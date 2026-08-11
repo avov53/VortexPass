@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Net.NetworkInformation;
+using System.Net.Http;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -16,6 +17,8 @@ namespace VortexPass.App;
 
 public partial class MainWindow : Window
 {
+    private sealed record AdvisorCandidate(string Level, string Label, int Healthy, int Total, long? LatencyMs, string Summary, long Score);
+
     private readonly AppSettingsStore _settingsStore;
     private readonly WindowsStartupService _startupService = new();
     private readonly ExternalComponentService _components;
@@ -26,6 +29,8 @@ public partial class MainWindow : Window
     private readonly UserDomainListService _domainLists;
     private readonly GitHubUpdateService _updates = new();
     private readonly Forms.NotifyIcon _trayIcon;
+    private readonly Forms.ToolStripMenuItem _trayProtectionItem;
+    private readonly HttpClient _advisorHttp = new() { Timeout = TimeSpan.FromSeconds(8) };
     private readonly string _applicationLogPath;
     private readonly CancellationTokenSource _lifetime = new();
     private readonly SemaphoreSlim _protectionGate = new(1, 1);
@@ -45,6 +50,7 @@ public partial class MainWindow : Window
     private long _baselinePackets;
     private DateTimeOffset _nextHealthCheckUtc = DateTimeOffset.MinValue;
     private int _healthGeneration;
+    private bool _advisorRunning;
 
     public MainWindow()
     {
@@ -67,8 +73,17 @@ public partial class MainWindow : Window
             ContextMenuStrip = new Forms.ContextMenuStrip()
         };
         _trayIcon.ContextMenuStrip.Items.Add("Открыть", null, (_, _) => RestoreWindow());
+        _trayProtectionItem = new Forms.ToolStripMenuItem("Запустить защиту");
+        _trayProtectionItem.Click += async (_, _) =>
+        {
+            if (_advisorRunning || _protectionTransitioning) return;
+            await SetProtectionAsync(!_protectionRequested);
+        };
+        _trayIcon.ContextMenuStrip.Items.Add(_trayProtectionItem);
+        _trayIcon.ContextMenuStrip.Items.Add(new Forms.ToolStripSeparator());
         _trayIcon.ContextMenuStrip.Items.Add("Выход", null, async (_, _) => await ShutdownAsync());
         _trayIcon.DoubleClick += (_, _) => RestoreWindow();
+        _advisorHttp.DefaultRequestHeaders.UserAgent.ParseAdd("VortexPass/0.1 (+https://github.com/avov53/VortexPass)");
     }
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
@@ -97,7 +112,7 @@ public partial class MainWindow : Window
         }
         if (!_settings.StartWithWindows)
             _startupService.SetEnabled(false, Path.Combine(AppContext.BaseDirectory, "VortexPass.exe"));
-        _trayIcon.Visible = _settings.MinimizeToTray;
+        _trayIcon.Visible = true;
         await _components.LoadManifestAsync(_lifetime.Token);
 
         var webDirectory = Path.Combine(AppContext.BaseDirectory, "web");
@@ -193,14 +208,12 @@ public partial class MainWindow : Window
                     else await ShutdownAsync();
                     break;
                 case "settings.autostart":
-                    _settings.StartWithWindows = value;
-                    _startupService.SetEnabled(value, Path.Combine(AppContext.BaseDirectory, "VortexPass.exe"));
-                    await _settingsStore.SaveAsync(_settings);
+                    await SetAutostartAsync(value);
                     break;
                 case "settings.tray":
                     _settings.MinimizeToTray = value;
-                    _trayIcon.Visible = value;
                     await _settingsStore.SaveAsync(_settings);
+                    await PublishSettingsStatusAsync();
                     break;
                 case "protection.set":
                     await SetProtectionAsync(value);
@@ -212,6 +225,9 @@ public partial class MainWindow : Window
                 case "profile.set":
                     var bypassLevel = root.TryGetProperty("level", out var rawLevel) ? rawLevel.GetString() : null;
                     await SetBypassLevelAsync(bypassLevel);
+                    break;
+                case "advisor.run":
+                    await RunProfileAdvisorAsync();
                     break;
                 case "gamefilter.set":
                     await SetGameFilterAsync(root);
@@ -238,6 +254,12 @@ public partial class MainWindow : Window
 
     private async Task SetProtectionAsync(bool enabled)
     {
+        if (_advisorRunning)
+        {
+            await LogToUiAsync("warn", "Дождитесь завершения автоматического подбора профиля.");
+            return;
+        }
+
         if (enabled)
         {
             if (!_settings.Profiles.AnyEnabled)
@@ -257,6 +279,159 @@ public partial class MainWindow : Window
         }
 
         await StopProtectionAsync();
+    }
+
+    private async Task SetAutostartAsync(bool enabled)
+    {
+        var previous = _settings.StartWithWindows;
+        try
+        {
+            _startupService.SetEnabled(enabled, Path.Combine(AppContext.BaseDirectory, "VortexPass.exe"));
+            _settings.StartWithWindows = enabled;
+            await _settingsStore.SaveAsync(_settings);
+        }
+        catch (Exception ex)
+        {
+            _settings.StartWithWindows = previous;
+            await LogToUiAsync("error", $"Не удалось изменить автозапуск: {ex.Message}");
+        }
+        await PublishSettingsStatusAsync();
+    }
+
+    private async Task RunProfileAdvisorAsync()
+    {
+        if (_advisorRunning) return;
+        if (!_settings.Profiles.AnyEnabled)
+        {
+            await PostUiAsync(new { type = "advisor.status", state = "failed", error = "Сначала выберите хотя бы один сервис на дашборде." });
+            return;
+        }
+        if (_settings.Profiles.GameFilter && !_settings.GameFilter.HasSelectedGames)
+        {
+            await PostUiAsync(new { type = "advisor.status", state = "failed", error = "Для Game Filter сначала выберите Roblox или Phasmophobia." });
+            return;
+        }
+
+        _advisorRunning = true;
+        var savedLevel = WinwsProfileComposer.NormalizeLevel(_settings.BypassLevel);
+        var wasRunning = _activeProfiles.AnyEnabled && _components.GetStatuses().Any(x => x.Id == "dpi" && x.State == ServiceState.Running);
+        var candidates = new List<AdvisorCandidate>();
+        string? provider = null;
+        try
+        {
+            await PostUiAsync(new { type = "advisor.status", state = "detecting", progress = 0, message = "Определяем провайдера…" });
+            provider = await DetectProviderAsync(_lifetime.Token);
+            await LogToUiAsync("info", provider is null
+                ? "Провайдер не определён. Подбор продолжится по сетевым проверкам."
+                : $"Автоподбор: определён провайдер {provider}.");
+
+            if (wasRunning) await StopProtectionAsync();
+
+            var levels = new[] { "light", "moderate", "medium", "complex", "aggressive" };
+            for (var index = 0; index < levels.Length; index++)
+            {
+                _lifetime.Token.ThrowIfCancellationRequested();
+                var level = levels[index];
+                _settings.BypassLevel = level;
+                await PostUiAsync(new
+                {
+                    type = "advisor.status",
+                    state = "testing",
+                    provider,
+                    level,
+                    progress = index,
+                    total = levels.Length,
+                    message = $"Проверяем профиль «{LevelDisplayName(level)}»…"
+                });
+
+                await ApplyProfilesAsync();
+                var running = _components.GetStatuses().Any(x => x.Id == "dpi" && x.State == ServiceState.Running);
+                var results = new List<ServiceHealthResult>();
+                if (running)
+                {
+                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+                    timeout.CancelAfter(TimeSpan.FromSeconds(18));
+                    try
+                    {
+                        var checks = AdvisorServiceIds()
+                            .Select(id => _healthChecks.CheckAsync(id, true, true, timeout.Token));
+                        results.AddRange(await Task.WhenAll(checks));
+                    }
+                    catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested) { }
+                }
+
+                var healthy = results.Count(x => x.IsHealthy);
+                var total = results.Count;
+                var latency = results.Where(x => x.IsHealthy && x.LatencyMs.HasValue).Select(x => x.LatencyMs!.Value).DefaultIfEmpty().Average();
+                var latencyValue = latency > 0 ? (long?)Math.Round(latency) : null;
+                var score = running ? 100 + healthy * 1000 - (latencyValue ?? 500) : -10000;
+                var summary = !running
+                    ? "winws не запустился"
+                    : total == 0
+                        ? "winws запускается; для выбранного Game Filter нет HTTP-проверки"
+                        : $"Доступно сервисов: {healthy} из {total}";
+                candidates.Add(new AdvisorCandidate(level, LevelDisplayName(level), healthy, total, latencyValue, summary, score));
+
+                if (running || _protectionRequested) await StopProtectionAsync();
+            }
+
+            var best = candidates.OrderByDescending(item => item.Score).Take(3).Select(item => new
+            {
+                level = item.Level,
+                label = item.Label,
+                healthy = item.Healthy,
+                total = item.Total,
+                latencyMs = item.LatencyMs,
+                summary = item.Summary
+            }).ToArray();
+            await PostUiAsync(new { type = "advisor.status", state = "complete", provider, candidates = best });
+            await LogToUiAsync("ok", $"Автоматический подбор завершён{(provider is null ? "" : $" для {provider}")}. Выберите один из предложенных уровней вручную.");
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            await PostUiAsync(new { type = "advisor.status", state = "failed", provider, error = ex.Message });
+            await LogToUiAsync("error", $"Автоматический подбор не завершён: {ex.Message}");
+        }
+        finally
+        {
+            _settings.BypassLevel = savedLevel;
+            if (!_shutdownStarted && wasRunning)
+            {
+                try { await ApplyProfilesAsync(); }
+                catch (Exception ex) { await LogToUiAsync("error", $"Не удалось восстановить прежний профиль после диагностики: {ex.Message}"); }
+            }
+            _advisorRunning = false;
+            await PostUiAsync(new { type = "profile.status", level = _settings.BypassLevel });
+            await SendServiceSnapshotAsync();
+        }
+    }
+
+    private IEnumerable<string> AdvisorServiceIds()
+    {
+        if (_settings.Profiles.YouTube || _settings.Profiles.Web) yield return "youtube";
+        if (_settings.Profiles.Discord || _settings.Profiles.Web) yield return "discord";
+        if (_settings.Profiles.Telegram || _settings.Profiles.Web) yield return "telegram";
+    }
+
+    private async Task<string?> DetectProviderAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var response = await _advisorHttp.GetAsync("https://ipapi.co/json/", cancellationToken);
+            if (!response.IsSuccessStatusCode) return null;
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+            var root = document.RootElement;
+            var organization = root.TryGetProperty("org", out var org) ? org.GetString() : null;
+            var asn = root.TryGetProperty("asn", out var rawAsn) ? rawAsn.GetString() : null;
+            var result = string.Join(" · ", new[] { organization, asn }.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct());
+            return string.IsNullOrWhiteSpace(result) ? null : result;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            return null;
+        }
     }
 
     private async Task StopProtectionAsync()
@@ -578,7 +753,7 @@ public partial class MainWindow : Window
         {
             type = "protection.status",
             enabled,
-            pending = _protectionTransitioning,
+            pending = _protectionTransitioning || _advisorRunning,
             youtube = winwsRunning && _activeProfiles.YouTube,
             discord = winwsRunning && _activeProfiles.Discord,
             telegram = winwsRunning && _activeProfiles.Telegram,
@@ -590,9 +765,25 @@ public partial class MainWindow : Window
             requestedWeb = _settings.Profiles.Web,
             requestedGameFilter = _settings.Profiles.GameFilter
         });
+        UpdateTrayState(enabled);
+        await PublishSettingsStatusAsync();
         await PublishConfigurationAsync();
         await PublishHostsStatusAsync();
         await PublishHealthSnapshotAsync(winwsRunning);
+    }
+
+    private Task PublishSettingsStatusAsync() => PostUiAsync(new
+    {
+        type = "settings.status",
+        autostart = _settings.StartWithWindows,
+        tray = _settings.MinimizeToTray
+    });
+
+    private void UpdateTrayState(bool protectionEnabled)
+    {
+        _trayProtectionItem.Text = protectionEnabled ? "Остановить защиту" : "Запустить защиту";
+        _trayProtectionItem.Enabled = !_protectionTransitioning && !_advisorRunning;
+        _trayIcon.Text = protectionEnabled ? "VortexPass — защита включена" : "VortexPass — защита выключена";
     }
 
     private async Task RunMetricsLoopAsync(CancellationToken cancellationToken)
@@ -866,6 +1057,7 @@ public partial class MainWindow : Window
         finally
         {
             _components.Dispose();
+            _advisorHttp.Dispose();
             _allowClose = true;
             Close();
         }

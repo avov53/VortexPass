@@ -37,6 +37,7 @@ import {
   Gamepad2,
   Pencil,
   Save,
+  Sparkles,
 } from "lucide-react";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -102,6 +103,18 @@ type HealthMap = Record<string, HealthItem>;
 interface HostsInfo { applied: boolean; entryCount: number; updatedAt?: string; detail: string; sourceCommit?: string }
 interface GameFilterInfo { selectedGames: string[]; protocol: "udp" | "tcp" | "all" }
 interface DomainListsInfo { bypass: string[]; exclusions: string[] }
+interface SettingsInfo { autostart: boolean; tray: boolean }
+interface AdvisorCandidate { level: string; label: string; healthy: number; total: number; latencyMs: number | null; summary: string }
+interface AdvisorInfo {
+  state: "idle" | "detecting" | "testing" | "complete" | "failed";
+  provider?: string;
+  level?: string;
+  progress?: number;
+  total?: number;
+  message?: string;
+  error?: string;
+  candidates?: AdvisorCandidate[];
+}
 
 type BrandIconProps = SVGProps<SVGSVGElement> & { size?: number };
 type BrandIcon = ComponentType<BrandIconProps>;
@@ -521,6 +534,8 @@ function Dashboard({
   bypassLevel,
   health,
   hosts,
+  advisor,
+  onRunAdvisor,
   onBypassLevelChange,
   onServiceSelected,
   onRestoreHosts,
@@ -541,6 +556,8 @@ function Dashboard({
   bypassLevel: string;
   health: HealthMap;
   hosts: HostsInfo;
+  advisor: AdvisorInfo;
+  onRunAdvisor: () => void;
   onBypassLevelChange: (level: string) => void;
   onServiceSelected: (serviceId: string, selected: boolean) => void;
   onRestoreHosts: () => void;
@@ -716,6 +733,70 @@ function Dashboard({
         )}
       </GlassCard>
 
+      <GlassCard className="p-5 overflow-hidden relative">
+        <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(circle at 92% 0%, rgba(108,92,231,0.12), transparent 42%)" }} />
+        <div className="relative flex items-start justify-between gap-5">
+          <div className="flex items-start gap-3 min-w-0">
+            <div className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
+              style={{ background: "linear-gradient(135deg, rgba(108,92,231,0.2), rgba(0,120,212,0.12))", border: "1px solid rgba(108,92,231,0.28)" }}>
+              <Sparkles size={18} className="text-[#A99BFF]" />
+            </div>
+            <div>
+              <div className="text-[13px] font-semibold text-[#EEEEF8]">Автоматический подбор профиля</div>
+              <div className="text-[10px] leading-relaxed text-[#5A5A7A] mt-1 max-w-[650px]">
+                Определит провайдера и последовательно проверит пять уровней на выбранных сервисах. Текущая защита после теста будет восстановлена.
+              </div>
+              <div className="text-[9px] font-mono text-[#3A3A5E] mt-1.5">При запуске выполняется один HTTPS-запрос к ipapi.co; публичный IP в VortexPass не сохраняется.</div>
+            </div>
+          </div>
+          <motion.button whileHover={advisor.state === "detecting" || advisor.state === "testing" ? {} : { scale: 1.02 }} whileTap={{ scale: 0.98 }}
+            type="button" onClick={onRunAdvisor} disabled={pending || advisor.state === "detecting" || advisor.state === "testing"}
+            className="px-4 py-2.5 rounded-xl text-[11px] font-semibold whitespace-nowrap disabled:opacity-50"
+            style={{ color: "#C2BCFF", background: "rgba(108,92,231,0.14)", border: "1px solid rgba(108,92,231,0.32)" }}>
+            {advisor.state === "detecting" || advisor.state === "testing" ? "Идёт диагностика…" : "Подобрать профиль"}
+          </motion.button>
+        </div>
+
+        {(advisor.state === "detecting" || advisor.state === "testing") && (
+          <motion.div initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} className="relative mt-4">
+            <div className="flex justify-between text-[10px] font-mono mb-2">
+              <span className="text-[#7777A8]">{advisor.message ?? "Проверяем сеть…"}</span>
+              <span className="text-[#4A4A6A]">{advisor.provider ?? "Провайдер определяется"}</span>
+            </div>
+            <div className="h-1.5 rounded-full overflow-hidden bg-white/[0.04]">
+              <motion.div className="h-full rounded-full" animate={{ width: `${advisor.state === "detecting" ? 8 : Math.max(12, (((advisor.progress ?? 0) + 1) / (advisor.total ?? 5)) * 100)}%` }}
+                style={{ background: "linear-gradient(90deg, #6C5CE7, #0078D4)" }} />
+            </div>
+          </motion.div>
+        )}
+
+        {advisor.state === "failed" && <div className="relative mt-4 text-[10px] font-mono text-[#FF7A8F]">{advisor.error}</div>}
+
+        {advisor.state === "complete" && (
+          <motion.div initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} className="relative mt-4">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[10px] font-mono text-[#7474A0]">Лучшие варианты{advisor.provider ? ` · ${advisor.provider}` : ""}</span>
+              <span className="text-[9px] font-mono text-[#3A3A5E]">Применение только вручную</span>
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              {(advisor.candidates ?? []).map((candidate, index) => (
+                <button key={candidate.level} type="button" onClick={() => onBypassLevelChange(candidate.level)}
+                  className="p-3 rounded-xl text-left transition-all hover:-translate-y-0.5"
+                  style={{ background: index === 0 ? "rgba(0,214,143,0.07)" : "rgba(255,255,255,0.03)", border: `1px solid ${index === 0 ? "rgba(0,214,143,0.2)" : "rgba(255,255,255,0.06)"}` }}>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-semibold text-[#DCDCF0]">{candidate.label}</span>
+                    {index === 0 && <span className="text-[8px] font-mono text-[#00D68F]">ЛУЧШИЙ</span>}
+                  </div>
+                  <div className="text-[9px] font-mono text-[#55557A] mt-1">{candidate.summary}</div>
+                  <div className="text-[9px] font-mono text-[#3A3A5E] mt-1">{candidate.latencyMs != null ? `Среднее ${candidate.latencyMs} мс` : "Без замера задержки"}</div>
+                  <div className="text-[9px] font-semibold text-[#A99BFF] mt-2">Выбрать этот уровень →</div>
+                </button>
+              ))}
+            </div>
+          </motion.div>
+        )}
+      </GlassCard>
+
       <GlassCard className="p-5">
         <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-3 min-w-0">
@@ -857,27 +938,6 @@ function YouTubeTab({
   webBypass: boolean;
   onToggleWeb: (value: boolean) => void;
 }) {
-  const [ytStrategy, setYtStrategy] = useState("standard");
-  const [dcStrategy, setDcStrategy] = useState("standard");
-
-  const strategies = [
-    {
-      value: "standard",
-      label: "Стандартная (Recommended)",
-      sub: "Packet Split · низкая нагрузка на CPU",
-    },
-    {
-      value: "aggressive",
-      label: "Агрессивная (Split2)",
-      sub: "2-байтовый фрагмент · максимальный обход",
-    },
-    {
-      value: "fake",
-      label: "Альтернативная (Fake)",
-      sub: "Fake packet с TTL=5 · для жёсткого DPI",
-    },
-  ];
-
   const services = [
     {
       id: "yt",
@@ -888,8 +948,6 @@ function YouTubeTab({
       active: ytActive,
       selected: ytSelected,
       onToggle: onToggleYt,
-      strategy: ytStrategy,
-      setStrategy: setYtStrategy,
       badge: ytActive && metrics.youtubePing != null ? `${metrics.youtubePing} ms` : null,
     },
     {
@@ -901,8 +959,6 @@ function YouTubeTab({
       active: dcActive,
       selected: dcSelected,
       onToggle: onToggleDc,
-      strategy: dcStrategy,
-      setStrategy: setDcStrategy,
       badge: dcActive && metrics.discordPing != null ? `${metrics.discordPing} ms` : null,
     },
   ];
@@ -917,7 +973,7 @@ function YouTubeTab({
           YouTube & Discord
         </h2>
         <p className="text-sm text-[#3A3A5E] mt-1">
-          Настройка стратегий обхода DPI для каждого сервиса независимо
+          Выбор сервисов; общий уровень обхода настраивается на дашборде
         </p>
       </div>
 
@@ -936,7 +992,7 @@ function YouTubeTab({
           }
         >
           {/* Service header */}
-          <div className="flex items-center gap-3 mb-4">
+          <div className="flex items-center gap-3">
             <div
               className="w-10 h-10 rounded-xl flex items-center justify-center text-xl transition-all duration-300 flex-shrink-0"
               style={{
@@ -972,21 +1028,6 @@ function YouTubeTab({
               </div>
             </div>
             <Toggle checked={s.selected} onChange={s.onToggle} />
-          </div>
-
-          {/* Strategy selector */}
-          <div
-            className="transition-all duration-300"
-            style={{ opacity: s.selected ? 1 : 0.35, pointerEvents: s.selected ? "auto" : "none" }}
-          >
-            <label className="text-[10px] font-mono uppercase tracking-widest text-[#3A3A5E] block mb-2">
-              Стратегия обхода
-            </label>
-            <Select
-              value={s.strategy}
-              onChange={s.setStrategy}
-              options={strategies}
-            />
           </div>
         </GlassCard>
       ))}
@@ -1445,21 +1486,8 @@ function DomainListEditor({ title, description, values, emptyText, onSave }: {
   );
 }
 
-function SettingsTab({ update, domains, onSaveDomains }: { update: UpdateInfo; domains: DomainListsInfo; onSaveDomains: (value: DomainListsInfo) => void }) {
-  const [autostart, setAutostart] = useState(() => nativeSetting("autostart", false));
-  const [tray, setTray] = useState(() => nativeSetting("tray", true));
-
+function SettingsTab({ update, domains, settings, onSettingsChange, onSaveDomains }: { update: UpdateInfo; domains: DomainListsInfo; settings: SettingsInfo; onSettingsChange: (name: keyof SettingsInfo, value: boolean) => void; onSaveDomains: (value: DomainListsInfo) => void }) {
   const handleUpdate = () => postNativeMessage(update.state === "available" ? "update.install" : "update.check");
-
-  const changeAutostart = (value: boolean) => {
-    setAutostart(value);
-    postNativeMessage("settings.autostart", value);
-  };
-
-  const changeTray = (value: boolean) => {
-    setTray(value);
-    postNativeMessage("settings.tray", value);
-  };
 
   const updateMeta = {
     idle: { label: "Проверить обновления GitHub", color: "#B5AEFC", bg: "rgba(108,92,231,0.15)", border: "rgba(108,92,231,0.3)" },
@@ -1502,7 +1530,7 @@ function SettingsTab({ update, domains, onSaveDomains }: { update: UpdateInfo; d
               Добавляет VortexPass в автозагрузку через реестр HKCU\Run
             </div>
           </div>
-          <Toggle checked={autostart} onChange={changeAutostart} />
+          <Toggle checked={settings.autostart} onChange={(value) => onSettingsChange("autostart", value)} />
         </div>
 
         <Divider />
@@ -1519,7 +1547,7 @@ function SettingsTab({ update, domains, onSaveDomains }: { update: UpdateInfo; d
               Закрытие окна скрывает приложение в трей, службы продолжают работу
             </div>
           </div>
-          <Toggle checked={tray} onChange={changeTray} />
+          <Toggle checked={settings.tray} onChange={(value) => onSettingsChange("tray", value)} />
         </div>
       </GlassCard>
 
@@ -1707,6 +1735,8 @@ export default function App() {
   const [logs, setLogs] = useState<LogEntry[]>(SEED_LOGS);
   const [metrics, setMetrics] = useState<Metrics>({ uptimeSeconds: 0, trafficBytes: 0, packets: 0, youtubePing: null, discordPing: null, telegramPing: null });
   const [update, setUpdate] = useState<UpdateInfo>({ state: "idle", currentVersion: (window as NativeWindow).__vortexRuntime?.app?.version });
+  const [settings, setSettings] = useState<SettingsInfo>({ autostart: nativeSetting("autostart", false), tray: nativeSetting("tray", true) });
+  const [advisor, setAdvisor] = useState<AdvisorInfo>({ state: "idle" });
 
   useNativeMessage((message) => {
     if (!message?.type) return;
@@ -1715,6 +1745,8 @@ export default function App() {
     if (message.type === "profile.status") setBypassLevel(String(message.level ?? "medium"));
     if (message.type === "health.status") setHealth((message.services ?? {}) as HealthMap);
     if (message.type === "hosts.status") setHosts(message as HostsInfo);
+    if (message.type === "settings.status") setSettings({ autostart: Boolean(message.autostart), tray: Boolean(message.tray) });
+    if (message.type === "advisor.status") setAdvisor(message as AdvisorInfo);
     if (message.type === "configuration.status") {
       if (message.gameFilter) setGameFilter(message.gameFilter as GameFilterInfo);
       if (message.domains) setDomains(message.domains as DomainListsInfo);
@@ -1737,20 +1769,22 @@ export default function App() {
     }
   });
 
+  const running = [ytActive, dcActive, tgActive, protection && webBypass, gameFilterActive].filter(Boolean).length;
+  const advisorBusy = advisor.state === "detecting" || advisor.state === "testing";
+  const controlsBusy = protectionPending || advisorBusy;
+
   // Sync: master protection toggle controls all services
   const handleToggleProtection = () => {
-    if (protectionPending) return;
+    if (controlsBusy) return;
     const next = !protection;
     postNativeMessage("protection.set", next);
   };
-
-  const running = [ytActive, dcActive, tgActive, protection && webBypass, gameFilterActive].filter(Boolean).length;
 
   const content: Record<Tab, React.ReactNode> = {
     dashboard: (
       <Dashboard
         protection={protection}
-        pending={protectionPending}
+        pending={controlsBusy}
         onToggleProtection={handleToggleProtection}
         ytActive={ytActive}
         dcActive={dcActive}
@@ -1763,9 +1797,11 @@ export default function App() {
         bypassLevel={bypassLevel}
         health={health}
         hosts={hosts}
-        onBypassLevelChange={(level) => { setBypassLevel(level); postNativePayload({ type: "profile.set", level }); }}
+        advisor={advisor}
+        onRunAdvisor={() => postNativePayload({ type: "advisor.run" })}
+        onBypassLevelChange={(level) => { if (!controlsBusy) { setBypassLevel(level); postNativePayload({ type: "profile.set", level }); } }}
         onServiceSelected={(serviceId, selected) => {
-          if (protectionPending) return;
+          if (controlsBusy) return;
           if (serviceId === "youtube") setYtSelected(selected);
           if (serviceId === "discord") setDcSelected(selected);
           if (serviceId === "telegram") setTgSelected(selected);
@@ -1784,11 +1820,11 @@ export default function App() {
         dcActive={dcActive}
         ytSelected={ytSelected}
         dcSelected={dcSelected}
-        onToggleYt={(value) => { if (!protectionPending) { setYtSelected(value); postNativeMessage("service.set", value, "youtube"); } }}
-        onToggleDc={(value) => { if (!protectionPending) { setDcSelected(value); postNativeMessage("service.set", value, "discord"); } }}
+        onToggleYt={(value) => { if (!controlsBusy) { setYtSelected(value); postNativeMessage("service.set", value, "youtube"); } }}
+        onToggleDc={(value) => { if (!controlsBusy) { setDcSelected(value); postNativeMessage("service.set", value, "discord"); } }}
         metrics={metrics}
         webBypass={webBypass}
-        onToggleWeb={(value) => { if (!protectionPending) { setWebBypass(value); postNativeMessage("service.set", value, "web"); } }}
+        onToggleWeb={(value) => { if (!controlsBusy) { setWebBypass(value); postNativeMessage("service.set", value, "web"); } }}
       />
     ),
     telegram: (
@@ -1796,22 +1832,27 @@ export default function App() {
         tgActive={tgActive}
         tgSelected={tgSelected}
         webActive={webBypass}
-        pending={protectionPending}
-        onToggleTg={(value) => { if (!protectionPending) { setTgSelected(value); postNativeMessage("service.set", value, "telegram"); } }}
-        onToggleWeb={(value) => { if (!protectionPending) { setWebBypass(value); postNativeMessage("service.set", value, "web"); } }}
+        pending={controlsBusy}
+        onToggleTg={(value) => { if (!controlsBusy) { setTgSelected(value); postNativeMessage("service.set", value, "telegram"); } }}
+        onToggleWeb={(value) => { if (!controlsBusy) { setWebBypass(value); postNativeMessage("service.set", value, "web"); } }}
       />
     ),
     gamefilter: (
       <GameFilterTab
         selected={gameFilterSelected}
         active={gameFilterActive}
-        pending={protectionPending}
+        pending={controlsBusy}
         info={gameFilter}
-        onToggle={(value) => { if (!protectionPending) { setGameFilterSelected(value); postNativeMessage("service.set", value, "gamefilter"); } }}
+        onToggle={(value) => { if (!controlsBusy) { setGameFilterSelected(value); postNativeMessage("service.set", value, "gamefilter"); } }}
         onChange={(value) => { setGameFilter(value); postNativePayload({ type: "gamefilter.set", selectedGames: value.selectedGames, protocol: value.protocol }); }}
       />
     ),
-    settings: <SettingsTab update={update} domains={domains} onSaveDomains={(value) => { setDomains(value); postNativePayload({ type: "domains.set", bypass: value.bypass, exclusions: value.exclusions }); }} />,
+    settings: <SettingsTab update={update} domains={domains} settings={settings}
+      onSettingsChange={(name, value) => {
+        setSettings((current) => ({ ...current, [name]: value }));
+        postNativeMessage(name === "autostart" ? "settings.autostart" : "settings.tray", value);
+      }}
+      onSaveDomains={(value) => { setDomains(value); postNativePayload({ type: "domains.set", bypass: value.bypass, exclusions: value.exclusions }); }} />,
   };
 
   return (
