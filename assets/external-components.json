@@ -1,0 +1,32 @@
+{
+  "source": {
+    "repository": "https://github.com/Flowseal/zapret-discord-youtube",
+    "commit": "61d7596c7ce82b6f320e5c79ff4598856f4ae7d3",
+    "license": "MIT"
+  },
+  "components": [
+    {
+      "id": "dpi",
+      "displayName": "YouTube, Discord, Telegram и игры",
+      "executable": "bin\\winws.exe",
+      "arguments": "",
+      "requiredFiles": [
+        { "path": "bin\\winws.exe", "sha256": "affb4f69d2ea302a7abccd5325d81826e140ddae014f1e070bc4a6c0dd555188" },
+        { "path": "bin\\WinDivert.dll", "sha256": "c1e060ee19444a259b2162f8af0f3fe8c4428a1c6f694dce20de194ac8d7d9a2" },
+        { "path": "bin\\WinDivert64.sys", "sha256": "8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2" },
+        { "path": "bin\\cygwin1.dll", "sha256": "103104a52e5293ce418944725df19e2bf81ad9269b9a120d71d39028e821499b" },
+        { "path": "bin\\files\\list-youtube.txt", "sha256": "faaff6ed52c6751ae9cddc52c1ca28ebf0f37d05ca317ec7335d732daecde81f" },
+        { "path": "bin\\files\\list-discord.txt", "sha256": "1310a6f3a9ed8a76d0d58d5b78442a4d52a1ce83ec6c1a8fd254ae25ca48164a" },
+        { "path": "bin\\files\\list-telegram.txt", "sha256": "52e6e00563cebd8c0d507fb4bcb2a1fb3c14bc01b8bddbcc09eaf6bac7440bbe" },
+        { "path": "bin\\files\\list-roblox.txt", "sha256": "23b5b3796f116a57d0810f439369a4b425f579f5b1a72de6df0563ff79c79414" },
+        { "path": "bin\\files\\flowseal-hosts.txt", "sha256": "ca810989b7e9ac87fb1ddb5786f01a80d862a6ff8f3c1cc883bb09baeab1c34d" },
+        { "path": "bin\\files\\ACTIVE_DISCORD_UDP.bin", "sha256": "2fe18b3bd20807d36704d0b072092ee49ae84edca907a4420ab9a0f0f28fddcf" },
+        { "path": "bin\\files\\quic_initial_www_google_com.bin", "sha256": "f4589c57749f956bb30538197a521d7005f8b0a8723b4707e72405e51ddac50a" },
+        { "path": "bin\\files\\stun.bin", "sha256": "9cd5469309780ca56c0bd97266524a48c7ee529d02c3179cfecb20b260a59641" },
+        { "path": "bin\\files\\tls_clienthello_4pda_to.bin", "sha256": "eefeaf09dde8d69b1f176212541f63c68b314a33a335eced99a8a29f17254da8" },
+        { "path": "bin\\files\\tls_clienthello_max_ru.bin", "sha256": "4ee0870abe0a0128600b0095189987ba1d210dae8bf963bc725aff49cf922624" },
+        { "path": "bin\\files\\tls_clienthello_www_google_com.bin", "sha256": "936c2bee4cfb80aa3c426b2dcbcc834b3fbcd1adb17172959dc569c73a14275c" }
+      ]
+    }
+  ]
+}

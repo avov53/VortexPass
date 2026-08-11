@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <OutputType>WinExe</OutputType>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>VortexPass</AssemblyName>
+    <RootNamespace>VortexPass.App</RootNamespace>
+    <Version>0.1.0</Version>
+    <AssemblyInformationalVersion>0.1.0</AssemblyInformationalVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\VortexPass.Core\VortexPass.Core.csproj" />
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3719.77" />
+    <Content Include="..\..\assets\external-components.json" Link="assets\external-components.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="web-dist\**\*" Link="web\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="CopyUpdaterToApplicationOutput" AfterTargets="Build">
+    <ItemGroup>
+      <UpdaterFiles Include="$(MSBuildProjectDirectory)\..\VortexPass.Updater\bin\$(Configuration)\net8.0-windows\win-x64\VortexPass.Updater.*" />
+    </ItemGroup>
+    <MakeDir Directories="$(OutDir)updater" Condition="'@(UpdaterFiles)' != ''" />
+    <Copy SourceFiles="@(UpdaterFiles)" DestinationFolder="$(OutDir)updater" SkipUnchangedFiles="true" Condition="'@(UpdaterFiles)' != ''" />
+  </Target>
+</Project>

@@ -1,0 +1,26 @@
+# .NET build output
+**/bin/
+**/obj/
+artifacts/
+
+# Frontend dependencies and local package caches
+**/node_modules/
+.pnpm-store/
+
+# Temporary component downloads and packaging output
+components-temp/
+dist/
+dist.zip
+
+# Local logs and editor/user files
+*.log
+*.user
+*.suo
+.vs/
+.idea/
+.vscode/
+
+# OS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store

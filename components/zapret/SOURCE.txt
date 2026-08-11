@@ -1,0 +1,8 @@
+VortexPass network component source
+
+Flowseal/zapret-discord-youtube
+Commit: 61d7596c7ce82b6f320e5c79ff4598856f4ae7d3
+Repository: https://github.com/Flowseal/zapret-discord-youtube
+License: MIT (see FLOWSEAL-LICENSE.txt)
+
+VortexPass invokes winws.exe directly. No batch or command scripts are included or executed.
