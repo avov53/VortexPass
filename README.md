@@ -1,4 +1,5 @@
-# VortexPass <img width="442" height="428" alt="image" src="https://github.com/user-attachments/assets/2cd32e7f-5348-4868-93bf-1888c361f88f" />
+<img width="100" height="86" alt="image" src="https://github.com/user-attachments/assets/7e02a56c-a7f5-4882-85e5-85d51fc7fb92" />
+# VortexPass
 
 
 WPF/.NET 8 x64 launcher for Windows 10/11 with a GitHub Releases updater.
