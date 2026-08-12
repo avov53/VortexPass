@@ -17,7 +17,7 @@ namespace VortexPass.App;
 
 public partial class MainWindow : Window
 {
-    private sealed record AdvisorCandidate(string Level, string Label, int Healthy, int Total, long? LatencyMs, string Summary, long Score);
+    private sealed record AdvisorCandidate(string Level, int Tuning, string Label, int Healthy, int Total, long? LatencyMs, string Summary, long Score);
 
     private readonly AppSettingsStore _settingsStore;
     private readonly WindowsStartupService _startupService = new();
@@ -29,7 +29,7 @@ public partial class MainWindow : Window
     private readonly UserDomainListService _domainLists;
     private readonly GitHubUpdateService _updates = new();
     private readonly Forms.NotifyIcon _trayIcon;
-    private readonly Forms.ToolStripMenuItem _trayProtectionItem;
+    private readonly TrayMenuWindow _trayMenu;
     private readonly HttpClient _advisorHttp = new() { Timeout = TimeSpan.FromSeconds(8) };
     private readonly string _applicationLogPath;
     private readonly CancellationTokenSource _lifetime = new();
@@ -50,6 +50,7 @@ public partial class MainWindow : Window
     private long _baselinePackets;
     private DateTimeOffset _nextHealthCheckUtc = DateTimeOffset.MinValue;
     private int _healthGeneration;
+    private int _healthCheckRunning;
     private bool _advisorRunning;
 
     public MainWindow()
@@ -67,23 +68,43 @@ public partial class MainWindow : Window
 
         _trayIcon = new Forms.NotifyIcon
         {
-            Icon = System.Drawing.SystemIcons.Shield,
+            Icon = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath!) ?? System.Drawing.SystemIcons.Application,
             Text = "VortexPass",
-            Visible = false,
-            ContextMenuStrip = new Forms.ContextMenuStrip()
+            Visible = false
         };
-        _trayIcon.ContextMenuStrip.Items.Add("Открыть", null, (_, _) => RestoreWindow());
-        _trayProtectionItem = new Forms.ToolStripMenuItem("Запустить защиту");
-        _trayProtectionItem.Click += async (_, _) =>
-        {
-            if (_advisorRunning || _protectionTransitioning) return;
-            await SetProtectionAsync(!_protectionRequested);
-        };
-        _trayIcon.ContextMenuStrip.Items.Add(_trayProtectionItem);
-        _trayIcon.ContextMenuStrip.Items.Add(new Forms.ToolStripSeparator());
-        _trayIcon.ContextMenuStrip.Items.Add("Выход", null, async (_, _) => await ShutdownAsync());
+        _trayMenu = new TrayMenuWindow(
+            RestoreWindow,
+            async () =>
+            {
+                if (_advisorRunning || _protectionTransitioning) return;
+                await SetProtectionAsync(!_protectionRequested);
+            },
+            ShutdownAsync);
+        _trayMenu.UpdateState(false, false);
+        _trayIcon.MouseUp += TrayIconMouseUp;
         _trayIcon.DoubleClick += (_, _) => RestoreWindow();
         _advisorHttp.DefaultRequestHeaders.UserAgent.ParseAdd("VortexPass/0.1 (+https://github.com/avov53/VortexPass)");
+    }
+
+    private void TrayIconMouseUp(object? sender, Forms.MouseEventArgs e)
+    {
+        if (e.Button == Forms.MouseButtons.Left)
+        {
+            RestoreWindow();
+            return;
+        }
+        if (e.Button != Forms.MouseButtons.Right || _shutdownStarted) return;
+
+        var cursor = Forms.Cursor.Position;
+        var screen = Forms.Screen.FromPoint(cursor);
+        var transform = PresentationSource.FromVisual(this)?.CompositionTarget?.TransformFromDevice;
+        var cursorPoint = transform?.Transform(new System.Windows.Point(cursor.X, cursor.Y)) ?? new System.Windows.Point(cursor.X, cursor.Y);
+        var area = screen.WorkingArea;
+        var workAreaTopLeft = transform?.Transform(new System.Windows.Point(area.Left, area.Top)) ?? new System.Windows.Point(area.Left, area.Top);
+        var workAreaBottomRight = transform?.Transform(new System.Windows.Point(area.Right, area.Bottom)) ?? new System.Windows.Point(area.Right, area.Bottom);
+        var workArea = new Rect(workAreaTopLeft, workAreaBottomRight);
+        _trayMenu.UpdateState(_protectionRequested, _protectionTransitioning || _advisorRunning);
+        _trayMenu.ShowAt(cursorPoint, workArea);
     }
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
@@ -96,6 +117,8 @@ public partial class MainWindow : Window
         _settings.GameFilter.Protocol = WinwsProfileComposer.NormalizeGameProtocol(_settings.GameFilter.Protocol);
         _settings.CustomBypassDomains ??= [];
         _settings.ExcludedDomains ??= DefaultDomainLists.CreateExclusions();
+        _settings.FavoriteProfiles ??= [];
+        _settings.FavoriteProfiles = NormalizeFavorites(_settings.FavoriteProfiles);
         _hostsStatus = _hostsManager.GetStatus();
         if (_hostsStatus.Applied)
         {
@@ -108,6 +131,12 @@ public partial class MainWindow : Window
             _settings.Profiles.Discord = false;
             _settings.Profiles.Telegram = false;
             _settings.ProfileSettingsVersion = 2;
+            await _settingsStore.SaveAsync(_settings, _lifetime.Token);
+        }
+        if (_settings.ProfileSettingsVersion < 3)
+        {
+            _settings.FavoriteProfiles.Clear();
+            _settings.ProfileSettingsVersion = 3;
             await _settingsStore.SaveAsync(_settings, _lifetime.Token);
         }
         if (!_settings.StartWithWindows)
@@ -154,6 +183,12 @@ public partial class MainWindow : Window
                     exclusions = _settings.ExcludedDomains
                 },
                 bypassLevel = WinwsProfileComposer.NormalizeLevel(_settings.BypassLevel),
+                bypassTuning = WinwsProfileComposer.NormalizeTuning(_settings.BypassTuning),
+                favoriteProfiles = _settings.FavoriteProfiles.Select(profile => new
+                {
+                    level = WinwsProfileComposer.NormalizeLevel(profile.Level),
+                    tuning = WinwsProfileComposer.NormalizeTuning(profile.Tuning)
+                }),
                 app = new { version = currentVersion, platform = Environment.OSVersion.VersionString }
             });
             await DesignView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(
@@ -224,7 +259,19 @@ public partial class MainWindow : Window
                     break;
                 case "profile.set":
                     var bypassLevel = root.TryGetProperty("level", out var rawLevel) ? rawLevel.GetString() : null;
-                    await SetBypassLevelAsync(bypassLevel);
+                    var bypassTuning = root.TryGetProperty("tuning", out var rawTuning) && rawTuning.TryGetInt32(out var tuning) ? tuning : 0;
+                    await SetBypassLevelAsync(bypassLevel, bypassTuning);
+                    break;
+                case "profile.favorite.set":
+                    var favoriteLevel = root.TryGetProperty("level", out var rawFavoriteLevel) ? rawFavoriteLevel.GetString() : null;
+                    var favoriteTuning = root.TryGetProperty("tuning", out var rawFavoriteTuning) && rawFavoriteTuning.TryGetInt32(out var favoriteTuningValue) ? favoriteTuningValue : 0;
+                    var favorite = root.TryGetProperty("favorite", out var rawFavorite) && rawFavorite.ValueKind is JsonValueKind.True;
+                    await SetFavoriteProfileAsync(favoriteLevel, favoriteTuning, favorite);
+                    break;
+                case "profile.launch":
+                    var launchLevel = root.TryGetProperty("level", out var rawLaunchLevel) ? rawLaunchLevel.GetString() : null;
+                    var launchTuning = root.TryGetProperty("tuning", out var rawLaunchTuning) && rawLaunchTuning.TryGetInt32(out var launchTuningValue) ? launchTuningValue : 0;
+                    await LaunchProfileAsync(launchLevel, launchTuning);
                     break;
                 case "advisor.run":
                     await RunProfileAdvisorAsync();
@@ -314,6 +361,7 @@ public partial class MainWindow : Window
 
         _advisorRunning = true;
         var savedLevel = WinwsProfileComposer.NormalizeLevel(_settings.BypassLevel);
+        var savedTuning = WinwsProfileComposer.NormalizeTuning(_settings.BypassTuning);
         var wasRunning = _activeProfiles.AnyEnabled && _components.GetStatuses().Any(x => x.Id == "dpi" && x.State == ServiceState.Running);
         var candidates = new List<AdvisorCandidate>();
         string? provider = null;
@@ -327,21 +375,26 @@ public partial class MainWindow : Window
 
             if (wasRunning) await StopProtectionAsync();
 
-            var levels = new[] { "light", "moderate", "medium", "complex", "aggressive" };
-            for (var index = 0; index < levels.Length; index++)
+            var strategies = new[] { "light", "moderate", "medium", "complex", "aggressive" }
+                .SelectMany(level => Enumerable.Range(0, 4).Select(tuning => (Level: level, Tuning: tuning)))
+                .ToArray();
+            for (var index = 0; index < strategies.Length; index++)
             {
                 _lifetime.Token.ThrowIfCancellationRequested();
-                var level = levels[index];
+                var (level, tuning) = strategies[index];
                 _settings.BypassLevel = level;
+                _settings.BypassTuning = tuning;
+                var strategyLabel = $"{LevelDisplayName(level)} · {TuningDisplayName(tuning)}";
                 await PostUiAsync(new
                 {
                     type = "advisor.status",
                     state = "testing",
                     provider,
                     level,
+                    tuning,
                     progress = index,
-                    total = levels.Length,
-                    message = $"Проверяем профиль «{LevelDisplayName(level)}»…"
+                    total = strategies.Length,
+                    message = $"Проверяем стратегию «{strategyLabel}»…"
                 });
 
                 await ApplyProfilesAsync();
@@ -350,7 +403,7 @@ public partial class MainWindow : Window
                 if (running)
                 {
                     using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-                    timeout.CancelAfter(TimeSpan.FromSeconds(18));
+                    timeout.CancelAfter(TimeSpan.FromSeconds(12));
                     try
                     {
                         var checks = AdvisorServiceIds()
@@ -364,13 +417,13 @@ public partial class MainWindow : Window
                 var total = results.Count;
                 var latency = results.Where(x => x.IsHealthy && x.LatencyMs.HasValue).Select(x => x.LatencyMs!.Value).DefaultIfEmpty().Average();
                 var latencyValue = latency > 0 ? (long?)Math.Round(latency) : null;
-                var score = running ? 100 + healthy * 1000 - (latencyValue ?? 500) : -10000;
+                var score = running ? 100 + healthy * 1000 - (latencyValue ?? 500) - tuning * 25 : -10000;
                 var summary = !running
                     ? "winws не запустился"
                     : total == 0
                         ? "winws запускается; для выбранного Game Filter нет HTTP-проверки"
                         : $"Доступно сервисов: {healthy} из {total}";
-                candidates.Add(new AdvisorCandidate(level, LevelDisplayName(level), healthy, total, latencyValue, summary, score));
+                candidates.Add(new AdvisorCandidate(level, tuning, strategyLabel, healthy, total, latencyValue, summary, score));
 
                 if (running || _protectionRequested) await StopProtectionAsync();
             }
@@ -378,6 +431,7 @@ public partial class MainWindow : Window
             var best = candidates.OrderByDescending(item => item.Score).Take(3).Select(item => new
             {
                 level = item.Level,
+                tuning = item.Tuning,
                 label = item.Label,
                 healthy = item.Healthy,
                 total = item.Total,
@@ -396,13 +450,14 @@ public partial class MainWindow : Window
         finally
         {
             _settings.BypassLevel = savedLevel;
+            _settings.BypassTuning = savedTuning;
             if (!_shutdownStarted && wasRunning)
             {
                 try { await ApplyProfilesAsync(); }
                 catch (Exception ex) { await LogToUiAsync("error", $"Не удалось восстановить прежний профиль после диагностики: {ex.Message}"); }
             }
             _advisorRunning = false;
-            await PostUiAsync(new { type = "profile.status", level = _settings.BypassLevel });
+            await PublishProfileStatusAsync();
             await SendServiceSnapshotAsync();
         }
     }
@@ -474,12 +529,88 @@ public partial class MainWindow : Window
         await SendServiceSnapshotAsync();
     }
 
-    private async Task SetBypassLevelAsync(string? level)
+    private async Task SetBypassLevelAsync(string? level, int tuning = 0)
     {
         _settings.BypassLevel = WinwsProfileComposer.NormalizeLevel(level);
+        _settings.BypassTuning = WinwsProfileComposer.NormalizeTuning(tuning);
         await _settingsStore.SaveAsync(_settings);
-        await LogToUiAsync("info", $"Выбран общий уровень обхода: {LevelDisplayName(_settings.BypassLevel)}.");
-        await PostUiAsync(new { type = "profile.status", level = _settings.BypassLevel });
+        await LogToUiAsync("info", $"Выбран общий уровень обхода: {LevelDisplayName(_settings.BypassLevel)} · {TuningDisplayName(_settings.BypassTuning)}.");
+        await PublishProfileStatusAsync();
+    }
+
+    private async Task SetFavoriteProfileAsync(string? level, int tuning, bool favorite)
+    {
+        var normalizedLevel = WinwsProfileComposer.NormalizeLevel(level);
+        var normalizedTuning = WinwsProfileComposer.NormalizeTuning(tuning);
+        var existing = _settings.FavoriteProfiles.FirstOrDefault(profile =>
+            profile.Level.Equals(normalizedLevel, StringComparison.OrdinalIgnoreCase) &&
+            profile.Tuning == normalizedTuning);
+
+        if (favorite && existing is null)
+        {
+            if (_settings.FavoriteProfiles.Count >= 5)
+            {
+                await LogToUiAsync("warn", "В избранное можно добавить не больше пяти профилей.");
+                await PublishProfileStatusAsync();
+                return;
+            }
+
+            _settings.FavoriteProfiles.Add(new FavoriteProfileSettings { Level = normalizedLevel, Tuning = normalizedTuning });
+            await LogToUiAsync("ok", $"Профиль «{ProfileDisplayName(normalizedLevel, normalizedTuning)}» добавлен на дашборд.");
+        }
+        else if (!favorite && existing is not null)
+        {
+            _settings.FavoriteProfiles.Remove(existing);
+            await LogToUiAsync("info", $"Профиль «{ProfileDisplayName(normalizedLevel, normalizedTuning)}» удалён с дашборда.");
+        }
+        else
+        {
+            await PublishProfileStatusAsync();
+            return;
+        }
+
+        _settings.FavoriteProfiles = NormalizeFavorites(_settings.FavoriteProfiles);
+        await _settingsStore.SaveAsync(_settings);
+        await PublishProfileStatusAsync();
+    }
+
+    private async Task LaunchProfileAsync(string? level, int tuning)
+    {
+        if (_advisorRunning || _protectionTransitioning)
+        {
+            await LogToUiAsync("warn", "Дождитесь завершения текущей операции с защитой.");
+            return;
+        }
+
+        await SetBypassLevelAsync(level, tuning);
+        await LogToUiAsync("info", $"Быстрый запуск профиля «{ProfileDisplayName(_settings.BypassLevel, _settings.BypassTuning)}».");
+        await SetProtectionAsync(true);
+    }
+
+    private Task PublishProfileStatusAsync() => PostUiAsync(new
+    {
+        type = "profile.status",
+        level = _settings.BypassLevel,
+        tuning = _settings.BypassTuning,
+        favoriteProfiles = _settings.FavoriteProfiles.Select(profile => new
+        {
+            level = WinwsProfileComposer.NormalizeLevel(profile.Level),
+            tuning = WinwsProfileComposer.NormalizeTuning(profile.Tuning)
+        })
+    });
+
+    private static List<FavoriteProfileSettings> NormalizeFavorites(IEnumerable<FavoriteProfileSettings> favorites)
+    {
+        return favorites
+            .Where(profile => profile is not null)
+            .Select(profile => new FavoriteProfileSettings
+            {
+                Level = WinwsProfileComposer.NormalizeLevel(profile.Level),
+                Tuning = WinwsProfileComposer.NormalizeTuning(profile.Tuning)
+            })
+            .DistinctBy(profile => $"{profile.Level}:{profile.Tuning}", StringComparer.OrdinalIgnoreCase)
+            .Take(5)
+            .ToList();
     }
 
     private async Task SetGameFilterAsync(JsonElement root)
@@ -549,8 +680,9 @@ public partial class MainWindow : Window
                     _settings.BypassLevel,
                     _settings.GameFilter,
                     runtimeLists.BypassPath,
-                    runtimeLists.ExclusionPath);
-                await LogToUiAsync("info", $"Применение уровня {LevelDisplayName(_settings.BypassLevel)}. Сервисы: {string.Join(", ", ActiveProfileNames())}.");
+                    runtimeLists.ExclusionPath,
+                    _settings.BypassTuning);
+                await LogToUiAsync("info", $"Применение уровня {LevelDisplayName(_settings.BypassLevel)} · {TuningDisplayName(_settings.BypassTuning)}. Сервисы: {string.Join(", ", ActiveProfileNames())}.");
                 await LogToUiAsync("info", $"Пользовательские списки: обход — {runtimeLists.BypassCount}, исключения — {runtimeLists.ExclusionCount}.");
                 await _components.StopAllAsync();
                 _components.SetArguments("dpi", arguments);
@@ -781,9 +913,8 @@ public partial class MainWindow : Window
 
     private void UpdateTrayState(bool protectionEnabled)
     {
-        _trayProtectionItem.Text = protectionEnabled ? "Остановить защиту" : "Запустить защиту";
-        _trayProtectionItem.Enabled = !_protectionTransitioning && !_advisorRunning;
         _trayIcon.Text = protectionEnabled ? "VortexPass — защита включена" : "VortexPass — защита выключена";
+        _trayMenu.UpdateState(protectionEnabled, _protectionTransitioning || _advisorRunning);
     }
 
     private async Task RunMetricsLoopAsync(CancellationToken cancellationToken)
@@ -793,10 +924,10 @@ public partial class MainWindow : Window
         {
             var counters = ReadNetworkCounters();
             var active = _protectionStarted.HasValue;
-            if (active && DateTimeOffset.UtcNow >= _nextHealthCheckUtc)
+            if (active && !_advisorRunning && DateTimeOffset.UtcNow >= _nextHealthCheckUtc)
             {
                 _nextHealthCheckUtc = DateTimeOffset.UtcNow.AddSeconds(15);
-                await RunHealthChecksAsync(cancellationToken);
+                _ = RunHealthChecksGuardedAsync(cancellationToken);
             }
             var pings = _healthStatuses.ToDictionary(x => x.Key, x => x.Value.IsHealthy ? x.Value.LatencyMs : null, StringComparer.OrdinalIgnoreCase);
             await PostUiAsync(new
@@ -809,6 +940,24 @@ public partial class MainWindow : Window
                 discordPing = pings.GetValueOrDefault("discord"),
                 telegramPing = pings.GetValueOrDefault("telegram")
             });
+        }
+    }
+
+    private async Task RunHealthChecksGuardedAsync(CancellationToken cancellationToken)
+    {
+        if (Interlocked.Exchange(ref _healthCheckRunning, 1) != 0) return;
+        try
+        {
+            await RunHealthChecksAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            await AppendBackgroundErrorAsync("Сетевая проверка", ex);
+        }
+        finally
+        {
+            Volatile.Write(ref _healthCheckRunning, 0);
         }
     }
 
@@ -897,6 +1046,18 @@ public partial class MainWindow : Window
         "light" => "Лёгкий", "moderate" => "Умеренный", "medium" => "Средний", "complex" => "Сложный", "aggressive" => "Агрессивный", _ => "Средний"
     };
 
+    private static string TuningDisplayName(int tuning) => WinwsProfileComposer.NormalizeTuning(tuning) switch
+    {
+        0 => "Стандарт",
+        1 => "Усиленный +2",
+        2 => "Усиленный +4",
+        3 => "Максимум +6",
+        _ => "Стандарт"
+    };
+
+    private static string ProfileDisplayName(string level, int tuning) =>
+        $"{LevelDisplayName(WinwsProfileComposer.NormalizeLevel(level))} · {TuningDisplayName(tuning)}";
+
     private static (long Bytes, long Packets) ReadNetworkCounters()
     {
         long bytes = 0, packets = 0;
@@ -904,7 +1065,7 @@ public partial class MainWindow : Window
         {
             try
             {
-                var stats = nic.GetIPv4Statistics();
+                var stats = nic.GetIPStatistics();
                 bytes += stats.BytesReceived + stats.BytesSent;
                 packets += stats.UnicastPacketsReceived + stats.UnicastPacketsSent + stats.NonUnicastPacketsReceived + stats.NonUnicastPacketsSent;
             }
@@ -1027,6 +1188,8 @@ public partial class MainWindow : Window
     {
         if (_allowClose)
         {
+            _trayMenu.Hide();
+            _trayMenu.Close();
             _trayIcon.Visible = false;
             _trayIcon.Dispose();
             _lifetime.Cancel();

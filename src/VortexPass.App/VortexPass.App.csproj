@@ -6,6 +6,7 @@
     <OutputType>WinExe</OutputType>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\VortexPass.ico</ApplicationIcon>
     <AssemblyName>VortexPass</AssemblyName>
     <RootNamespace>VortexPass.App</RootNamespace>
     <Version>0.1.0</Version>
@@ -16,6 +17,8 @@
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3719.77" />
     <Content Include="..\..\assets\external-components.json" Link="assets\external-components.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="web-dist\**\*" Link="web\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Resource Include="Assets\VortexPass.ico" />
+    <Resource Include="Assets\VortexPass-logo.png" />
   </ItemGroup>
   <Target Name="CopyUpdaterToApplicationOutput" AfterTargets="Build">
     <ItemGroup>

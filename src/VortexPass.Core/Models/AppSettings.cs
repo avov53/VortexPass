@@ -7,10 +7,18 @@ public sealed class AppSettings
     public DateTimeOffset? LastUpdateCheckUtc { get; set; }
     public BypassProfileSettings Profiles { get; set; } = new();
     public string BypassLevel { get; set; } = "medium";
+    public int BypassTuning { get; set; }
+    public List<FavoriteProfileSettings> FavoriteProfiles { get; set; } = [];
     public int ProfileSettingsVersion { get; set; }
     public GameFilterSettings GameFilter { get; set; } = new();
     public List<string> CustomBypassDomains { get; set; } = [];
     public List<string> ExcludedDomains { get; set; } = DefaultDomainLists.CreateExclusions();
+}
+
+public sealed class FavoriteProfileSettings
+{
+    public string Level { get; set; } = "medium";
+    public int Tuning { get; set; }
 }
 
 public sealed class BypassProfileSettings

@@ -7,16 +7,18 @@ public static class WinwsProfileComposer
     public const string FlowsealCommit = "61d7596c7ce82b6f320e5c79ff4598856f4ae7d3";
 
     public static string Compose(BypassProfileSettings profiles, string level) =>
-        Compose(profiles, level, new GameFilterSettings(), null, null);
+        Compose(profiles, level, new GameFilterSettings(), null, null, 0);
 
     public static string Compose(
         BypassProfileSettings profiles,
         string level,
         GameFilterSettings gameFilter,
         string? customBypassListPath,
-        string? exclusionListPath)
+        string? exclusionListPath,
+        int tuning = 0)
     {
         level = NormalizeLevel(level);
+        tuning = NormalizeTuning(tuning);
         var includeYouTubeWeb = profiles.YouTube || profiles.Web;
         var includeDiscordWeb = profiles.Discord || profiles.Web;
         var includeTelegramWeb = profiles.Web;
@@ -50,74 +52,74 @@ public static class WinwsProfileComposer
         var rules = new List<string>();
 
         if (includeYouTubeWeb)
-            AddDomainRules(rules, "files\\list-youtube.txt", level, includeHttp: true, exclusionListPath);
+            AddDomainRules(rules, "files\\list-youtube.txt", level, tuning, includeHttp: true, exclusionListPath);
 
         if (includeDiscordWeb)
-            AddDomainRules(rules, "files\\list-discord.txt", level, includeHttp: true, exclusionListPath);
+            AddDomainRules(rules, "files\\list-discord.txt", level, tuning, includeHttp: true, exclusionListPath);
 
         if (includeTelegramWeb || includeTelegramDesktop)
-            AddDomainRules(rules, "files\\list-telegram.txt", level, includeHttp: false, exclusionListPath);
+            AddDomainRules(rules, "files\\list-telegram.txt", level, tuning, includeHttp: false, exclusionListPath);
 
         if (includeRoblox)
-            AddDomainRules(rules, "files\\list-roblox.txt", level, includeHttp: true, exclusionListPath);
+            AddDomainRules(rules, "files\\list-roblox.txt", level, tuning, includeHttp: true, exclusionListPath);
 
         if (!string.IsNullOrWhiteSpace(customBypassListPath))
-            AddDomainRules(rules, customBypassListPath, level, includeHttp: true, exclusionListPath);
+            AddDomainRules(rules, customBypassListPath, level, tuning, includeHttp: true, exclusionListPath);
 
         if (includeDiscordVoice)
         {
             rules.Add($"--filter-udp=19294-19344,50000-50100 --filter-l7=discord,stun " +
                       "--dpi-desync=fake --dpi-desync-fake-discord=files\\ACTIVE_DISCORD_UDP.bin " +
                       "--dpi-desync-fake-stun=files\\ACTIVE_DISCORD_UDP.bin " +
-                      $"--dpi-desync-repeats={Repeats(level)} --new");
+                      $"--dpi-desync-repeats={Repeats(level, tuning)} --new");
             rules.Add("--filter-tcp=2053,2083,2087,2096,8443 --hostlist-domains=discord.media " +
-                      TcpStrategy(level, "681", "files\\tls_clienthello_www_google_com.bin") + ExclusionOption(exclusionListPath) + " --new");
+                      TcpStrategy(level, tuning, "681", "files\\tls_clienthello_www_google_com.bin") + ExclusionOption(exclusionListPath) + " --new");
         }
 
         if (includeGameUdp)
         {
             rules.Add($"--filter-udp=5055-5058 --dpi-desync=fake --dpi-desync-any-protocol " +
-                      $"--dpi-desync-repeats={Repeats(level)} --new");
+                      $"--dpi-desync-repeats={Repeats(level, tuning)} --new");
         }
         if (includeGameTcp)
         {
             rules.Add("--filter-tcp=5055,5056,5058 --dpi-desync-any-protocol " +
-                      TcpStrategy(level, "681", "files\\tls_clienthello_www_google_com.bin") + " --new");
+                      TcpStrategy(level, tuning, "681", "files\\tls_clienthello_www_google_com.bin") + " --new");
         }
 
         return $"{string.Join(' ', capture)} {string.Join(' ', rules)}";
     }
 
-    private static void AddDomainRules(List<string> rules, string hostlist, string level, bool includeHttp, string? exclusionListPath)
+    private static void AddDomainRules(List<string> rules, string hostlist, string level, int tuning, bool includeHttp, string? exclusionListPath)
     {
         var hostlistOption = $"--hostlist={QuotePath(hostlist)}";
         var exclusionOption = ExclusionOption(exclusionListPath);
         if (includeHttp)
         {
             rules.Add($"--filter-tcp=80 {hostlistOption} " +
-                      TcpStrategy(level, "568", "files\\tls_clienthello_4pda_to.bin") + exclusionOption + " --new");
+                      TcpStrategy(level, tuning, "568", "files\\tls_clienthello_4pda_to.bin") + exclusionOption + " --new");
         }
 
         rules.Add($"--filter-tcp=443 {hostlistOption} " +
-                  TcpStrategy(level, "681", "files\\tls_clienthello_www_google_com.bin") + exclusionOption + " --new");
+                  TcpStrategy(level, tuning, "681", "files\\tls_clienthello_www_google_com.bin") + exclusionOption + " --new");
         rules.Add($"--filter-udp=443 {hostlistOption} --filter-l7=quic --dpi-desync=fake " +
-                  $"--dpi-desync-repeats={Repeats(level)} --dpi-desync-fake-quic=files\\quic_initial_www_google_com.bin{exclusionOption} --new");
+                  $"--dpi-desync-repeats={Repeats(level, tuning)} --dpi-desync-fake-quic=files\\quic_initial_www_google_com.bin{exclusionOption} --new");
     }
 
     private static string QuotePath(string value) => value.Contains(' ') ? $"\"{value}\"" : value;
     private static string ExclusionOption(string? path) => string.IsNullOrWhiteSpace(path) ? string.Empty : $" --hostlist-exclude={QuotePath(path)}";
 
-    private static string TcpStrategy(string level, string overlap, string pattern) => level switch
+    private static string TcpStrategy(string level, int tuning, string overlap, string pattern) => level switch
     {
-        "light" => "--dpi-desync=fake --dpi-desync-repeats=2 --dpi-desync-autottl=2",
-        "moderate" => $"--dpi-desync=fake,fakedsplit --dpi-desync-repeats=4 --dpi-desync-fooling=ts --dpi-desync-fakedsplit-pattern=0x00 --dpi-desync-fake-tls={pattern}",
-        "medium" => $"--dpi-desync=multisplit --dpi-desync-split-seqovl={overlap} --dpi-desync-split-pos=1 --dpi-desync-split-seqovl-pattern={pattern}",
-        "complex" => $"--dpi-desync=fake,multisplit --dpi-desync-repeats=6 --dpi-desync-split-seqovl={overlap} --dpi-desync-split-pos=1 --dpi-desync-split-seqovl-pattern={pattern}",
-        "aggressive" => $"--dpi-desync=fake,fakedsplit --dpi-desync-repeats=12 --dpi-desync-fooling=ts --dpi-desync-fakedsplit-pattern=0x00 --dpi-desync-fake-tls=files\\stun.bin --dpi-desync-fake-tls={pattern}",
+        "light" => $"--dpi-desync=fake --dpi-desync-repeats={Repeats(level, tuning)} --dpi-desync-autottl=2",
+        "moderate" => $"--dpi-desync=fake,fakedsplit --dpi-desync-repeats={Repeats(level, tuning)} --dpi-desync-fooling=ts --dpi-desync-fakedsplit-pattern=0x00 --dpi-desync-fake-tls={pattern}",
+        "medium" => $"--dpi-desync=multisplit --dpi-desync-split-seqovl={AdjustedOverlap(overlap, tuning)} --dpi-desync-split-pos=1 --dpi-desync-split-seqovl-pattern={pattern}",
+        "complex" => $"--dpi-desync=fake,multisplit --dpi-desync-repeats={Repeats(level, tuning)} --dpi-desync-split-seqovl={AdjustedOverlap(overlap, tuning)} --dpi-desync-split-pos=1 --dpi-desync-split-seqovl-pattern={pattern}",
+        "aggressive" => $"--dpi-desync=fake,fakedsplit --dpi-desync-repeats={Repeats(level, tuning)} --dpi-desync-fooling=ts --dpi-desync-fakedsplit-pattern=0x00 --dpi-desync-fake-tls=files\\stun.bin --dpi-desync-fake-tls={pattern}",
         _ => throw new ArgumentOutOfRangeException(nameof(level))
     };
 
-    private static int Repeats(string level) => level switch
+    private static int Repeats(string level, int tuning) => (level switch
     {
         "light" => 2,
         "moderate" => 4,
@@ -125,7 +127,10 @@ public static class WinwsProfileComposer
         "complex" => 8,
         "aggressive" => 12,
         _ => 6
-    };
+    }) + NormalizeTuning(tuning) * 2;
+
+    private static string AdjustedOverlap(string overlap, int tuning) =>
+        int.TryParse(overlap, out var value) ? (value + NormalizeTuning(tuning) * 64).ToString() : overlap;
 
     public static string NormalizeLevel(string? level) => level?.ToLowerInvariant() switch
     {
@@ -138,4 +143,6 @@ public static class WinwsProfileComposer
         "udp" or "tcp" or "all" => protocol.ToLowerInvariant(),
         _ => "all"
     };
+
+    public static int NormalizeTuning(int tuning) => Math.Clamp(tuning, 0, 3);
 }

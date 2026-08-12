@@ -2,7 +2,6 @@ import { useState, useEffect, useRef } from "react";
 import type { ComponentType, SVGProps } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
-  Shield,
   ShieldCheck,
   ShieldOff,
   Zap,
@@ -38,11 +37,15 @@ import {
   Pencil,
   Save,
   Sparkles,
+  Search,
+  Star,
+  Play,
+  SlidersHorizontal,
 } from "lucide-react";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Tab = "dashboard" | "youtube" | "telegram" | "gamefilter" | "settings";
+type Tab = "dashboard" | "profiles" | "youtube" | "telegram" | "gamefilter" | "settings";
 
 type NativeWebView = { postMessage: (message: unknown) => void };
 type NativeWindow = Window & {
@@ -104,7 +107,8 @@ interface HostsInfo { applied: boolean; entryCount: number; updatedAt?: string; 
 interface GameFilterInfo { selectedGames: string[]; protocol: "udp" | "tcp" | "all" }
 interface DomainListsInfo { bypass: string[]; exclusions: string[] }
 interface SettingsInfo { autostart: boolean; tray: boolean }
-interface AdvisorCandidate { level: string; label: string; healthy: number; total: number; latencyMs: number | null; summary: string }
+interface FavoriteProfile { level: string; tuning: number }
+interface AdvisorCandidate { level: string; tuning: number; label: string; healthy: number; total: number; latencyMs: number | null; summary: string }
 interface AdvisorInfo {
   state: "idle" | "detecting" | "testing" | "complete" | "failed";
   provider?: string;
@@ -114,6 +118,41 @@ interface AdvisorInfo {
   message?: string;
   error?: string;
   candidates?: AdvisorCandidate[];
+}
+
+const PROFILE_LEVELS = [
+  { id: "light", label: "Лёгкий", short: "Минимальное вмешательство", description: "Узкая обработка трафика с минимальной нагрузкой." },
+  { id: "moderate", label: "Умеренный", short: "Базовая защита", description: "Базовые TLS, QUIC и UDP-правила для обычных блокировок." },
+  { id: "medium", label: "Средний", short: "Устойчивый профиль", description: "Сбалансированная стратегия для большинства провайдеров." },
+  { id: "complex", label: "Сложный", short: "Усиленный TLS/QUIC", description: "Multisplit и fake-правила для более строгого DPI." },
+  { id: "aggressive", label: "Агрессивный", short: "Широкий fallback", description: "Максимально широкий профиль для жёсткой фильтрации." },
+] as const;
+
+const PROFILE_TUNINGS = [
+  { id: 0, label: "Стандарт", detail: "штатные повторы" },
+  { id: 1, label: "Усиленный +2", detail: "+2 повтора" },
+  { id: 2, label: "Усиленный +4", detail: "+4 повтора" },
+  { id: 3, label: "Максимум +6", detail: "+6 повторов" },
+] as const;
+
+const PROFILE_CATALOG = PROFILE_LEVELS.flatMap((level) =>
+  PROFILE_TUNINGS.map((tuning) => ({
+    level: level.id,
+    tuning: tuning.id,
+    label: `${level.label} · ${tuning.label}`,
+    levelLabel: level.label,
+    tuningLabel: tuning.label,
+    short: level.short,
+    description: `${level.description} ${tuning.detail}.`,
+  })),
+);
+
+function profileKey(profile: FavoriteProfile) {
+  return `${profile.level}:${profile.tuning}`;
+}
+
+function profileCatalogItem(profile: FavoriteProfile) {
+  return PROFILE_CATALOG.find((item) => item.level === profile.level && item.tuning === profile.tuning) ?? PROFILE_CATALOG[8];
 }
 
 type BrandIconProps = SVGProps<SVGSVGElement> & { size?: number };
@@ -532,11 +571,16 @@ function Dashboard({
   webSelected,
   gameFilterSelected,
   bypassLevel,
+  bypassTuning,
+  favoriteProfiles,
   health,
   hosts,
   advisor,
   onRunAdvisor,
-  onBypassLevelChange,
+  onAdvisorCandidateSelected,
+  onProfileSelected,
+  onFavoriteToggle,
+  onOpenProfiles,
   onServiceSelected,
   onRestoreHosts,
   logs,
@@ -554,11 +598,16 @@ function Dashboard({
   webSelected: boolean;
   gameFilterSelected: boolean;
   bypassLevel: string;
+  bypassTuning: number;
+  favoriteProfiles: FavoriteProfile[];
   health: HealthMap;
   hosts: HostsInfo;
   advisor: AdvisorInfo;
   onRunAdvisor: () => void;
-  onBypassLevelChange: (level: string) => void;
+  onAdvisorCandidateSelected: (candidate: AdvisorCandidate) => void;
+  onProfileSelected: (profile: FavoriteProfile) => void;
+  onFavoriteToggle: (profile: FavoriteProfile, favorite: boolean) => void;
+  onOpenProfiles: () => void;
   onServiceSelected: (serviceId: string, selected: boolean) => void;
   onRestoreHosts: () => void;
   logs: LogEntry[];
@@ -744,9 +793,9 @@ function Dashboard({
             <div>
               <div className="text-[13px] font-semibold text-[#EEEEF8]">Автоматический подбор профиля</div>
               <div className="text-[10px] leading-relaxed text-[#5A5A7A] mt-1 max-w-[650px]">
-                Определит провайдера и последовательно проверит пять уровней на выбранных сервисах. Текущая защита после теста будет восстановлена.
+                Определит провайдера и проверит 20 внутренних стратегий на выбранных сервисах. Пять понятных уровней на дашборде останутся без изменений.
               </div>
-              <div className="text-[9px] font-mono text-[#3A3A5E] mt-1.5">При запуске выполняется один HTTPS-запрос к ipapi.co; публичный IP в VortexPass не сохраняется.</div>
+              <div className="text-[9px] font-mono text-[#3A3A5E] mt-1.5">Проверка может занять несколько минут. Выполняется один HTTPS-запрос к ipapi.co; публичный IP в VortexPass не сохраняется.</div>
             </div>
           </div>
           <motion.button whileHover={advisor.state === "detecting" || advisor.state === "testing" ? {} : { scale: 1.02 }} whileTap={{ scale: 0.98 }}
@@ -764,7 +813,7 @@ function Dashboard({
               <span className="text-[#4A4A6A]">{advisor.provider ?? "Провайдер определяется"}</span>
             </div>
             <div className="h-1.5 rounded-full overflow-hidden bg-white/[0.04]">
-              <motion.div className="h-full rounded-full" animate={{ width: `${advisor.state === "detecting" ? 8 : Math.max(12, (((advisor.progress ?? 0) + 1) / (advisor.total ?? 5)) * 100)}%` }}
+              <motion.div className="h-full rounded-full" animate={{ width: `${advisor.state === "detecting" ? 5 : Math.max(5, (((advisor.progress ?? 0) + 1) / (advisor.total ?? 20)) * 100)}%` }}
                 style={{ background: "linear-gradient(90deg, #6C5CE7, #0078D4)" }} />
             </div>
           </motion.div>
@@ -779,19 +828,30 @@ function Dashboard({
               <span className="text-[9px] font-mono text-[#3A3A5E]">Применение только вручную</span>
             </div>
             <div className="grid grid-cols-3 gap-2">
-              {(advisor.candidates ?? []).map((candidate, index) => (
-                <button key={candidate.level} type="button" onClick={() => onBypassLevelChange(candidate.level)}
-                  className="p-3 rounded-xl text-left transition-all hover:-translate-y-0.5"
-                  style={{ background: index === 0 ? "rgba(0,214,143,0.07)" : "rgba(255,255,255,0.03)", border: `1px solid ${index === 0 ? "rgba(0,214,143,0.2)" : "rgba(255,255,255,0.06)"}` }}>
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[11px] font-semibold text-[#DCDCF0]">{candidate.label}</span>
-                    {index === 0 && <span className="text-[8px] font-mono text-[#00D68F]">ЛУЧШИЙ</span>}
-                  </div>
-                  <div className="text-[9px] font-mono text-[#55557A] mt-1">{candidate.summary}</div>
-                  <div className="text-[9px] font-mono text-[#3A3A5E] mt-1">{candidate.latencyMs != null ? `Среднее ${candidate.latencyMs} мс` : "Без замера задержки"}</div>
-                  <div className="text-[9px] font-semibold text-[#A99BFF] mt-2">Выбрать этот уровень →</div>
-                </button>
-              ))}
+              {(advisor.candidates ?? []).map((candidate, index) => {
+                const favorite = favoriteProfiles.some((profile) => profileKey(profile) === profileKey(candidate));
+                const favoriteLimitReached = !favorite && favoriteProfiles.length >= 5;
+                return (
+                  <motion.div key={`${candidate.level}-${candidate.tuning}`} whileHover={{ y: -2 }} className="group relative p-3 rounded-xl text-left"
+                    style={{ background: index === 0 ? "rgba(0,214,143,0.07)" : "rgba(255,255,255,0.03)", border: `1px solid ${index === 0 ? "rgba(0,214,143,0.2)" : "rgba(255,255,255,0.06)"}` }}>
+                    <button type="button" onClick={() => onAdvisorCandidateSelected(candidate)} className="w-full text-left pr-7">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-semibold text-[#DCDCF0]">{candidate.label}</span>
+                        {index === 0 && <span className="text-[8px] font-mono text-[#00D68F]">ЛУЧШИЙ</span>}
+                      </div>
+                      <div className="text-[9px] font-mono text-[#55557A] mt-1">{candidate.summary}</div>
+                      <div className="text-[9px] font-mono text-[#3A3A5E] mt-1">{candidate.latencyMs != null ? `Среднее ${candidate.latencyMs} мс` : "Без замера задержки"}</div>
+                      <div className="text-[9px] font-semibold text-[#A99BFF] mt-2">Выбрать этот профиль →</div>
+                    </button>
+                    <motion.button type="button" whileTap={{ scale: 0.82 }} disabled={favoriteLimitReached}
+                      onClick={() => onFavoriteToggle(candidate, !favorite)}
+                      title={favoriteLimitReached ? "Можно добавить максимум 5 профилей" : favorite ? "Убрать с дашборда" : "Добавить на дашборд"}
+                      className={`absolute right-2.5 top-2.5 w-7 h-7 rounded-lg flex items-center justify-center transition-all ${favorite ? "opacity-100" : "opacity-0 group-hover:opacity-100"} disabled:cursor-not-allowed`}>
+                      <Star size={15} fill={favorite ? "#F7B955" : "transparent"} style={{ color: favorite ? "#F7B955" : favoriteLimitReached ? "#34344F" : "#77779B", filter: favorite ? "drop-shadow(0 0 6px rgba(247,185,85,0.45))" : "none" }} />
+                    </motion.button>
+                  </motion.div>
+                );
+              })}
             </div>
           </motion.div>
         )}
@@ -820,22 +880,41 @@ function Dashboard({
       </GlassCard>
 
       <GlassCard className="p-5">
-        <SectionLabel>Общий уровень обхода</SectionLabel>
-        <div className="grid grid-cols-5 gap-2">
-          {[
-            ["light", "Лёгкий", "Минимум"],
-            ["moderate", "Умеренный", "Базовый"],
-            ["medium", "Средний", "Устойчивый"],
-            ["complex", "Сложный", "TLS/QUIC"],
-            ["aggressive", "Агрессивный", "Широкий fallback"],
-          ].map(([id, label, description]) => (
-            <button key={id} onClick={() => onBypassLevelChange(id)} className="p-3 rounded-xl text-left transition-all"
-              style={{ background: bypassLevel === id ? "rgba(108,92,231,0.18)" : "rgba(255,255,255,0.035)", border: `1px solid ${bypassLevel === id ? "rgba(108,92,231,0.42)" : "rgba(255,255,255,0.06)"}` }}>
-              <div className="text-[12px] font-semibold" style={{ color: bypassLevel === id ? "#C2BCFF" : "#6A6A91" }}>{label}</div>
-              <div className="text-[9px] font-mono mt-1 text-[#3A3A5E]">{description}</div>
-            </button>
-          ))}
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <SectionLabel>Избранные профили · {favoriteProfiles.length}/5</SectionLabel>
+          <button type="button" onClick={onOpenProfiles} className="text-[9px] font-semibold text-[#A99BFF] hover:text-[#C9C4FF] transition-colors">
+            Открыть каталог →
+          </button>
         </div>
+        {favoriteProfiles.length === 0 ? (
+          <motion.button type="button" onClick={onOpenProfiles} whileHover={{ y: -1 }} whileTap={{ scale: 0.995 }}
+            className="w-full py-5 rounded-xl flex flex-col items-center justify-center text-center"
+            style={{ background: "linear-gradient(135deg,rgba(108,92,231,0.07),rgba(255,255,255,0.02))", border: "1px dashed rgba(108,92,231,0.25)" }}>
+            <Star size={19} className="text-[#69638E] mb-2" />
+            <span className="text-[11px] font-semibold text-[#8884AA]">Добавьте любимые стратегии из каталога</span>
+            <span className="text-[9px] font-mono text-[#454563] mt-1">Здесь можно закрепить до пяти профилей</span>
+          </motion.button>
+        ) : (
+          <div className="grid grid-cols-5 gap-2">
+            {favoriteProfiles.map((profile) => {
+              const item = profileCatalogItem(profile);
+              const selected = bypassLevel === profile.level && bypassTuning === profile.tuning;
+              return (
+                <motion.div key={profileKey(profile)} whileHover={{ y: -2 }} className="group relative min-w-0 rounded-xl"
+                  style={{ background: selected ? "rgba(108,92,231,0.18)" : "rgba(255,255,255,0.035)", border: `1px solid ${selected ? "rgba(108,92,231,0.45)" : "rgba(255,255,255,0.065)"}` }}>
+                  <button type="button" onClick={() => onProfileSelected(profile)} className="w-full p-3 pr-7 text-left min-w-0">
+                    <div className="text-[11px] font-semibold truncate" style={{ color: selected ? "#D1CCFF" : "#8585A5" }}>{item.levelLabel}</div>
+                    <div className="text-[8px] font-mono mt-1 truncate text-[#4A4A6A]">{item.tuningLabel}</div>
+                  </button>
+                  <motion.button type="button" whileTap={{ scale: 0.82 }} onClick={() => onFavoriteToggle(profile, false)} title="Убрать с дашборда"
+                    className="absolute right-1.5 top-1.5 w-6 h-6 rounded-md flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                    <Star size={13} fill="#F7B955" className="text-[#F7B955]" />
+                  </motion.button>
+                </motion.div>
+              );
+            })}
+          </div>
+        )}
         <Divider />
         <SectionLabel>Какие сервисы запускать</SectionLabel>
         <div className="grid grid-cols-5 gap-2">
@@ -1438,7 +1517,107 @@ function GameFilterTab({
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// TAB 5 — SETTINGS
+// TAB 5 — PROFILES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function ProfilesTab({ favorites, currentLevel, currentTuning, pending, onSelect, onLaunch, onFavoriteToggle }: {
+  favorites: FavoriteProfile[];
+  currentLevel: string;
+  currentTuning: number;
+  pending: boolean;
+  onSelect: (profile: FavoriteProfile) => void;
+  onLaunch: (profile: FavoriteProfile) => void;
+  onFavoriteToggle: (profile: FavoriteProfile, favorite: boolean) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const normalizedQuery = query.trim().toLocaleLowerCase("ru-RU");
+  const profiles = PROFILE_CATALOG.filter((profile) =>
+    !normalizedQuery || [profile.label, profile.short, profile.description, profile.level]
+      .some((value) => value.toLocaleLowerCase("ru-RU").includes(normalizedQuery)),
+  );
+
+  return (
+    <div className="flex flex-col gap-5">
+      <div>
+        <h1 className="text-[23px] font-bold text-white" style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}>Профили</h1>
+        <p className="text-[12px] text-[#67678B] mt-1">Все 20 стратегий обхода, быстрый запуск и избранное для дашборда</p>
+      </div>
+
+      <GlassCard className="p-5 overflow-hidden relative">
+        <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(circle at 8% 0%,rgba(177,36,57,0.09),transparent 38%),radial-gradient(circle at 92% 0%,rgba(108,92,231,0.11),transparent 42%)" }} />
+        <div className="relative flex items-center gap-3">
+          <motion.div animate={{ color: query ? "#C5BFFF" : "#68688C" }} className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0"
+            style={{ background: "rgba(108,92,231,0.09)", border: "1px solid rgba(108,92,231,0.2)" }}>
+            <Search size={18} />
+          </motion.div>
+          <div className="relative flex-1">
+            <input value={query} onChange={(event) => setQuery(event.target.value)} autoComplete="off"
+              placeholder="Найдите нужный профиль…"
+              className="w-full h-11 px-4 rounded-xl bg-white/[0.035] border border-white/[0.07] text-[12px] text-[#EEEEF8] placeholder:text-[#4B4B6B] outline-none focus:border-[#6C5CE7]/60 focus:ring-2 focus:ring-[#6C5CE7]/15 transition-all" />
+          </div>
+          <div className="px-3 py-2 rounded-xl text-[10px] font-mono text-[#77779B] bg-white/[0.035] border border-white/[0.06] whitespace-nowrap">
+            Избранное {favorites.length}/5
+          </div>
+        </div>
+      </GlassCard>
+
+      <div className="flex items-center justify-between px-1">
+        <span className="text-[10px] font-mono text-[#55557A]">Найдено профилей: {profiles.length}</span>
+        <span className="text-[9px] font-mono text-[#3A3A5E]">Запуск использует отмеченные на дашборде сервисы</span>
+      </div>
+
+      <motion.div layout className="grid grid-cols-2 gap-3">
+        <AnimatePresence mode="popLayout">
+          {profiles.map((profile) => {
+            const favorite = favorites.some((item) => profileKey(item) === profileKey(profile));
+            const selected = currentLevel === profile.level && currentTuning === profile.tuning;
+            const favoriteLimitReached = !favorite && favorites.length >= 5;
+            return (
+              <motion.div layout key={profileKey(profile)} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, scale: 0.97 }}
+                whileHover={{ y: -2 }} className="group relative p-4 rounded-2xl overflow-hidden"
+                style={{ background: selected ? "linear-gradient(135deg,rgba(108,92,231,0.16),rgba(255,255,255,0.035))" : "rgba(255,255,255,0.032)", border: `1px solid ${selected ? "rgba(108,92,231,0.42)" : "rgba(255,255,255,0.07)"}` }}>
+                <button type="button" onClick={() => onSelect(profile)} className="w-full text-left pr-20">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[13px] font-semibold" style={{ color: selected ? "#D3CFFF" : "#E2E2EF", fontFamily: "'Plus Jakarta Sans', sans-serif" }}>{profile.levelLabel}</span>
+                    {selected && <span className="px-1.5 py-0.5 rounded text-[7px] font-mono text-[#BEB7FF] bg-[#6C5CE7]/15 border border-[#6C5CE7]/25">ВЫБРАН</span>}
+                  </div>
+                  <div className="text-[10px] font-semibold text-[#8D86BD] mt-1">{profile.tuningLabel}</div>
+                  <div className="text-[9px] font-mono text-[#55557A] mt-2 leading-relaxed">{profile.description}</div>
+                </button>
+                <div className="absolute right-3 top-3 flex items-center gap-1.5">
+                  <motion.button type="button" whileHover={{ scale: 1.06 }} whileTap={{ scale: 0.88 }} disabled={pending}
+                    onClick={() => onLaunch(profile)} title="Применить и запустить защиту"
+                    className="w-8 h-8 rounded-lg flex items-center justify-center disabled:opacity-35"
+                    style={{ color: "#BEB8FF", background: "rgba(108,92,231,0.15)", border: "1px solid rgba(108,92,231,0.3)" }}>
+                    <Play size={14} fill="currentColor" />
+                  </motion.button>
+                  <motion.button type="button" whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.82 }} disabled={favoriteLimitReached}
+                    onClick={() => onFavoriteToggle(profile, !favorite)}
+                    title={favoriteLimitReached ? "Можно добавить максимум 5 профилей" : favorite ? "Убрать с дашборда" : "Добавить на дашборд"}
+                    className="w-8 h-8 rounded-lg flex items-center justify-center disabled:cursor-not-allowed"
+                    style={{ background: favorite ? "rgba(247,185,85,0.12)" : "rgba(255,255,255,0.035)", border: `1px solid ${favorite ? "rgba(247,185,85,0.3)" : "rgba(255,255,255,0.07)"}` }}>
+                    <Star size={15} fill={favorite ? "#F7B955" : "transparent"} style={{ color: favorite ? "#F7B955" : favoriteLimitReached ? "#34344F" : "#77779B", filter: favorite ? "drop-shadow(0 0 7px rgba(247,185,85,0.5))" : "none", transition: "all .2s ease" }} />
+                  </motion.button>
+                </div>
+              </motion.div>
+            );
+          })}
+        </AnimatePresence>
+      </motion.div>
+
+      {profiles.length === 0 && (
+        <GlassCard className="p-10 text-center">
+          <Search size={22} className="mx-auto text-[#454563]" />
+          <div className="text-[12px] font-semibold text-[#77779A] mt-3">Профили не найдены</div>
+          <button type="button" onClick={() => setQuery("")} className="text-[10px] text-[#A99BFF] mt-2">Сбросить поиск</button>
+        </GlassCard>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TAB 6 — SETTINGS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function DomainListEditor({ title, description, values, emptyText, onSave }: {
@@ -1694,6 +1873,7 @@ function SettingsTab({ update, domains, settings, onSettingsChange, onSaveDomain
 
 const NAV: { id: Tab; Icon: BrandIcon; trailingIcon?: BrandIcon; label: string; sub: string; color: string }[] = [
   { id: "dashboard", Icon: LayoutDashboard, label: "Дашборд", sub: "Статус и управление", color: "#A99BFF" },
+  { id: "profiles", Icon: SlidersHorizontal, label: "Профили", sub: "20 стратегий · Избранное", color: "#D0A3FF" },
   { id: "youtube", Icon: YouTubeIcon, trailingIcon: DiscordIcon, label: "YouTube & Discord", sub: "Стратегии обхода DPI", color: "#FF5B72" },
   { id: "telegram", Icon: TelegramIcon, label: "Telegram", sub: "Desktop · Web", color: "#45C5F5" },
   { id: "gamefilter", Icon: GameFilterIcon, label: "Game Filter", sub: "Игры · UDP/TCP", color: "#F7B955" },
@@ -1730,6 +1910,11 @@ export default function App() {
     exclusions: Array.isArray((window as NativeWindow).__vortexRuntime?.domains?.exclusions) ? (window as NativeWindow).__vortexRuntime?.domains.exclusions : [],
   }));
   const [bypassLevel, setBypassLevel] = useState(String((window as NativeWindow).__vortexRuntime?.bypassLevel ?? "medium"));
+  const [bypassTuning, setBypassTuning] = useState(Number((window as NativeWindow).__vortexRuntime?.bypassTuning ?? 0));
+  const [favoriteProfiles, setFavoriteProfiles] = useState<FavoriteProfile[]>(() => {
+    const profiles = (window as NativeWindow).__vortexRuntime?.favoriteProfiles;
+    return Array.isArray(profiles) ? profiles.slice(0, 5).map((profile) => ({ level: String(profile.level), tuning: Number(profile.tuning ?? 0) })) : [];
+  });
   const [health, setHealth] = useState<HealthMap>({});
   const [hosts, setHosts] = useState<HostsInfo>({ applied: false, entryCount: 0, detail: "hosts не применён" });
   const [logs, setLogs] = useState<LogEntry[]>(SEED_LOGS);
@@ -1742,7 +1927,13 @@ export default function App() {
     if (!message?.type) return;
     if (message.type === "metrics") setMetrics(message as Metrics);
     if (message.type === "update.status") setUpdate(message as UpdateInfo);
-    if (message.type === "profile.status") setBypassLevel(String(message.level ?? "medium"));
+    if (message.type === "profile.status") {
+      setBypassLevel(String(message.level ?? "medium"));
+      setBypassTuning(Number(message.tuning ?? 0));
+      if (Array.isArray(message.favoriteProfiles)) {
+        setFavoriteProfiles(message.favoriteProfiles.slice(0, 5).map((profile: any) => ({ level: String(profile.level), tuning: Number(profile.tuning ?? 0) })));
+      }
+    }
     if (message.type === "health.status") setHealth((message.services ?? {}) as HealthMap);
     if (message.type === "hosts.status") setHosts(message as HostsInfo);
     if (message.type === "settings.status") setSettings({ autostart: Boolean(message.autostart), tray: Boolean(message.tray) });
@@ -1780,6 +1971,26 @@ export default function App() {
     postNativeMessage("protection.set", next);
   };
 
+  const handleProfileSelected = (profile: FavoriteProfile) => {
+    if (controlsBusy) return;
+    setBypassLevel(profile.level);
+    setBypassTuning(profile.tuning);
+    postNativePayload({ type: "profile.set", level: profile.level, tuning: profile.tuning });
+  };
+
+  const handleFavoriteToggle = (profile: FavoriteProfile, favorite: boolean) => {
+    if (favorite && favoriteProfiles.length >= 5) return;
+    postNativePayload({ type: "profile.favorite.set", level: profile.level, tuning: profile.tuning, favorite });
+  };
+
+  const handleProfileLaunch = (profile: FavoriteProfile) => {
+    if (controlsBusy) return;
+    setBypassLevel(profile.level);
+    setBypassTuning(profile.tuning);
+    setProtectionPending(true);
+    postNativePayload({ type: "profile.launch", level: profile.level, tuning: profile.tuning });
+  };
+
   const content: Record<Tab, React.ReactNode> = {
     dashboard: (
       <Dashboard
@@ -1795,11 +2006,19 @@ export default function App() {
         webSelected={webBypass}
         gameFilterSelected={gameFilterSelected}
         bypassLevel={bypassLevel}
+        bypassTuning={bypassTuning}
+        favoriteProfiles={favoriteProfiles}
         health={health}
         hosts={hosts}
         advisor={advisor}
         onRunAdvisor={() => postNativePayload({ type: "advisor.run" })}
-        onBypassLevelChange={(level) => { if (!controlsBusy) { setBypassLevel(level); postNativePayload({ type: "profile.set", level }); } }}
+        onAdvisorCandidateSelected={(candidate) => {
+          if (controlsBusy) return;
+          handleProfileSelected(candidate);
+        }}
+        onProfileSelected={handleProfileSelected}
+        onFavoriteToggle={handleFavoriteToggle}
+        onOpenProfiles={() => setTab("profiles")}
         onServiceSelected={(serviceId, selected) => {
           if (controlsBusy) return;
           if (serviceId === "youtube") setYtSelected(selected);
@@ -1812,6 +2031,17 @@ export default function App() {
         onRestoreHosts={() => postNativeMessage("hosts.restore")}
         logs={logs}
         metrics={metrics}
+      />
+    ),
+    profiles: (
+      <ProfilesTab
+        favorites={favoriteProfiles}
+        currentLevel={bypassLevel}
+        currentTuning={bypassTuning}
+        pending={controlsBusy}
+        onSelect={handleProfileSelected}
+        onLaunch={handleProfileLaunch}
+        onFavoriteToggle={handleFavoriteToggle}
       />
     ),
     youtube: (
@@ -1905,15 +2135,18 @@ export default function App() {
         {/* Logo */}
         <div className="px-5 pt-5 pb-6">
           <div className="flex items-center gap-3">
-            <div
+            <motion.div
+              whileHover={{ scale: 1.06, rotate: -2 }}
+              transition={{ type: "spring", stiffness: 280, damping: 18 }}
               className="w-9 h-9 rounded-[10px] flex items-center justify-center flex-shrink-0"
               style={{
-                background: "linear-gradient(135deg,#6C5CE7 0%,#0078D4 100%)",
-                boxShadow: "0 4px 14px rgba(108,92,231,0.5)",
+                background: "linear-gradient(145deg,rgba(108,18,34,0.96),rgba(29,10,16,0.98))",
+                border: "1px solid rgba(229,66,91,0.5)",
+                boxShadow: "0 0 18px rgba(207,32,61,0.25),0 5px 18px rgba(92,12,26,0.5)",
               }}
             >
-              <Shield size={16} className="text-white" />
-            </div>
+              <img src="/vortexpass-logo.png" alt="VortexPass" className="w-[28px] h-[28px] object-contain" style={{ filter: "brightness(1.55) saturate(1.35) drop-shadow(0 0 5px rgba(225,46,73,0.45))" }} draggable={false} />
+            </motion.div>
             <div>
               <div
                 className="font-bold text-[13px] text-white leading-none"
@@ -1921,7 +2154,7 @@ export default function App() {
               >
                 VortexPass
               </div>
-              <div className="text-[10px] font-mono text-[#2A2A44] mt-0.5">
+              <div className="text-[10px] font-mono text-[#777795] mt-0.5 tracking-[0.01em]">
                 Network Manager
               </div>
             </div>
