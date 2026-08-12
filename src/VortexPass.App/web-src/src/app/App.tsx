@@ -1155,6 +1155,7 @@ function TelegramTab({
   webActive,
   onToggleTg,
   onToggleWeb,
+  onConfigureDesktop,
   pending,
 }: {
   tgActive: boolean;
@@ -1162,6 +1163,7 @@ function TelegramTab({
   webActive: boolean;
   onToggleTg: (v: boolean) => void;
   onToggleWeb: (v: boolean) => void;
+  onConfigureDesktop: () => void;
   pending: boolean;
 }) {
   const tgDesktop = tgSelected;
@@ -1169,7 +1171,7 @@ function TelegramTab({
   const applying = false;
   const applied = tgActive;
 
-  const handleApply = () => onToggleTg(true);
+  const handleApply = () => onConfigureDesktop();
 
   return (
     <div className="flex flex-col gap-5">
@@ -1245,7 +1247,7 @@ function TelegramTab({
                   Telegram Desktop
                 </div>
                 <div className="text-[11px] text-[#3A3A5E] mt-0.5">
-                  Обрабатывается системным DPI-движком при включённой защите
+                  Локальный MTProto → WebSocket/TLS маршрут для стабильной работы Desktop
                 </div>
               </div>
               <Toggle
@@ -1261,9 +1263,9 @@ function TelegramTab({
             {/* Proxy details */}
             <div className="grid grid-cols-3 gap-2 mb-4">
               {[
-                { label: "Движок", value: "winws" },
-                { label: "Драйвер", value: "WinDivert" },
-                { label: "Режим", value: "System" },
+                { label: "Движок", value: "TG WS Proxy" },
+                { label: "Адрес", value: "127.0.0.1" },
+                { label: "Порт", value: "1443" },
               ].map((f) => (
                 <div
                   key={f.label}
@@ -1316,8 +1318,8 @@ function TelegramTab({
               {applying
                 ? "Запуск защиты…"
                 : applied
-                ? "Защита Telegram активна"
-                : "Включить защиту Telegram"}
+                ? "Переподключить Telegram Desktop"
+                : "Сначала запустите защиту Telegram"}
             </motion.button>
 
             {applied && (
@@ -1326,7 +1328,7 @@ function TelegramTab({
                 animate={{ opacity: 1, y: 0 }}
                 className="text-center text-[10px] font-mono text-[#3A3A5E] mt-2"
               >
-                Трафик Telegram обрабатывается системным DPI-движком.
+                Если Telegram откроет окно прокси, подтвердите подключение. Сообщения остаются зашифрованными Telegram.
               </motion.p>
             )}
           </div>
@@ -2065,6 +2067,7 @@ export default function App() {
         pending={controlsBusy}
         onToggleTg={(value) => { if (!controlsBusy) { setTgSelected(value); postNativeMessage("service.set", value, "telegram"); } }}
         onToggleWeb={(value) => { if (!controlsBusy) { setWebBypass(value); postNativeMessage("service.set", value, "web"); } }}
+        onConfigureDesktop={() => postNativeMessage("telegram.proxy.configure")}
       />
     ),
     gamefilter: (

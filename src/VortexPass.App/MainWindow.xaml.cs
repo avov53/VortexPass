@@ -22,6 +22,7 @@ public partial class MainWindow : Window
     private readonly AppSettingsStore _settingsStore;
     private readonly WindowsStartupService _startupService = new();
     private readonly ExternalComponentService _components;
+    private readonly TelegramDesktopProxyService _telegramProxy;
     private readonly ServiceHealthCheckService _healthChecks = new();
     private readonly SystemProxyManager _proxyManager;
     private readonly HostsFileManager _hostsManager;
@@ -60,6 +61,7 @@ public partial class MainWindow : Window
         _settingsStore = new AppSettingsStore(appData);
         _applicationLogPath = Path.Combine(appData, "app.log");
         _components = new ExternalComponentService(AppContext.BaseDirectory);
+        _telegramProxy = new TelegramDesktopProxyService(AppContext.BaseDirectory, appData);
         _proxyManager = new SystemProxyManager(appData);
         _hostsManager = new HostsFileManager(AppContext.BaseDirectory, appData);
         _domainLists = new UserDomainListService(appData);
@@ -88,6 +90,12 @@ public partial class MainWindow : Window
 
     private void TrayIconMouseUp(object? sender, Forms.MouseEventArgs e)
     {
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.Invoke(() => TrayIconMouseUp(sender, e));
+            return;
+        }
+
         if (e.Button == Forms.MouseButtons.Left)
         {
             RestoreWindow();
@@ -285,6 +293,9 @@ public partial class MainWindow : Window
                 case "hosts.restore":
                     await RestoreHostsAsync();
                     break;
+                case "telegram.proxy.configure":
+                    await ConfigureTelegramProxyAsync();
+                    break;
                 case "update.check":
                     await CheckForUpdatesAsync();
                     break;
@@ -326,6 +337,25 @@ public partial class MainWindow : Window
         }
 
         await StopProtectionAsync();
+    }
+
+    private async Task ConfigureTelegramProxyAsync()
+    {
+        if (!_telegramProxy.IsRunning)
+        {
+            await LogToUiAsync("warn", "Сначала отметьте Telegram и запустите защиту, чтобы включить локальный Telegram WS Proxy.");
+            return;
+        }
+
+        try
+        {
+            _telegramProxy.OpenTelegramConfiguration();
+            await LogToUiAsync("info", "Telegram открыт. Подтвердите подключение к локальному прокси 127.0.0.1:1443.");
+        }
+        catch (Exception ex)
+        {
+            await LogToUiAsync("error", $"Не удалось открыть настройку прокси Telegram Desktop: {ex.Message}");
+        }
     }
 
     private async Task SetAutostartAsync(bool enabled)
@@ -407,7 +437,14 @@ public partial class MainWindow : Window
                     try
                     {
                         var checks = AdvisorServiceIds()
-                            .Select(id => _healthChecks.CheckAsync(id, true, true, timeout.Token));
+                            .Select(id => _healthChecks.CheckAsync(
+                                id,
+                                true,
+                                true,
+                                timeout.Token,
+                                appSelected: id == "telegram" && _settings.Profiles.Telegram,
+                                webSelected: id == "telegram" && _settings.Profiles.Web,
+                                telegramProxyRunning: id == "telegram" && _telegramProxy.IsRunning));
                         results.AddRange(await Task.WhenAll(checks));
                     }
                     catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested) { }
@@ -467,6 +504,7 @@ public partial class MainWindow : Window
         if (_settings.Profiles.YouTube || _settings.Profiles.Web) yield return "youtube";
         if (_settings.Profiles.Discord || _settings.Profiles.Web) yield return "discord";
         if (_settings.Profiles.Telegram || _settings.Profiles.Web) yield return "telegram";
+        if (_settings.Profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("roblox", StringComparison.OrdinalIgnoreCase))) yield return "roblox";
     }
 
     private async Task<string?> DetectProviderAsync(CancellationToken cancellationToken)
@@ -499,6 +537,7 @@ public partial class MainWindow : Window
             Interlocked.Increment(ref _healthGeneration);
             await SendServiceSnapshotAsync();
             await _components.StopAllAsync();
+            await _telegramProxy.StopAsync();
             await RestoreHostsCoreAsync();
             _proxyManager.RestoreIfOwned();
             _activeProfiles = new BypassProfileSettings();
@@ -685,6 +724,7 @@ public partial class MainWindow : Window
                 await LogToUiAsync("info", $"Применение уровня {LevelDisplayName(_settings.BypassLevel)} · {TuningDisplayName(_settings.BypassTuning)}. Сервисы: {string.Join(", ", ActiveProfileNames())}.");
                 await LogToUiAsync("info", $"Пользовательские списки: обход — {runtimeLists.BypassCount}, исключения — {runtimeLists.ExclusionCount}.");
                 await _components.StopAllAsync();
+                await _telegramProxy.StopAsync();
                 _components.SetArguments("dpi", arguments);
                 await PostUiAsync(new { type = "log", level = "info", message = "Запуск компонентов обхода…" });
 
@@ -722,6 +762,27 @@ public partial class MainWindow : Window
                 else
                 {
                     _activeProfiles = CloneProfiles(_settings.Profiles);
+                    if (_activeProfiles.Telegram)
+                    {
+                        try
+                        {
+                            await _telegramProxy.StartAsync(_lifetime.Token);
+                            await LogToUiAsync("ok", $"Локальный Telegram Desktop WS Proxy v{TelegramDesktopProxyService.Version} запущен на 127.0.0.1:{TelegramDesktopProxyService.Port}. Ожидается подключение Telegram Desktop.");
+                            if (_telegramProxy.ShouldOfferConfiguration)
+                            {
+                                _telegramProxy.OpenTelegramConfiguration();
+                                await LogToUiAsync("info", "Telegram открыт впервые. Нажмите «Подключить», чтобы Desktop использовал локальный WebSocket-маршрут VortexPass.");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            await LogToUiAsync("error", $"Telegram Desktop proxy не запущен: {ex.Message}");
+                        }
+                    }
+                    else
+                    {
+                        await _telegramProxy.StopAsync();
+                    }
                     var hostsOverrides = await CreateHostsOverridesAsync(_activeProfiles);
                     if (RequiresHosts(_activeProfiles) || hostsOverrides.Count != 0)
                     {
@@ -748,6 +809,7 @@ public partial class MainWindow : Window
             else
             {
                 await _components.StopAllAsync();
+                await _telegramProxy.StopAsync();
                 await RestoreHostsCoreAsync();
                 _proxyManager.RestoreIfOwned();
                 _activeProfiles = new BypassProfileSettings();
@@ -913,6 +975,13 @@ public partial class MainWindow : Window
 
     private void UpdateTrayState(bool protectionEnabled)
     {
+        if (!Dispatcher.CheckAccess())
+        {
+            _ = Dispatcher.InvokeAsync(() => UpdateTrayState(protectionEnabled));
+            return;
+        }
+        if (_shutdownStarted) return;
+
         _trayIcon.Text = protectionEnabled ? "VortexPass — защита включена" : "VortexPass — защита выключена";
         _trayMenu.UpdateState(protectionEnabled, _protectionTransitioning || _advisorRunning);
     }
@@ -965,12 +1034,15 @@ public partial class MainWindow : Window
     {
         var generation = Volatile.Read(ref _healthGeneration);
         var winwsRunning = _components.GetStatuses().Any(x => x.Id == "dpi" && x.State == ServiceState.Running);
-        var checks = new[]
+        var profiles = _activeProfiles.AnyEnabled ? _activeProfiles : _settings.Profiles;
+        var checks = new List<Task<ServiceHealthResult>>
         {
-            _healthChecks.CheckAsync("youtube", IsServiceSelected("youtube"), winwsRunning, cancellationToken),
-            _healthChecks.CheckAsync("discord", IsServiceSelected("discord"), winwsRunning, cancellationToken),
-            _healthChecks.CheckAsync("telegram", IsServiceSelected("telegram"), winwsRunning, cancellationToken)
+            _healthChecks.CheckAsync("youtube", profiles.YouTube || profiles.Web, winwsRunning, cancellationToken),
+            _healthChecks.CheckAsync("discord", profiles.Discord || profiles.Web, winwsRunning, cancellationToken),
+            _healthChecks.CheckAsync("telegram", profiles.Telegram || profiles.Web, winwsRunning, cancellationToken, profiles.Telegram, profiles.Web, _telegramProxy.IsRunning, _telegramProxy.HasTelegramClientActivity)
         };
+        if (profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("roblox", StringComparison.OrdinalIgnoreCase)))
+            checks.Add(_healthChecks.CheckAsync("roblox", true, winwsRunning, cancellationToken));
         var results = await Task.WhenAll(checks);
         if (generation != Volatile.Read(ref _healthGeneration)) return;
         foreach (var result in results)
@@ -1028,7 +1100,7 @@ public partial class MainWindow : Window
         };
     }
 
-    private static string ServiceDisplayName(string id) => id switch { "youtube" => "YouTube", "discord" => "Discord", "telegram" => "Telegram", _ => id };
+    private static string ServiceDisplayName(string id) => id switch { "youtube" => "YouTube", "discord" => "Discord", "telegram" => "Telegram", "roblox" => "Roblox", _ => id };
 
     private static bool RequiresHosts(BypassProfileSettings profiles) => profiles.Web || profiles.Discord;
 
@@ -1214,12 +1286,14 @@ public partial class MainWindow : Window
         try
         {
             await _components.StopAllAsync();
+            await _telegramProxy.StopAsync();
             await RestoreHostsCoreAsync();
             _proxyManager.RestoreIfOwned();
         }
         finally
         {
             _components.Dispose();
+            _telegramProxy.Dispose();
             _advisorHttp.Dispose();
             _allowClose = true;
             Close();

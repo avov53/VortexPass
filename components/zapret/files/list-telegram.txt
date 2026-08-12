@@ -11,3 +11,9 @@ cdn-telegram.org
 telegramusercontent.com
 telegram.space
 telesco.pe
+pluto.web.telegram.org
+venus.web.telegram.org
+aurora.web.telegram.org
+vesta.web.telegram.org
+kws.web.telegram.org
+zws.web.telegram.org

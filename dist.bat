@@ -5,7 +5,7 @@ set "ROOT=%~dp0"
 set "DIST=%ROOT%dist"
 set "STAGING=%ROOT%dist.next"
 set "VERSION=%~1"
-if "%VERSION%"=="" set "VERSION=0.1.0"
+if "%VERSION%"=="" set "VERSION=0.2.0"
 
 echo.
 echo === VortexPass %VERSION% ^| win-x64 Release build ===
@@ -57,6 +57,10 @@ if not exist "%STAGING%\bin\winws.exe" (
   echo ERROR: winws component files were not copied.
   goto :error
 )
+if not exist "%STAGING%\bin\TgWsProxyHeadless\TgWsProxyHeadless.exe" (
+  echo ERROR: Telegram Desktop headless WS Proxy was not copied.
+  goto :error
+)
 if not exist "%STAGING%\bin\files\flowseal-hosts.txt" (
   echo ERROR: pinned Flowseal hosts asset was not copied.
   goto :error
@@ -81,7 +85,7 @@ echo Build complete:
 echo %DIST%
 echo Start the application with: VortexPass.exe
 echo.
-echo Verified winws and WinDivert files were included in dist\bin.
+echo Verified winws, WinDivert and Telegram Desktop headless WS Proxy files were included in dist\bin.
 exit /b 0
 
 :error

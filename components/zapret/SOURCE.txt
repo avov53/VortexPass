@@ -6,3 +6,12 @@ Repository: https://github.com/Flowseal/zapret-discord-youtube
 License: MIT (see FLOWSEAL-LICENSE.txt)
 
 VortexPass invokes winws.exe directly. No batch or command scripts are included or executed.
+
+Telegram Desktop fallback component
+
+Flowseal/tg-ws-proxy v1.9.0
+Commit: 21aaeb3aba97ad3b0ae39c6540a7b1afd12a3f7e
+Repository: https://github.com/Flowseal/tg-ws-proxy
+License: MIT (see TG-WS-PROXY-LICENSE.txt)
+
+VortexPass starts a headless console build from the pinned source tree, without the upstream tray UI, and verifies TgWsProxyHeadless.exe SHA-256 before launch.

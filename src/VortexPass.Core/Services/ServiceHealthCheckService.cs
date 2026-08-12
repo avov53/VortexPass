@@ -33,25 +33,50 @@ public sealed record ServiceHealthResult(
 public sealed class ServiceHealthCheckService
 {
     private sealed record Target(string Host, string Url, string? VoiceHost = null);
+    private sealed record TcpEndpoint(IPAddress Address, int Port);
+
+    private static readonly TcpEndpoint[] TelegramDcEndpoints =
+    [
+        new(IPAddress.Parse("149.154.167.51"), 443),
+        new(IPAddress.Parse("149.154.167.91"), 443),
+        new(IPAddress.Parse("91.108.56.130"), 443),
+        new(IPAddress.Parse("149.154.167.51"), 5222),
+        new(IPAddress.Parse("149.154.167.91"), 5222)
+    ];
+
     private static readonly IReadOnlyDictionary<string, Target> Targets = new Dictionary<string, Target>
     {
         ["youtube"] = new("www.youtube.com", "https://www.youtube.com/generate_204"),
         ["discord"] = new("discord.com", "https://discord.com/api/v10/gateway", "discord.media"),
-        ["telegram"] = new("web.telegram.org", "https://web.telegram.org/")
+        ["telegram"] = new("web.telegram.org", "https://web.telegram.org/"),
+        ["roblox"] = new("thumbnails.roblox.com", "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=1&size=48x48&format=Png&isCircular=false")
     };
 
-    public async Task<ServiceHealthResult> CheckAsync(string id, bool selected, bool winwsRunning, CancellationToken cancellationToken)
+    public async Task<ServiceHealthResult> CheckAsync(
+        string id,
+        bool selected,
+        bool winwsRunning,
+        CancellationToken cancellationToken,
+        bool appSelected = false,
+        bool webSelected = false,
+        bool telegramProxyRunning = false,
+        bool telegramProxyHasClientActivity = false)
     {
         if (!selected) return new(id, ServiceHealthState.NotSelected, "Не выбран");
         if (!winwsRunning) return new(id, ServiceHealthState.WinwsStopped, "winws остановлен");
         if (!Targets.TryGetValue(id, out var target)) throw new ArgumentOutOfRangeException(nameof(id));
+        if (id == "telegram" && !appSelected && !webSelected)
+        {
+            appSelected = true;
+            webSelected = true;
+        }
 
         var dns = "не проверен";
         var tcp = "не проверен";
         var tls = "не проверен";
         var http = "не проверен";
         var voice = target.VoiceHost is null ? null : "не проверен";
-        string? gateway = id == "discord" ? "не проверен" : null;
+        string? gateway = id is "discord" or "telegram" ? "не проверен" : null;
         string? cdn = id == "discord" ? "не проверен" : null;
         IPAddress? address = null;
         Exception? dnsFailure = null;
@@ -140,6 +165,20 @@ public sealed class ServiceHealthCheckService
             gateway = auxiliary[0];
             cdn = auxiliary[1];
         }
+        if (id == "telegram" && appSelected)
+        {
+            gateway = telegramProxyRunning
+                ? await CheckTelegramLocalProxyAsync(telegramProxyHasClientActivity, cancellationToken)
+                : await CheckTelegramDcEndpointAsync(cancellationToken);
+            if (appSelected && !webSelected)
+            {
+                http = "пропущен: выбран Telegram Desktop";
+                var desktopStages = new ServiceProbeStages(dns, tcp, tls, http, voice, gateway, cdn);
+                return gateway.StartsWith("OK", StringComparison.Ordinal)
+                    ? new(id, ServiceHealthState.Healthy, telegramProxyRunning ? "Telegram Desktop подключён к локальному WebSocket-прокси" : $"Telegram Desktop/DC доступен: {gateway}", null, desktopStages)
+                    : new(id, ServiceHealthState.TcpTimeout, $"Telegram Desktop недоступен: {gateway}", null, desktopStages);
+            }
+        }
 
         try
         {
@@ -149,6 +188,22 @@ public sealed class ServiceHealthCheckService
             http = $"OK: HTTP {(int)response.StatusCode}";
             if ((int)response.StatusCode < 500)
             {
+                if (id == "telegram")
+                {
+                    var telegramStages = new ServiceProbeStages(dns, tcp, tls, http, voice, gateway, cdn);
+                    if (webSelected && appSelected && gateway?.StartsWith("OK", StringComparison.Ordinal) != true)
+                        return new(id, ServiceHealthState.HttpUnavailable, $"Telegram Web доступен; Telegram Desktop не подключён: {gateway}", transportLatencyMs, telegramStages);
+
+                    var telegramDetail = appSelected
+                        ? telegramProxyRunning
+                            ? "Telegram Web доступен; Desktop подключён к локальному WebSocket-прокси"
+                            : "Telegram Web и Desktop/DC доступны"
+                        : secureDnsFallback
+                            ? "Работает через Secure DNS; системный DNS Windows недоступен"
+                            : "Telegram Web доступен";
+                    return new(id, ServiceHealthState.Healthy, telegramDetail, transportLatencyMs, telegramStages);
+                }
+
                 var discordAuxiliaryFailed = id == "discord" &&
                     (gateway?.StartsWith("OK", StringComparison.Ordinal) != true || cdn?.StartsWith("OK", StringComparison.Ordinal) != true);
                 var detail = id == "discord"
@@ -181,6 +236,8 @@ public sealed class ServiceHealthCheckService
         }
 
         var stages = new ServiceProbeStages(dns, tcp, tls, http, voice, gateway, cdn);
+        if (id == "telegram" && appSelected && gateway?.StartsWith("OK", StringComparison.Ordinal) == true)
+            return new(id, ServiceHealthState.HttpUnavailable, $"Telegram Desktop/DC доступен; Telegram Web недоступен: {http}", null, stages);
         if (dnsFailure is not null)
             return new(id, ServiceHealthState.DnsUnavailable, $"Системный DNS недоступен; Secure DNS браузера проверяется отдельно. HTTP: {http}", null, stages);
         if (transportFailure == ServiceHealthState.TcpTimeout)
@@ -207,6 +264,24 @@ public sealed class ServiceHealthCheckService
         catch (Exception ex) when (ex is SocketException or OperationCanceledException)
         {
             return $"недоступен: {ShortError(ex)}";
+        }
+    }
+
+    private static async Task<string> CheckTelegramLocalProxyAsync(bool hasClientActivity, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(2));
+            using var client = new TcpClient(AddressFamily.InterNetwork);
+            await client.ConnectAsync(IPAddress.Loopback, TelegramDesktopProxyService.Port, timeout.Token);
+            return hasClientActivity
+                ? $"OK: WS Proxy 127.0.0.1:{TelegramDesktopProxyService.Port}; Telegram подключался"
+                : $"локальный WS Proxy запущен на 127.0.0.1:{TelegramDesktopProxyService.Port}, но Telegram Desktop ещё не подключался";
+        }
+        catch (Exception ex) when (ex is SocketException or OperationCanceledException)
+        {
+            return $"локальный WS Proxy недоступен: {ShortError(ex)}";
         }
     }
 
@@ -262,6 +337,33 @@ public sealed class ServiceHealthCheckService
     }
 
     private sealed record EndpointCheck(bool Success, string Detail);
+
+    private static async Task<string> CheckTelegramDcEndpointAsync(CancellationToken cancellationToken)
+    {
+        var checks = await Task.WhenAll(TelegramDcEndpoints.Select(endpoint =>
+            CheckTcpEndpointAsync(endpoint.Address, endpoint.Port, cancellationToken)));
+        var success = checks.FirstOrDefault(check => check.Success);
+        if (success is not null) return $"OK: {success.Detail}";
+        return string.Join("; ", checks.Select(check => check.Detail).Take(5));
+    }
+
+    private static async Task<EndpointCheck> CheckTcpEndpointAsync(IPAddress address, int port, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromMilliseconds(2500));
+            using var client = new TcpClient(address.AddressFamily);
+            var watch = Stopwatch.StartNew();
+            await client.ConnectAsync(address, port, timeout.Token);
+            watch.Stop();
+            return new(true, $"{address}:{port} {watch.ElapsedMilliseconds} ms");
+        }
+        catch (Exception ex) when (ex is SocketException or OperationCanceledException)
+        {
+            return new(false, $"{address}:{port} {ShortError(ex)}");
+        }
+    }
 
     private static HttpMessageHandler CreateHttpHandler(IPAddress? address, bool usePinnedAddress)
     {

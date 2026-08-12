@@ -109,8 +109,23 @@ public sealed class HostsFileManager
         try
         {
             await File.WriteAllTextAsync(temporary, content, new UTF8Encoding(false), cancellationToken);
-            if (File.Exists(_hostsPath)) File.Replace(temporary, _hostsPath, null, true);
-            else File.Move(temporary, _hostsPath);
+            for (var attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    if (File.Exists(_hostsPath)) File.Replace(temporary, _hostsPath, null, true);
+                    else File.Move(temporary, _hostsPath);
+                    break;
+                }
+                catch (IOException) when (attempt < 8)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(180 * attempt), cancellationToken);
+                }
+                catch (UnauthorizedAccessException) when (attempt < 8)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(180 * attempt), cancellationToken);
+                }
+            }
         }
         finally
         {
