@@ -1,4 +1,3 @@
-<img width="100" height="86" alt="image" src="https://github.com/user-attachments/assets/7e02a56c-a7f5-4882-85e5-85d51fc7fb92" />
 # VortexPass
 
 
