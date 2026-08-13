@@ -43,6 +43,8 @@ public sealed class ServiceHealthCheckService
         new(IPAddress.Parse("149.154.167.51"), 5222),
         new(IPAddress.Parse("149.154.167.91"), 5222)
     ];
+    private static readonly int[] PhotonUdpPorts = [5055, 5056, 5058, 27000, 27001, 27002];
+    private static readonly int[] PhotonWebSocketPorts = [19090, 19093, 9090, 9093, 4530, 4533];
 
     private static readonly IReadOnlyDictionary<string, Target> Targets = new Dictionary<string, Target>
     {
@@ -51,6 +53,7 @@ public sealed class ServiceHealthCheckService
         ["telegram"] = new("web.telegram.org", "https://web.telegram.org/"),
         ["roblox"] = new("thumbnails.roblox.com", "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=1&size=48x48&format=Png&isCircular=false")
     };
+    private static readonly SecureDnsHostResolver SecureDnsResolver = new();
 
     public async Task<ServiceHealthResult> CheckAsync(
         string id,
@@ -64,6 +67,8 @@ public sealed class ServiceHealthCheckService
     {
         if (!selected) return new(id, ServiceHealthState.NotSelected, "Не выбран");
         if (!winwsRunning) return new(id, ServiceHealthState.WinwsStopped, "winws остановлен");
+        if (id.Equals("phasmophobia", StringComparison.OrdinalIgnoreCase))
+            return await CheckPhasmophobiaAsync(cancellationToken);
         if (!Targets.TryGetValue(id, out var target)) throw new ArgumentOutOfRangeException(nameof(id));
         if (id == "telegram" && !appSelected && !webSelected)
         {
@@ -188,6 +193,25 @@ public sealed class ServiceHealthCheckService
             http = $"OK: HTTP {(int)response.StatusCode}";
             if ((int)response.StatusCode < 500)
             {
+                if (id == "youtube")
+                {
+                    var search = await CheckYoutubeSearchEndpointAsync(cancellationToken);
+                    http = $"{http}; Search=[{search.Detail}]";
+                    var youtubeStages = new ServiceProbeStages(dns, tcp, tls, http, voice, gateway, cdn);
+                    if (!search.Success)
+                    {
+                        var partialDetail = secureDnsFallback
+                            ? $"Video endpoint works through Secure DNS, but YouTube search suggestions are unavailable: {search.Detail}"
+                            : $"Video endpoint works, but YouTube search suggestions are unavailable: {search.Detail}";
+                        return new(id, ServiceHealthState.HttpUnavailable, partialDetail, null, youtubeStages);
+                    }
+
+                    var youtubeDetail = secureDnsFallback
+                        ? "YouTube works through Secure DNS; system DNS Windows is unavailable; search suggestions OK"
+                        : "YouTube works; system DNS and search suggestions OK";
+                    return new(id, ServiceHealthState.Healthy, youtubeDetail, transportLatencyMs, youtubeStages);
+                }
+
                 if (id == "telegram")
                 {
                     var telegramStages = new ServiceProbeStages(dns, tcp, tls, http, voice, gateway, cdn);
@@ -245,6 +269,58 @@ public sealed class ServiceHealthCheckService
         if (transportFailure == ServiceHealthState.TlsFailed)
             return new(id, ServiceHealthState.TlsFailed, $"TLS не установлен; HTTP: {http}", null, stages);
         return new(id, ServiceHealthState.HttpUnavailable, $"HTTP/WebSocket-совместимая точка недоступна: {http}", null, stages);
+    }
+
+    private static async Task<EndpointCheck> CheckYoutubeSearchEndpointAsync(CancellationToken cancellationToken)
+    {
+        const string searchHost = "suggestqueries.google.com";
+        const string searchUrl = "https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=vortexpass";
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(7));
+            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(7) };
+            using var request = new HttpRequestMessage(HttpMethod.Get, searchUrl);
+            request.Headers.UserAgent.ParseAdd("Mozilla/5.0 VortexPass/0.2");
+            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+            var success = (int)response.StatusCode < 500;
+            if (success)
+                return new EndpointCheck(true, $"suggest=HTTP {(int)response.StatusCode}");
+
+            var fallback = await CheckYoutubeSearchEndpointWithSecureDnsAsync(searchHost, searchUrl, cancellationToken);
+            return fallback.Success
+                ? new EndpointCheck(true, $"suggest=HTTP {(int)response.StatusCode}; SecureDNS=[{fallback.Detail}]")
+                : new EndpointCheck(false, $"suggest=HTTP {(int)response.StatusCode}; SecureDNS=[{fallback.Detail}]");
+        }
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException)
+        {
+            var fallback = await CheckYoutubeSearchEndpointWithSecureDnsAsync(searchHost, searchUrl, cancellationToken);
+            return fallback.Success
+                ? new EndpointCheck(true, $"suggest={ShortError(ex)}; SecureDNS=[{fallback.Detail}]")
+                : new EndpointCheck(false, $"suggest={ShortError(ex)}; SecureDNS=[{fallback.Detail}]");
+        }
+    }
+
+    private static async Task<EndpointCheck> CheckYoutubeSearchEndpointWithSecureDnsAsync(string host, string url, CancellationToken cancellationToken)
+    {
+        var resolution = await SecureDnsResolver.ResolveAsync(host, verifyTls: true, cancellationToken);
+        if (!resolution.Succeeded || resolution.Address is null)
+            return new EndpointCheck(false, resolution.Detail);
+
+        try
+        {
+            using var handler = CreateHttpHandler(resolution.Address, usePinnedAddress: true);
+            using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(7) };
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.UserAgent.ParseAdd("Mozilla/5.0 VortexPass/0.2");
+            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            var success = (int)response.StatusCode < 500;
+            return new EndpointCheck(success, $"suggest=HTTP {(int)response.StatusCode} via {resolution.Address}");
+        }
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException)
+        {
+            return new EndpointCheck(false, ShortError(ex));
+        }
     }
 
     private static async Task<string> CheckVoiceEndpointAsync(string host, CancellationToken cancellationToken)
@@ -337,6 +413,85 @@ public sealed class ServiceHealthCheckService
     }
 
     private sealed record EndpointCheck(bool Success, string Detail);
+
+    private static async Task<ServiceHealthResult> CheckPhasmophobiaAsync(CancellationToken cancellationToken)
+    {
+        const string photonHost = "ns.exitgames.com";
+        var watch = Stopwatch.StartNew();
+        var dns = await CheckDnsEndpointAsync(photonHost, cancellationToken);
+        var udp = dns.Success && dns.Address is not null
+            ? await CheckUdpSmokeEndpointsAsync(dns.Address, PhotonUdpPorts, cancellationToken)
+            : new EndpointCheck(false, "skipped: Photon DNS returned no IP");
+        var websocket = dns.Success && dns.Address is not null
+            ? await CheckPhotonWebSocketPortsAsync(dns.Address, PhotonWebSocketPorts, cancellationToken)
+            : new EndpointCheck(false, "skipped: Photon DNS returned no IP");
+        watch.Stop();
+
+        var stages = new ServiceProbeStages(
+            $"Photon DNS=[{dns.Detail}]",
+            $"Photon UDP=[{udp.Detail}]",
+            "game TLS is not forced",
+            $"Photon WebSocket=[{websocket.Detail}]");
+
+        if (!dns.Success)
+            return new("phasmophobia", ServiceHealthState.DnsUnavailable, $"Photon DNS недоступен: {dns.Detail}", null, stages);
+        if (!udp.Success && !websocket.Success)
+            return new("phasmophobia", ServiceHealthState.TcpTimeout, $"Photon UDP/WebSocket недоступны: UDP {udp.Detail}; WS {websocket.Detail}", null, stages);
+
+        var detail = udp.Success
+            ? "Photon DNS/UDP доступны; игровой UDP оставлен прямым для стабильности сессии"
+            : $"Photon DNS доступен; UDP smoke не подтверждён, WebSocket: {websocket.Detail}";
+        return new("phasmophobia", ServiceHealthState.Healthy, detail, watch.ElapsedMilliseconds, stages);
+    }
+
+    private static async Task<(bool Success, string Detail, IPAddress? Address)> CheckDnsEndpointAsync(string host, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var addresses = await Dns.GetHostAddressesAsync(host, cancellationToken);
+            var address = addresses.FirstOrDefault(x => x.AddressFamily == AddressFamily.InterNetwork)
+                          ?? addresses.FirstOrDefault(x => x.AddressFamily == AddressFamily.InterNetworkV6);
+            return address is null
+                ? (false, "DNS returned no IP", null)
+                : (true, $"OK: {address}", address);
+        }
+        catch (Exception ex) when (ex is SocketException or OperationCanceledException)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return (false, ShortError(ex), null);
+        }
+    }
+
+    private static async Task<EndpointCheck> CheckUdpSmokeEndpointsAsync(IPAddress address, IEnumerable<int> ports, CancellationToken cancellationToken)
+    {
+        var checks = new List<string>();
+        foreach (var port in ports)
+        {
+            try
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeout.CancelAfter(TimeSpan.FromMilliseconds(900));
+                using var client = new UdpClient(address.AddressFamily);
+                client.Connect(address, port);
+                await client.SendAsync([0], 1).WaitAsync(timeout.Token);
+                return new EndpointCheck(true, $"{address}:{port} send OK");
+            }
+            catch (Exception ex) when (ex is SocketException or OperationCanceledException)
+            {
+                checks.Add($"{port} {ShortError(ex)}");
+            }
+        }
+
+        return new EndpointCheck(false, string.Join("; ", checks.Take(4)));
+    }
+
+    private static async Task<EndpointCheck> CheckPhotonWebSocketPortsAsync(IPAddress address, IEnumerable<int> ports, CancellationToken cancellationToken)
+    {
+        var checks = await Task.WhenAll(ports.Select(port => CheckTcpEndpointAsync(address, port, cancellationToken)));
+        var success = checks.FirstOrDefault(check => check.Success);
+        if (success is not null) return new EndpointCheck(true, success.Detail);
+        return new EndpointCheck(false, string.Join("; ", checks.Select(check => check.Detail).Take(4)));
+    }
 
     private static async Task<string> CheckTelegramDcEndpointAsync(CancellationToken cancellationToken)
     {

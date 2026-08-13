@@ -9,6 +9,7 @@ public sealed class AppSettings
     public string BypassLevel { get; set; } = "medium";
     public int BypassTuning { get; set; }
     public List<FavoriteProfileSettings> FavoriteProfiles { get; set; } = [];
+    public List<AdvisorHistoryEntry> AdvisorHistory { get; set; } = [];
     public int ProfileSettingsVersion { get; set; }
     public GameFilterSettings GameFilter { get; set; } = new();
     public List<string> CustomBypassDomains { get; set; } = [];
@@ -19,6 +20,19 @@ public sealed class FavoriteProfileSettings
 {
     public string Level { get; set; } = "medium";
     public int Tuning { get; set; }
+}
+
+public sealed class AdvisorHistoryEntry
+{
+    public string ProviderKey { get; set; } = string.Empty;
+    public string ProviderName { get; set; } = string.Empty;
+    public string Level { get; set; } = "medium";
+    public int Tuning { get; set; }
+    public long Score { get; set; }
+    public int Healthy { get; set; }
+    public int Total { get; set; }
+    public long? LatencyMs { get; set; }
+    public DateTimeOffset LastTestUtc { get; set; }
 }
 
 public sealed class BypassProfileSettings

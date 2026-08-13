@@ -17,7 +17,9 @@ namespace VortexPass.App;
 
 public partial class MainWindow : Window
 {
-    private sealed record AdvisorCandidate(string Level, int Tuning, string Label, int Healthy, int Total, long? LatencyMs, string Summary, long Score);
+    private sealed record AdvisorCandidate(string Level, int Tuning, string Label, int Healthy, int Total, long? LatencyMs, string Summary, long Score, string Source);
+    private sealed record AdvisorStrategy(string Level, int Tuning);
+    private sealed record ProviderInfo(string DisplayName, string Key);
 
     private readonly AppSettingsStore _settingsStore;
     private readonly WindowsStartupService _startupService = new();
@@ -27,6 +29,7 @@ public partial class MainWindow : Window
     private readonly SystemProxyManager _proxyManager;
     private readonly HostsFileManager _hostsManager;
     private readonly RobloxThumbnailResolver _robloxThumbnailResolver = new();
+    private readonly SecureDnsHostResolver _secureDnsResolver = new();
     private readonly UserDomainListService _domainLists;
     private readonly GitHubUpdateService _updates = new();
     private readonly Forms.NotifyIcon _trayIcon;
@@ -127,6 +130,7 @@ public partial class MainWindow : Window
         _settings.ExcludedDomains ??= DefaultDomainLists.CreateExclusions();
         _settings.FavoriteProfiles ??= [];
         _settings.FavoriteProfiles = NormalizeFavorites(_settings.FavoriteProfiles);
+        _settings.AdvisorHistory ??= [];
         _hostsStatus = _hostsManager.GetStatus();
         if (_hostsStatus.Applied)
         {
@@ -394,20 +398,21 @@ public partial class MainWindow : Window
         var savedTuning = WinwsProfileComposer.NormalizeTuning(_settings.BypassTuning);
         var wasRunning = _activeProfiles.AnyEnabled && _components.GetStatuses().Any(x => x.Id == "dpi" && x.State == ServiceState.Running);
         var candidates = new List<AdvisorCandidate>();
-        string? provider = null;
+        ProviderInfo? provider = null;
         try
         {
             await PostUiAsync(new { type = "advisor.status", state = "detecting", progress = 0, message = "Определяем провайдера…" });
             provider = await DetectProviderAsync(_lifetime.Token);
             await LogToUiAsync("info", provider is null
                 ? "Провайдер не определён. Подбор продолжится по сетевым проверкам."
-                : $"Автоподбор: определён провайдер {provider}.");
+                : $"Автоподбор: определён провайдер {provider.DisplayName}.");
 
             if (wasRunning) await StopProtectionAsync();
 
             var strategies = new[] { "light", "moderate", "medium", "complex", "aggressive" }
-                .SelectMany(level => Enumerable.Range(0, 4).Select(tuning => (Level: level, Tuning: tuning)))
+                .SelectMany(level => Enumerable.Range(0, 4).Select(tuning => new AdvisorStrategy(level, tuning)))
                 .ToArray();
+            strategies = OrderAdvisorStrategies(provider, strategies).ToArray();
             for (var index = 0; index < strategies.Length; index++)
             {
                 _lifetime.Token.ThrowIfCancellationRequested();
@@ -415,11 +420,12 @@ public partial class MainWindow : Window
                 _settings.BypassLevel = level;
                 _settings.BypassTuning = tuning;
                 var strategyLabel = $"{LevelDisplayName(level)} · {TuningDisplayName(tuning)}";
+                var history = FindAdvisorHistory(provider, level, tuning);
                 await PostUiAsync(new
                 {
                     type = "advisor.status",
                     state = "testing",
-                    provider,
+                    provider = provider?.DisplayName,
                     level,
                     tuning,
                     progress = index,
@@ -454,13 +460,18 @@ public partial class MainWindow : Window
                 var total = results.Count;
                 var latency = results.Where(x => x.IsHealthy && x.LatencyMs.HasValue).Select(x => x.LatencyMs!.Value).DefaultIfEmpty().Average();
                 var latencyValue = latency > 0 ? (long?)Math.Round(latency) : null;
-                var score = running ? 100 + healthy * 1000 - (latencyValue ?? 500) - tuning * 25 : -10000;
+                var historyBoost = history is null ? 0 : Math.Clamp(history.Score / 5, -800L, 800L);
+                var youtubePenalty = results.Any(x => x.Id.Equals("youtube", StringComparison.OrdinalIgnoreCase) && !x.IsHealthy) ? 800 : 0;
+                var score = running ? 100 + healthy * 1000 - (latencyValue ?? 500) - tuning * 25 + historyBoost - youtubePenalty : -10000;
                 var summary = !running
                     ? "winws не запустился"
                     : total == 0
                         ? "winws запускается; для выбранного Game Filter нет HTTP-проверки"
                         : $"Доступно сервисов: {healthy} из {total}";
-                candidates.Add(new AdvisorCandidate(level, tuning, strategyLabel, healthy, total, latencyValue, summary, score));
+                var source = history is null ? "full-test" : "provider-history";
+                if (history is not null)
+                    summary = $"{summary}; история провайдера {history.Healthy}/{history.Total}";
+                candidates.Add(new AdvisorCandidate(level, tuning, strategyLabel, healthy, total, latencyValue, summary, score, source));
 
                 if (running || _protectionRequested) await StopProtectionAsync();
             }
@@ -473,21 +484,24 @@ public partial class MainWindow : Window
                 healthy = item.Healthy,
                 total = item.Total,
                 latencyMs = item.LatencyMs,
-                summary = item.Summary
+                summary = item.Summary,
+                source = item.Source
             }).ToArray();
-            await PostUiAsync(new { type = "advisor.status", state = "complete", provider, candidates = best });
-            await LogToUiAsync("ok", $"Автоматический подбор завершён{(provider is null ? "" : $" для {provider}")}. Выберите один из предложенных уровней вручную.");
+            UpdateAdvisorHistory(provider, candidates);
+            await PostUiAsync(new { type = "advisor.status", state = "complete", provider = provider?.DisplayName, candidates = best });
+            await LogToUiAsync("ok", $"Автоматический подбор завершён{(provider is null ? "" : $" для {provider.DisplayName}")}. Выберите один из предложенных уровней вручную.");
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
         catch (Exception ex)
         {
-            await PostUiAsync(new { type = "advisor.status", state = "failed", provider, error = ex.Message });
+            await PostUiAsync(new { type = "advisor.status", state = "failed", provider = provider?.DisplayName, error = ex.Message });
             await LogToUiAsync("error", $"Автоматический подбор не завершён: {ex.Message}");
         }
         finally
         {
             _settings.BypassLevel = savedLevel;
             _settings.BypassTuning = savedTuning;
+            await _settingsStore.SaveAsync(_settings, _lifetime.Token);
             if (!_shutdownStarted && wasRunning)
             {
                 try { await ApplyProfilesAsync(); }
@@ -505,9 +519,10 @@ public partial class MainWindow : Window
         if (_settings.Profiles.Discord || _settings.Profiles.Web) yield return "discord";
         if (_settings.Profiles.Telegram || _settings.Profiles.Web) yield return "telegram";
         if (_settings.Profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("roblox", StringComparison.OrdinalIgnoreCase))) yield return "roblox";
+        if (_settings.Profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("phasmophobia", StringComparison.OrdinalIgnoreCase))) yield return "phasmophobia";
     }
 
-    private async Task<string?> DetectProviderAsync(CancellationToken cancellationToken)
+    private async Task<ProviderInfo?> DetectProviderAsync(CancellationToken cancellationToken)
     {
         try
         {
@@ -519,12 +534,75 @@ public partial class MainWindow : Window
             var organization = root.TryGetProperty("org", out var org) ? org.GetString() : null;
             var asn = root.TryGetProperty("asn", out var rawAsn) ? rawAsn.GetString() : null;
             var result = string.Join(" · ", new[] { organization, asn }.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct());
-            return string.IsNullOrWhiteSpace(result) ? null : result;
+            if (string.IsNullOrWhiteSpace(result)) return null;
+            var key = NormalizeProviderKey(asn) ?? NormalizeProviderKey(organization) ?? result.ToLowerInvariant();
+            return new ProviderInfo(result, key);
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
         {
             return null;
         }
+    }
+
+    private IEnumerable<AdvisorStrategy> OrderAdvisorStrategies(ProviderInfo? provider, IEnumerable<AdvisorStrategy> strategies)
+    {
+        if (provider is null) return strategies;
+        var order = new[] { "medium", "moderate", "complex", "aggressive", "light" };
+        var history = _settings.AdvisorHistory
+            .Where(item => item.ProviderKey.Equals(provider.Key, StringComparison.OrdinalIgnoreCase))
+            .GroupBy(
+                item => $"{WinwsProfileComposer.NormalizeLevel(item.Level)}:{WinwsProfileComposer.NormalizeTuning(item.Tuning)}",
+                StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.OrderByDescending(item => item.LastTestUtc).First(),
+                StringComparer.OrdinalIgnoreCase);
+        return strategies
+            .OrderByDescending(strategy => history.TryGetValue($"{strategy.Level}:{strategy.Tuning}", out var entry) ? entry.Score : long.MinValue)
+            .ThenBy(strategy => strategy.Tuning)
+            .ThenBy(strategy => Array.IndexOf(order, strategy.Level));
+    }
+
+    private AdvisorHistoryEntry? FindAdvisorHistory(ProviderInfo? provider, string level, int tuning)
+    {
+        if (provider is null) return null;
+        var normalizedLevel = WinwsProfileComposer.NormalizeLevel(level);
+        var normalizedTuning = WinwsProfileComposer.NormalizeTuning(tuning);
+        return _settings.AdvisorHistory.FirstOrDefault(item =>
+            item.ProviderKey.Equals(provider.Key, StringComparison.OrdinalIgnoreCase) &&
+            WinwsProfileComposer.NormalizeLevel(item.Level).Equals(normalizedLevel, StringComparison.OrdinalIgnoreCase) &&
+            WinwsProfileComposer.NormalizeTuning(item.Tuning) == normalizedTuning);
+    }
+
+    private void UpdateAdvisorHistory(ProviderInfo? provider, IEnumerable<AdvisorCandidate> candidates)
+    {
+        if (provider is null) return;
+        _settings.AdvisorHistory.RemoveAll(item => item.ProviderKey.Equals(provider.Key, StringComparison.OrdinalIgnoreCase));
+        _settings.AdvisorHistory.AddRange(candidates.Select(candidate => new AdvisorHistoryEntry
+        {
+            ProviderKey = provider.Key,
+            ProviderName = provider.DisplayName,
+            Level = candidate.Level,
+            Tuning = candidate.Tuning,
+            Score = candidate.Score,
+            Healthy = candidate.Healthy,
+            Total = candidate.Total,
+            LatencyMs = candidate.LatencyMs,
+            LastTestUtc = DateTimeOffset.UtcNow
+        }));
+        _settings.AdvisorHistory = _settings.AdvisorHistory
+            .OrderByDescending(item => item.LastTestUtc)
+            .Take(120)
+            .ToList();
+    }
+
+    private static string? NormalizeProviderKey(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var normalized = new string(value.Trim().ToLowerInvariant()
+            .Where(ch => char.IsLetterOrDigit(ch) || ch is '-' or '_')
+            .ToArray());
+        return string.IsNullOrWhiteSpace(normalized) ? null : normalized;
     }
 
     private async Task StopProtectionAsync()
@@ -789,8 +867,8 @@ public partial class MainWindow : Window
                         try
                         {
                             _hostsStatus = await _hostsManager.ApplyAsync(hostsOverrides, _lifetime.Token);
-                            var robloxDetail = hostsOverrides.Count == 0 ? string.Empty : "; Roblox CDN DNS применён";
-                            await LogToUiAsync("ok", $"Системный hosts применён: {_hostsStatus.EntryCount} записей, источник Flowseal {WinwsProfileComposer.FlowsealCommit[..7]}{robloxDetail}.");
+                            var overrideDetail = hostsOverrides.Count == 0 ? string.Empty : $"; временных DNS-записей: {hostsOverrides.Count}";
+                            await LogToUiAsync("ok", $"Системный hosts применён: {_hostsStatus.EntryCount} записей, источник Flowseal {WinwsProfileComposer.FlowsealCommit[..7]}{overrideDetail}.");
                         }
                         catch (Exception ex)
                         {
@@ -804,6 +882,8 @@ public partial class MainWindow : Window
                     }
                     _nextHealthCheckUtc = DateTimeOffset.MinValue;
                     await PostUiAsync(new { type = "log", level = "ok", message = $"Профили активны: {string.Join(", ", ActiveProfileNames())}." });
+                    if (_activeProfiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("phasmophobia", StringComparison.OrdinalIgnoreCase)))
+                        await LogToUiAsync("info", "Phasmophobia: игровой UDP оставлен прямым для стабильности сессии; VortexPass обрабатывает только домены Photon/Unity/Vivox/Steam.");
                 }
             }
             else
@@ -832,23 +912,66 @@ public partial class MainWindow : Window
         if (_settings.Profiles.Telegram) yield return "Telegram";
         if (_settings.Profiles.Web) yield return "Web";
         if (_settings.Profiles.GameFilter) yield return $"Game Filter ({_settings.GameFilter.Protocol.ToUpperInvariant()})";
+        if (_settings.Profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("phasmophobia", StringComparison.OrdinalIgnoreCase)))
+            yield return "Phasmophobia stability-first";
     }
 
     private async Task<IReadOnlyList<HostsOverride>> CreateHostsOverridesAsync(BypassProfileSettings profiles)
     {
+        var overrides = new List<HostsOverride>();
+        if (profiles.YouTube || profiles.Web)
+            overrides.AddRange(await CreateYoutubeHostsOverridesAsync());
+
         var robloxSelected = profiles.GameFilter && _settings.GameFilter.SelectedGames
             .Any(game => game.Equals("roblox", StringComparison.OrdinalIgnoreCase));
-        if (!robloxSelected) return Array.Empty<HostsOverride>();
-
-        var resolution = await _robloxThumbnailResolver.ResolveAsync(_lifetime.Token);
-        if (!resolution.Succeeded)
+        if (robloxSelected)
         {
-            await LogToUiAsync("warn", $"Roblox CDN: не удалось получить временный DNS для {RobloxThumbnailResolver.ThumbnailHost}: {resolution.Detail}. Правила winws всё равно применены.");
-            return Array.Empty<HostsOverride>();
+            var resolution = await _robloxThumbnailResolver.ResolveAsync(_lifetime.Token);
+            if (!resolution.Succeeded)
+            {
+                await LogToUiAsync("warn", $"Roblox CDN: не удалось получить временный DNS для {RobloxThumbnailResolver.ThumbnailHost}: {resolution.Detail}. Правила winws всё равно применены.");
+            }
+            else
+            {
+                await LogToUiAsync("ok", $"Roblox CDN: временный DNS для {RobloxThumbnailResolver.ThumbnailHost} подтверждён ({resolution.Detail}).");
+                overrides.Add(new HostsOverride(resolution.Address!, RobloxThumbnailResolver.ThumbnailHost));
+            }
         }
 
-        await LogToUiAsync("ok", $"Roblox CDN: временный DNS для {RobloxThumbnailResolver.ThumbnailHost} подтверждён ({resolution.Detail}).");
-        return [new HostsOverride(resolution.Address!, RobloxThumbnailResolver.ThumbnailHost)];
+        return overrides;
+    }
+
+    private async Task<IReadOnlyList<HostsOverride>> CreateYoutubeHostsOverridesAsync()
+    {
+        var hosts = new[]
+        {
+            "www.youtube.com",
+            "youtube.com",
+            "suggestqueries.google.com",
+            "suggestqueries-clients6.youtube.com",
+            "youtubei.googleapis.com",
+            "youtube.googleapis.com",
+            "jnn-pa.googleapis.com"
+        };
+        var overrides = new List<HostsOverride>();
+        foreach (var host in hosts)
+        {
+            var resolution = await _secureDnsResolver.ResolveAsync(host, verifyTls: true, _lifetime.Token);
+            if (!resolution.Succeeded)
+            {
+                await LogToUiAsync("warn", $"YouTube DNS: не удалось закрепить {host}: {resolution.Detail}.");
+                continue;
+            }
+
+            overrides.Add(new HostsOverride(resolution.Address!, host));
+        }
+
+        if (overrides.Count != 0)
+            await LogToUiAsync("ok", $"YouTube DNS: закреплено {overrides.Count} доменов для системного DNS Windows.");
+        else
+            await LogToUiAsync("warn", "YouTube DNS: не удалось подготовить временные hosts-записи; winws всё равно запущен.");
+
+        return overrides;
     }
 
     private async Task RestoreHostsAsync()
@@ -1043,6 +1166,8 @@ public partial class MainWindow : Window
         };
         if (profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("roblox", StringComparison.OrdinalIgnoreCase)))
             checks.Add(_healthChecks.CheckAsync("roblox", true, winwsRunning, cancellationToken));
+        if (profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("phasmophobia", StringComparison.OrdinalIgnoreCase)))
+            checks.Add(_healthChecks.CheckAsync("phasmophobia", true, winwsRunning, cancellationToken));
         var results = await Task.WhenAll(checks);
         if (generation != Volatile.Read(ref _healthGeneration)) return;
         foreach (var result in results)
@@ -1066,7 +1191,7 @@ public partial class MainWindow : Window
 
     private async Task PublishHealthSnapshotAsync(bool winwsRunning)
     {
-        foreach (var id in new[] { "youtube", "discord", "telegram" })
+        foreach (var id in new[] { "youtube", "discord", "telegram", "phasmophobia" })
         {
             if (!IsServiceSelected(id))
                 _healthStatuses[id] = new ServiceHealthResult(id, ServiceHealthState.NotSelected, "Не выбран");
@@ -1096,11 +1221,12 @@ public partial class MainWindow : Window
             "youtube" => profiles.YouTube || profiles.Web,
             "discord" => profiles.Discord || profiles.Web,
             "telegram" => profiles.Telegram || profiles.Web,
+            "phasmophobia" => profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("phasmophobia", StringComparison.OrdinalIgnoreCase)),
             _ => false
         };
     }
 
-    private static string ServiceDisplayName(string id) => id switch { "youtube" => "YouTube", "discord" => "Discord", "telegram" => "Telegram", "roblox" => "Roblox", _ => id };
+    private static string ServiceDisplayName(string id) => id switch { "youtube" => "YouTube", "discord" => "Discord", "telegram" => "Telegram", "roblox" => "Roblox", "phasmophobia" => "Phasmophobia", _ => id };
 
     private static bool RequiresHosts(BypassProfileSettings profiles) => profiles.Web || profiles.Discord;
 

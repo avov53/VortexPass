@@ -1425,7 +1425,7 @@ function GameFilterTab({
 }) {
   const [open, setOpen] = useState(false);
   const games = [
-    { id: "phasmophobia", name: "Phasmophobia", subtitle: "Photon · игровые соединения", color: "#F7B955" },
+    { id: "phasmophobia", name: "Phasmophobia", subtitle: "Photon · стабильный прямой UDP", color: "#F7B955" },
     { id: "roblox", name: "Roblox", subtitle: "Изображения, аватары и CDN", color: "#6AA8FF" },
   ] as const;
   const selectedGames = games.filter((game) => info.selectedGames.includes(game.id));
@@ -1453,7 +1453,7 @@ function GameFilterTab({
             <Dot on={active} pulse={active} />
           </div>
           <div className="text-[11px] font-mono text-[#3A3A5E] mt-1">
-            {active ? `Активен · ${info.protocol === "all" ? "UDP + TCP" : info.protocol.toUpperCase()}` : "Применяется только после главной кнопки запуска"}
+            {active ? `Активен · ${info.protocol === "all" ? "UDP + TCP" : info.protocol.toUpperCase()} · Phasmophobia UDP direct` : "Применяется только после главной кнопки запуска"}
           </div>
         </div>
         <Toggle checked={selected} onChange={onToggle} disabled={pending} />
@@ -1500,9 +1500,9 @@ function GameFilterTab({
         <SectionLabel>Протокол</SectionLabel>
         <div className="grid grid-cols-3 gap-2">
           {[
-            ["udp", "UDP", "Быстрый игровой трафик"],
-            ["tcp", "TCP", "Надёжные соединения"],
-            ["all", "UDP + TCP", "По умолчанию"],
+            ["udp", "UDP", "Для Phasmophobia не ломает игровой UDP"],
+            ["tcp", "TCP", "Домены сервисов и WebSocket"],
+            ["all", "UDP + TCP", "Стабильный режим по умолчанию"],
           ].map(([id, label, sub]) => (
             <button key={id} type="button" onClick={() => onChange({ ...info, protocol: id as GameFilterInfo["protocol"] })}
               className="px-3 py-3 rounded-xl text-left transition-all"
@@ -1512,7 +1512,7 @@ function GameFilterTab({
             </button>
           ))}
         </div>
-        <p className="text-[10px] font-mono text-[#4A4A6A] mt-4">Изменения сохранены и будут применены при следующем запуске защиты. Winws не перезапускается автоматически.</p>
+        <p className="text-[10px] font-mono text-[#4A4A6A] mt-4">Изменения сохранены и будут применены при следующем запуске защиты. Для Phasmophobia игровой UDP остаётся прямым, VortexPass обрабатывает только домены сервисов.</p>
       </GlassCard>
     </div>
   );

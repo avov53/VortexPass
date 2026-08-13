@@ -9,8 +9,8 @@
     <ApplicationIcon>Assets\VortexPass.ico</ApplicationIcon>
     <AssemblyName>VortexPass</AssemblyName>
     <RootNamespace>VortexPass.App</RootNamespace>
-    <Version>0.2.0</Version>
-    <AssemblyInformationalVersion>0.2.0</AssemblyInformationalVersion>
+    <Version>0.3.0</Version>
+    <AssemblyInformationalVersion>0.3.0</AssemblyInformationalVersion>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\VortexPass.Core\VortexPass.Core.csproj" />

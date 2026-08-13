@@ -5,10 +5,16 @@ set "ROOT=%~dp0"
 set "DIST=%ROOT%dist"
 set "STAGING=%ROOT%dist.next"
 set "VERSION=%~1"
-if "%VERSION%"=="" set "VERSION=0.2.0"
+if "%VERSION%"=="" set "VERSION=0.3.0"
 
 echo.
 echo === VortexPass %VERSION% ^| win-x64 Release build ===
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\Test-ComponentManifest.ps1" -ManifestPath "%ROOT%assets\external-components.json" -ComponentsRoot "%ROOT%components\zapret"
+if errorlevel 1 (
+  echo ERROR: component files do not match assets\external-components.json.
+  goto :error
+)
 
 where pnpm >nul 2>&1
 if not errorlevel 1 (
@@ -40,6 +46,12 @@ if errorlevel 1 goto :error
 
 xcopy "%ROOT%components\zapret\*" "%STAGING%\bin\" /E /I /Y >nul
 if errorlevel 1 goto :error
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\Test-ComponentManifest.ps1" -ManifestPath "%STAGING%\assets\external-components.json" -ComponentsRoot "%STAGING%\bin"
+if errorlevel 1 (
+  echo ERROR: published component files failed manifest validation.
+  goto :error
+)
 
 if not exist "%STAGING%\VortexPass.exe" (
   echo ERROR: VortexPass.exe was not created.

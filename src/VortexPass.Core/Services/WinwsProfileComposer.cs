@@ -5,6 +5,8 @@ namespace VortexPass.Core.Services;
 public static class WinwsProfileComposer
 {
     public const string FlowsealCommit = "61d7596c7ce82b6f320e5c79ff4598856f4ae7d3";
+    // Phasmophobia stays stability-first: service domains are handled by
+    // hostlist rules, while long-lived Photon/Vivox UDP sessions stay direct.
 
     public static string Compose(BypassProfileSettings profiles, string level) =>
         Compose(profiles, level, new GameFilterSettings(), null, null, 0);
@@ -26,14 +28,12 @@ public static class WinwsProfileComposer
         var includeDiscordVoice = profiles.Discord || profiles.Web;
         var includePhasmophobia = profiles.GameFilter && gameFilter.SelectedGames.Contains("phasmophobia", StringComparer.OrdinalIgnoreCase);
         var includeRoblox = profiles.GameFilter && gameFilter.SelectedGames.Contains("roblox", StringComparer.OrdinalIgnoreCase);
-        var gameProtocol = NormalizeGameProtocol(gameFilter.Protocol);
-        var includeGameTcp = includePhasmophobia && gameProtocol is "tcp" or "all";
-        var includeGameUdp = includePhasmophobia && gameProtocol is "udp" or "all";
 
         if (!includeYouTubeWeb && !includeDiscordWeb && !includeTelegramWeb && !includeTelegramDesktop && !includePhasmophobia && !includeRoblox && string.IsNullOrWhiteSpace(customBypassListPath))
             return string.Empty;
 
         var tcpPorts = new SortedSet<int> { 80, 443 };
+        var tcpPortRanges = new List<string>();
         var udpPorts = new List<string> { "443" };
         if (includeDiscordVoice)
         {
@@ -41,12 +41,10 @@ public static class WinwsProfileComposer
             udpPorts.Add("19294-19344");
             udpPorts.Add("50000-50100");
         }
-        if (includeGameTcp) foreach (var port in new[] { 5055, 5056, 5058 }) tcpPorts.Add(port);
-        if (includeGameUdp) udpPorts.Add("5055-5058");
 
         var capture = new List<string>
         {
-            $"--wf-tcp={string.Join(',', tcpPorts)}",
+            $"--wf-tcp={string.Join(',', tcpPorts.Select(x => x.ToString()).Concat(tcpPortRanges))}",
             $"--wf-udp={string.Join(',', udpPorts)}"
         };
         var rules = new List<string>();
@@ -63,6 +61,9 @@ public static class WinwsProfileComposer
         if (includeRoblox)
             AddDomainRules(rules, "files\\list-roblox.txt", level, tuning, includeHttp: true, exclusionListPath);
 
+        if (includePhasmophobia)
+            AddDomainRules(rules, "files\\list-phasmophobia.txt", level, tuning, includeHttp: true, exclusionListPath);
+
         if (!string.IsNullOrWhiteSpace(customBypassListPath))
             AddDomainRules(rules, customBypassListPath, level, tuning, includeHttp: true, exclusionListPath);
 
@@ -74,17 +75,6 @@ public static class WinwsProfileComposer
                       $"--dpi-desync-repeats={Repeats(level, tuning)} --new");
             rules.Add("--filter-tcp=2053,2083,2087,2096,8443 --hostlist-domains=discord.media " +
                       TcpStrategy(level, tuning, "681", "files\\tls_clienthello_www_google_com.bin") + ExclusionOption(exclusionListPath) + " --new");
-        }
-
-        if (includeGameUdp)
-        {
-            rules.Add($"--filter-udp=5055-5058 --dpi-desync=fake --dpi-desync-any-protocol " +
-                      $"--dpi-desync-repeats={Repeats(level, tuning)} --new");
-        }
-        if (includeGameTcp)
-        {
-            rules.Add("--filter-tcp=5055,5056,5058 --dpi-desync-any-protocol " +
-                      TcpStrategy(level, tuning, "681", "files\\tls_clienthello_www_google_com.bin") + " --new");
         }
 
         return $"{string.Join(' ', capture)} {string.Join(' ', rules)}";

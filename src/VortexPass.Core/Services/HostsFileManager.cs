@@ -13,6 +13,17 @@ public sealed class HostsFileManager
     public const string BeginMarker = "# VortexPass begin";
     public const string EndMarker = "# VortexPass end";
     public const string HostsAssetSha256 = "ca810989b7e9ac87fb1ddb5786f01a80d862a6ff8f3c1cc883bb09baeab1c34d";
+    private static readonly HashSet<string> AllowedDynamicHosts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        RobloxThumbnailResolver.ThumbnailHost,
+        "www.youtube.com",
+        "youtube.com",
+        "suggestqueries.google.com",
+        "suggestqueries-clients6.youtube.com",
+        "youtubei.googleapis.com",
+        "youtube.googleapis.com",
+        "jnn-pa.googleapis.com"
+    };
 
     private readonly string _assetPath;
     private readonly string _hostsPath;
@@ -158,7 +169,7 @@ public sealed class HostsFileManager
 
     private static bool IsAllowedHost(string host) =>
         host == "web.telegram.org" || host == "api.telegram.org" || host.EndsWith(".web.telegram.org", StringComparison.Ordinal) ||
-        host.EndsWith(".discord.media", StringComparison.Ordinal) || host == RobloxThumbnailResolver.ThumbnailHost;
+        host.EndsWith(".discord.media", StringComparison.Ordinal) || AllowedDynamicHosts.Contains(host);
 
     private static async Task EnsureReachableAsync(IPAddress address, CancellationToken cancellationToken)
     {
