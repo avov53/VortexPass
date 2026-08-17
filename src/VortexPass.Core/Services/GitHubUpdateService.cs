@@ -63,13 +63,20 @@ public sealed class GitHubUpdateService
         var directory = Path.Combine(Path.GetTempPath(), "VortexPass-update", release.Version.ToString());
         Directory.CreateDirectory(directory);
         var zipPath = Path.Combine(directory, ZipAssetName);
+        var hashText = await _http.GetStringAsync(release.HashUrl, cancellationToken);
+        var expected = hashText.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim();
+        if (string.IsNullOrWhiteSpace(expected))
+            throw new InvalidDataException("SHA-256 файл релиза пустой или повреждён.");
+
+        if (File.Exists(zipPath) && await HashVerifier.MatchesAsync(zipPath, expected, cancellationToken))
+            return new DownloadedRelease(zipPath, release.Version, expected);
 
         using (var response = await _http.GetAsync(release.ZipUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken))
         {
             response.EnsureSuccessStatusCode();
             var total = response.Content.Headers.ContentLength;
             await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
-            await using var output = File.Create(zipPath);
+            await using var output = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None);
             var buffer = new byte[81920];
             long completed = 0;
             int read;
@@ -81,14 +88,12 @@ public sealed class GitHubUpdateService
             }
         }
 
-        var hashText = await _http.GetStringAsync(release.HashUrl, cancellationToken);
-        var expected = hashText.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
         if (string.IsNullOrWhiteSpace(expected) || !await HashVerifier.MatchesAsync(zipPath, expected, cancellationToken))
         {
             File.Delete(zipPath);
             throw new InvalidDataException("Контрольная сумма скачанного обновления не совпала.");
         }
-        return new DownloadedRelease(zipPath, release.Version);
+        return new DownloadedRelease(zipPath, release.Version, expected);
     }
 
     private sealed class GitHubRelease
@@ -105,4 +110,4 @@ public sealed class GitHubUpdateService
     }
 }
 
-public sealed record DownloadedRelease(string ZipPath, Version Version);
+public sealed record DownloadedRelease(string ZipPath, Version Version, string Sha256);

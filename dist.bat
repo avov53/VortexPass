@@ -5,7 +5,7 @@ set "ROOT=%~dp0"
 set "DIST=%ROOT%dist"
 set "STAGING=%ROOT%dist.next"
 set "VERSION=%~1"
-if "%VERSION%"=="" set "VERSION=0.3.0"
+if "%VERSION%"=="" set "VERSION=0.5.0"
 
 echo.
 echo === VortexPass %VERSION% ^| win-x64 Release build ===
@@ -33,7 +33,13 @@ if not errorlevel 1 (
   echo pnpm was not found; using the checked prebuilt web interface.
 )
 
-if exist "%STAGING%" rmdir /s /q "%STAGING%"
+if exist "%STAGING%" rmdir /s /q "%STAGING%" >nul 2>&1
+if exist "%STAGING%" set "STAGING=%ROOT%dist.build.%RANDOM%"
+if exist "%STAGING%" rmdir /s /q "%STAGING%" >nul 2>&1
+if exist "%STAGING%" (
+  echo ERROR: staging folder is locked: %STAGING%
+  goto :error
+)
 mkdir "%STAGING%" || goto :error
 mkdir "%STAGING%\updater" || goto :error
 mkdir "%STAGING%\bin" || goto :error

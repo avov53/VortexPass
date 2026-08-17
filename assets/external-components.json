@@ -17,7 +17,7 @@
         { "path": "bin\\cygwin1.dll", "sha256": "103104a52e5293ce418944725df19e2bf81ad9269b9a120d71d39028e821499b" },
         { "path": "bin\\files\\list-youtube.txt", "sha256": "987464e6fab4edd49887521cb00fa260b990bf76c307bbd9eaa18abf9922cb8a" },
         { "path": "bin\\files\\list-discord.txt", "sha256": "1310a6f3a9ed8a76d0d58d5b78442a4d52a1ce83ec6c1a8fd254ae25ca48164a" },
-        { "path": "bin\\files\\list-telegram.txt", "sha256": "88a63d9cbda8164015922d10d48d1bdbc135e3e8ce155f0bbae7fe521cb9a7e4" },
+        { "path": "bin\\files\\list-telegram.txt", "sha256": "5e2f4d5394c986118a77a9e73a29d0bb3ac382f5c13a8ab047f5e269434c6065" },
         { "path": "bin\\files\\list-telegram-ipset.txt", "sha256": "d8b083218327c5f4a5a25aefae408306aa5a5bddbc8ad8627d0a8f1d88308750" },
         { "path": "bin\\files\\list-roblox.txt", "sha256": "e28ff2d5cd98f22a2e2c8b3e49c63c87c2fa77f29b14d276ad192c3cd8d9cab8" },
         { "path": "bin\\files\\list-phasmophobia.txt", "sha256": "2dccf7539a371ece5244bf0b6d55f45cb0ddc17a22a852bf5f9c67bceb80dab6" },

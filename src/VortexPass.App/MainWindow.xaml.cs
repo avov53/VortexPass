@@ -29,9 +29,10 @@ public partial class MainWindow : Window
     private readonly SystemProxyManager _proxyManager;
     private readonly HostsFileManager _hostsManager;
     private readonly RobloxThumbnailResolver _robloxThumbnailResolver = new();
-    private readonly SecureDnsHostResolver _secureDnsResolver = new();
+    private readonly DnsOverrideService _dnsOverrides = new();
     private readonly UserDomainListService _domainLists;
     private readonly GitHubUpdateService _updates = new();
+    private readonly PendingUpdateStore _pendingUpdates;
     private readonly Forms.NotifyIcon _trayIcon;
     private readonly TrayMenuWindow _trayMenu;
     private readonly HttpClient _advisorHttp = new() { Timeout = TimeSpan.FromSeconds(8) };
@@ -40,10 +41,13 @@ public partial class MainWindow : Window
     private readonly SemaphoreSlim _protectionGate = new(1, 1);
     private readonly Dictionary<string, ServiceStatus> _serviceStatuses = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, ServiceHealthResult> _healthStatuses = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _healthFailureStreaks = new(StringComparer.OrdinalIgnoreCase);
     private AppSettings _settings = new();
     private BypassProfileSettings _activeProfiles = new();
     private HostsFileStatus _hostsStatus = new(false, 0, null, "hosts не применён");
     private UpdateCheckResult? _lastUpdate;
+    private string? _startupUpdateError;
+    private bool _updatePromptDismissedThisSession;
     private bool _allowClose;
     private bool _shutdownStarted;
     private bool _webReady;
@@ -56,12 +60,18 @@ public partial class MainWindow : Window
     private int _healthGeneration;
     private int _healthCheckRunning;
     private bool _advisorRunning;
+    private CancellationTokenSource? _advisorCts;
+    private CancellationTokenSource? _profileApplyCts;
+    private CancellationTokenSource _healthCheckCts = new();
+    private bool _advisorStopProtectionRequested;
+    private int _startupAddedDefaultExclusions;
 
     public MainWindow()
     {
         InitializeComponent();
         var appData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VortexPass");
         _settingsStore = new AppSettingsStore(appData);
+        _pendingUpdates = new PendingUpdateStore(appData);
         _applicationLogPath = Path.Combine(appData, "app.log");
         _components = new ExternalComponentService(AppContext.BaseDirectory);
         _telegramProxy = new TelegramDesktopProxyService(AppContext.BaseDirectory, appData);
@@ -81,7 +91,7 @@ public partial class MainWindow : Window
             RestoreWindow,
             async () =>
             {
-                if (_advisorRunning || _protectionTransitioning) return;
+                if ((_advisorRunning || _protectionTransitioning) && !_protectionRequested) return;
                 await SetProtectionAsync(!_protectionRequested);
             },
             ShutdownAsync);
@@ -121,6 +131,8 @@ public partial class MainWindow : Window
     private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
         await ResetApplicationLogAsync();
+        await LogUpdateCommandLineAsync();
+        if (await TryInstallPendingUpdateOnStartupAsync()) return;
         _settings = await _settingsStore.LoadAsync(_lifetime.Token);
         _settings.Profiles ??= new BypassProfileSettings();
         _settings.GameFilter ??= new GameFilterSettings();
@@ -128,6 +140,7 @@ public partial class MainWindow : Window
         _settings.GameFilter.Protocol = WinwsProfileComposer.NormalizeGameProtocol(_settings.GameFilter.Protocol);
         _settings.CustomBypassDomains ??= [];
         _settings.ExcludedDomains ??= DefaultDomainLists.CreateExclusions();
+        _startupAddedDefaultExclusions = DefaultDomainLists.MergeDefaultExclusions(_settings.ExcludedDomains);
         _settings.FavoriteProfiles ??= [];
         _settings.FavoriteProfiles = NormalizeFavorites(_settings.FavoriteProfiles);
         _settings.AdvisorHistory ??= [];
@@ -149,6 +162,10 @@ public partial class MainWindow : Window
         {
             _settings.FavoriteProfiles.Clear();
             _settings.ProfileSettingsVersion = 3;
+            await _settingsStore.SaveAsync(_settings, _lifetime.Token);
+        }
+        if (_startupAddedDefaultExclusions > 0)
+        {
             await _settingsStore.SaveAsync(_settings, _lifetime.Token);
         }
         if (!_settings.StartWithWindows)
@@ -226,6 +243,10 @@ public partial class MainWindow : Window
 
         _webReady = true;
         await SendServiceSnapshotAsync();
+        if (!string.IsNullOrWhiteSpace(_startupUpdateError))
+            await PostUiAsync(new { type = "update.status", state = "failed", currentVersion = CurrentVersion().ToString(3), error = _startupUpdateError });
+        if (_startupAddedDefaultExclusions > 0)
+            await LogToUiAsync("info", $"Исключения обновлены: добавлено {_startupAddedDefaultExclusions} доменов для CurseForge/Battle.net.");
         _ = RunMetricsLoopAsync(_lifetime.Token);
         _ = CheckForUpdatesAsync();
     }
@@ -288,6 +309,9 @@ public partial class MainWindow : Window
                 case "advisor.run":
                     await RunProfileAdvisorAsync();
                     break;
+                case "advisor.stop":
+                    StopProfileAdvisor();
+                    break;
                 case "gamefilter.set":
                     await SetGameFilterAsync(root);
                     break;
@@ -304,7 +328,15 @@ public partial class MainWindow : Window
                     await CheckForUpdatesAsync();
                     break;
                 case "update.install":
-                    await InstallUpdateAsync();
+                case "update.installNow":
+                    await InstallUpdateNowAsync();
+                    break;
+                case "update.defer":
+                    await DeferUpdateAsync();
+                    break;
+                case "update.dismissError":
+                    await _pendingUpdates.ClearAsync();
+                    await CheckForUpdatesAsync();
                     break;
             }
         }
@@ -316,6 +348,15 @@ public partial class MainWindow : Window
 
     private async Task SetProtectionAsync(bool enabled)
     {
+        if (!enabled)
+        {
+            _advisorStopProtectionRequested = _advisorRunning;
+            StopProfileAdvisor();
+            CancelPendingProfileWork();
+            await StopProtectionAsync();
+            return;
+        }
+
         if (_advisorRunning)
         {
             await LogToUiAsync("warn", "Дождитесь завершения автоматического подбора профиля.");
@@ -340,7 +381,15 @@ public partial class MainWindow : Window
             return;
         }
 
-        await StopProtectionAsync();
+    }
+
+    private void CancelPendingProfileWork()
+    {
+        try { _profileApplyCts?.Cancel(); }
+        catch (ObjectDisposedException) { }
+        try { _healthCheckCts.Cancel(); }
+        catch (ObjectDisposedException) { }
+        Interlocked.Increment(ref _healthGeneration);
     }
 
     private async Task ConfigureTelegramProxyAsync()
@@ -394,6 +443,9 @@ public partial class MainWindow : Window
         }
 
         _advisorRunning = true;
+        _advisorCts?.Dispose();
+        _advisorCts = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        var advisorToken = _advisorCts.Token;
         var savedLevel = WinwsProfileComposer.NormalizeLevel(_settings.BypassLevel);
         var savedTuning = WinwsProfileComposer.NormalizeTuning(_settings.BypassTuning);
         var wasRunning = _activeProfiles.AnyEnabled && _components.GetStatuses().Any(x => x.Id == "dpi" && x.State == ServiceState.Running);
@@ -402,7 +454,7 @@ public partial class MainWindow : Window
         try
         {
             await PostUiAsync(new { type = "advisor.status", state = "detecting", progress = 0, message = "Определяем провайдера…" });
-            provider = await DetectProviderAsync(_lifetime.Token);
+            provider = await DetectProviderAsync(advisorToken);
             await LogToUiAsync("info", provider is null
                 ? "Провайдер не определён. Подбор продолжится по сетевым проверкам."
                 : $"Автоподбор: определён провайдер {provider.DisplayName}.");
@@ -415,7 +467,7 @@ public partial class MainWindow : Window
             strategies = OrderAdvisorStrategies(provider, strategies).ToArray();
             for (var index = 0; index < strategies.Length; index++)
             {
-                _lifetime.Token.ThrowIfCancellationRequested();
+                advisorToken.ThrowIfCancellationRequested();
                 var (level, tuning) = strategies[index];
                 _settings.BypassLevel = level;
                 _settings.BypassTuning = tuning;
@@ -430,15 +482,17 @@ public partial class MainWindow : Window
                     tuning,
                     progress = index,
                     total = strategies.Length,
-                    message = $"Проверяем стратегию «{strategyLabel}»…"
+                    message = $"Проверяем стратегию «{strategyLabel}»…",
+                    best = candidates.OrderByDescending(item => item.Score).FirstOrDefault()?.Label
                 });
 
                 await ApplyProfilesAsync();
+                advisorToken.ThrowIfCancellationRequested();
                 var running = _components.GetStatuses().Any(x => x.Id == "dpi" && x.State == ServiceState.Running);
                 var results = new List<ServiceHealthResult>();
                 if (running)
                 {
-                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(advisorToken);
                     timeout.CancelAfter(TimeSpan.FromSeconds(12));
                     try
                     {
@@ -453,27 +507,27 @@ public partial class MainWindow : Window
                                 telegramProxyRunning: id == "telegram" && _telegramProxy.IsRunning));
                         results.AddRange(await Task.WhenAll(checks));
                     }
-                    catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested) { }
+                    catch (OperationCanceledException) when (!advisorToken.IsCancellationRequested) { }
                 }
 
-                var healthy = results.Count(x => x.IsHealthy);
-                var total = results.Count;
-                var latency = results.Where(x => x.IsHealthy && x.LatencyMs.HasValue).Select(x => x.LatencyMs!.Value).DefaultIfEmpty().Average();
-                var latencyValue = latency > 0 ? (long?)Math.Round(latency) : null;
-                var historyBoost = history is null ? 0 : Math.Clamp(history.Score / 5, -800L, 800L);
-                var youtubePenalty = results.Any(x => x.Id.Equals("youtube", StringComparison.OrdinalIgnoreCase) && !x.IsHealthy) ? 800 : 0;
-                var score = running ? 100 + healthy * 1000 - (latencyValue ?? 500) - tuning * 25 + historyBoost - youtubePenalty : -10000;
+                var evaluation = EvaluateAdvisorCandidate(running, results, tuning, history);
                 var summary = !running
                     ? "winws не запустился"
-                    : total == 0
+                    : evaluation.Total == 0
                         ? "winws запускается; для выбранного Game Filter нет HTTP-проверки"
-                        : $"Доступно сервисов: {healthy} из {total}";
+                        : evaluation.Summary;
                 var source = history is null ? "full-test" : "provider-history";
                 if (history is not null)
                     summary = $"{summary}; история провайдера {history.Healthy}/{history.Total}";
-                candidates.Add(new AdvisorCandidate(level, tuning, strategyLabel, healthy, total, latencyValue, summary, score, source));
+                candidates.Add(new AdvisorCandidate(level, tuning, strategyLabel, evaluation.Healthy, evaluation.Total, evaluation.LatencyMs, summary, evaluation.Score, source));
 
                 if (running || _protectionRequested) await StopProtectionAsync();
+                var stableCandidates = candidates.Count(item => item.Total > 0 && item.Healthy == item.Total && item.Score >= 2500);
+                if (stableCandidates >= 3 && index >= 5)
+                {
+                    await LogToUiAsync("info", "Автоподбор: найдено 3 стабильных кандидата, оставшиеся стратегии пропущены для ускорения.");
+                    break;
+                }
             }
 
             var best = candidates.OrderByDescending(item => item.Score).Take(3).Select(item => new
@@ -485,11 +539,17 @@ public partial class MainWindow : Window
                 total = item.Total,
                 latencyMs = item.LatencyMs,
                 summary = item.Summary,
+                score = item.Score,
                 source = item.Source
             }).ToArray();
             UpdateAdvisorHistory(provider, candidates);
             await PostUiAsync(new { type = "advisor.status", state = "complete", provider = provider?.DisplayName, candidates = best });
             await LogToUiAsync("ok", $"Автоматический подбор завершён{(provider is null ? "" : $" для {provider.DisplayName}")}. Выберите один из предложенных уровней вручную.");
+        }
+        catch (OperationCanceledException) when (advisorToken.IsCancellationRequested && !_lifetime.IsCancellationRequested)
+        {
+            await PostUiAsync(new { type = "advisor.status", state = "failed", provider = provider?.DisplayName, error = "Автоподбор остановлен пользователем." });
+            await LogToUiAsync("warn", "Автоматический подбор остановлен. Предыдущий профиль будет восстановлен.");
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
         catch (Exception ex)
@@ -501,16 +561,95 @@ public partial class MainWindow : Window
         {
             _settings.BypassLevel = savedLevel;
             _settings.BypassTuning = savedTuning;
-            await _settingsStore.SaveAsync(_settings, _lifetime.Token);
-            if (!_shutdownStarted && wasRunning)
+            await _settingsStore.SaveAsync(_settings, CancellationToken.None);
+            if (!_shutdownStarted && wasRunning && !_advisorStopProtectionRequested)
             {
                 try { await ApplyProfilesAsync(); }
                 catch (Exception ex) { await LogToUiAsync("error", $"Не удалось восстановить прежний профиль после диагностики: {ex.Message}"); }
             }
+            else if (!_shutdownStarted && !_advisorStopProtectionRequested)
+            {
+                try { await StopProtectionAsync(); }
+                catch (Exception ex) { await LogToUiAsync("error", $"Не удалось остановить временный профиль после диагностики: {ex.Message}"); }
+            }
             _advisorRunning = false;
+            _advisorStopProtectionRequested = false;
+            _advisorCts?.Dispose();
+            _advisorCts = null;
             await PublishProfileStatusAsync();
             await SendServiceSnapshotAsync();
         }
+    }
+
+    private void StopProfileAdvisor()
+    {
+        if (!_advisorRunning)
+            return;
+
+        try { _advisorCts?.Cancel(); }
+        catch (ObjectDisposedException) { }
+    }
+
+    private sealed record AdvisorEvaluation(int Healthy, int Total, long? LatencyMs, long Score, string Summary);
+
+    private static AdvisorEvaluation EvaluateAdvisorCandidate(
+        bool running,
+        IReadOnlyCollection<ServiceHealthResult> results,
+        int tuning,
+        AdvisorHistoryEntry? history)
+    {
+        if (!running) return new(0, results.Count, null, -10000, "winws не запустился");
+        var total = results.Count;
+        if (total == 0) return new(0, 0, null, 100, "winws запущен");
+
+        var score = 250L - tuning * 30L;
+        var healthy = 0;
+        var summaries = new List<string>();
+        var latencies = new List<long>();
+
+        foreach (var result in results)
+        {
+            var latency = result.LatencyMs ?? 900;
+            if (result.LatencyMs.HasValue) latencies.Add(result.LatencyMs.Value);
+            var serviceScore = result.IsHealthy ? 900L : -700L;
+            serviceScore -= Math.Min(latency, 1500) / 3;
+
+            var detail = $"{result.Detail} {result.Stages?.Http} {result.Stages?.Cdn} {result.Stages?.Gateway}";
+            if (detail.Contains("slow", StringComparison.OrdinalIgnoreCase) || detail.Contains("медленно", StringComparison.OrdinalIgnoreCase))
+                serviceScore -= 550;
+            if (detail.Contains("timeout", StringComparison.OrdinalIgnoreCase) || detail.Contains("тайм-аут", StringComparison.OrdinalIgnoreCase))
+                serviceScore -= 900;
+            if (detail.Contains("thumbnails OK", StringComparison.OrdinalIgnoreCase) ||
+                detail.Contains("media OK", StringComparison.OrdinalIgnoreCase) ||
+                detail.Contains("stickers OK", StringComparison.OrdinalIgnoreCase) ||
+                detail.Contains("voice доступны", StringComparison.OrdinalIgnoreCase))
+                serviceScore += 250;
+
+            if (result.IsHealthy) healthy++;
+            summaries.Add($"{ServiceDisplayName(result.Id)}: {CompactHealthSummary(result)}");
+            score += serviceScore;
+        }
+
+        if (history is not null)
+            score += Math.Clamp(history.Score / 6, -450L, 450L);
+
+        var latencyValue = latencies.Count == 0 ? null : (long?)Math.Round(latencies.Average());
+        if (latencyValue is > 450) score -= 450;
+        if (healthy == total) score += 500;
+        return new(healthy, total, latencyValue, score, string.Join("; ", summaries));
+    }
+
+    private static string CompactHealthSummary(ServiceHealthResult result)
+    {
+        if (!result.IsHealthy) return result.Detail;
+        var detail = result.Detail;
+        return result.Id switch
+        {
+            "youtube" => detail.Contains("thumbnails", StringComparison.OrdinalIgnoreCase) ? detail : $"{detail}; thumbnails проверены",
+            "telegram" => detail.Contains("media", StringComparison.OrdinalIgnoreCase) ? detail : $"{detail}; media проверены",
+            "discord" => detail,
+            _ => detail
+        };
     }
 
     private IEnumerable<string> AdvisorServiceIds()
@@ -607,12 +746,12 @@ public partial class MainWindow : Window
 
     private async Task StopProtectionAsync()
     {
+        CancelPendingProfileWork();
         await _protectionGate.WaitAsync();
         try
         {
             _protectionTransitioning = true;
             _protectionRequested = false;
-            Interlocked.Increment(ref _healthGeneration);
             await SendServiceSnapshotAsync();
             await _components.StopAllAsync();
             await _telegramProxy.StopAsync();
@@ -779,6 +918,14 @@ public partial class MainWindow : Window
 
         try
         {
+            try { _healthCheckCts.Cancel(); }
+            catch (ObjectDisposedException) { }
+            _healthCheckCts = new CancellationTokenSource();
+            _profileApplyCts?.Dispose();
+            _profileApplyCts = _advisorRunning && _advisorCts is not null
+                ? CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token, _advisorCts.Token)
+                : CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+            var operationToken = _profileApplyCts.Token;
             _protectionTransitioning = true;
             _protectionRequested = _settings.Profiles.AnyEnabled;
             await SendServiceSnapshotAsync();
@@ -791,7 +938,7 @@ public partial class MainWindow : Window
                 _baselineBytes = counters.Bytes;
                 _baselinePackets = counters.Packets;
                 _protectionStarted = DateTimeOffset.UtcNow;
-                var runtimeLists = await _domainLists.WriteAsync(_settings.CustomBypassDomains, _settings.ExcludedDomains, _lifetime.Token);
+                var runtimeLists = await _domainLists.WriteAsync(_settings.CustomBypassDomains, _settings.ExcludedDomains, operationToken);
                 var arguments = WinwsProfileComposer.Compose(
                     _settings.Profiles,
                     _settings.BypassLevel,
@@ -806,7 +953,7 @@ public partial class MainWindow : Window
                 _components.SetArguments("dpi", arguments);
                 await PostUiAsync(new { type = "log", level = "info", message = "Запуск компонентов обхода…" });
 
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(operationToken);
                 timeout.CancelAfter(TimeSpan.FromSeconds(15));
                 try
                 {
@@ -840,11 +987,14 @@ public partial class MainWindow : Window
                 else
                 {
                     _activeProfiles = CloneProfiles(_settings.Profiles);
+                    // Publish the running state before DNS/hosts preparation. This keeps
+                    // the Stop button available while optional network probes are pending.
+                    await SendServiceSnapshotAsync();
                     if (_activeProfiles.Telegram)
                     {
                         try
                         {
-                            await _telegramProxy.StartAsync(_lifetime.Token);
+                            await _telegramProxy.StartAsync(operationToken);
                             await LogToUiAsync("ok", $"Локальный Telegram Desktop WS Proxy v{TelegramDesktopProxyService.Version} запущен на 127.0.0.1:{TelegramDesktopProxyService.Port}. Ожидается подключение Telegram Desktop.");
                             if (_telegramProxy.ShouldOfferConfiguration)
                             {
@@ -861,14 +1011,15 @@ public partial class MainWindow : Window
                     {
                         await _telegramProxy.StopAsync();
                     }
-                    var hostsOverrides = await CreateHostsOverridesAsync(_activeProfiles);
+                    var hostsOverrides = await CreateHostsOverridesAsync(_activeProfiles, operationToken);
                     if (RequiresHosts(_activeProfiles) || hostsOverrides.Count != 0)
                     {
                         try
                         {
-                            _hostsStatus = await _hostsManager.ApplyAsync(hostsOverrides, _lifetime.Token);
+                            _hostsStatus = await _hostsManager.ApplyAsync(hostsOverrides, operationToken);
                             var overrideDetail = hostsOverrides.Count == 0 ? string.Empty : $"; временных DNS-записей: {hostsOverrides.Count}";
-                            await LogToUiAsync("ok", $"Системный hosts применён: {_hostsStatus.EntryCount} записей, источник Flowseal {WinwsProfileComposer.FlowsealCommit[..7]}{overrideDetail}.");
+                            var hostsDetail = string.IsNullOrWhiteSpace(_hostsStatus.Detail) ? string.Empty : $"; {_hostsStatus.Detail}";
+                            await LogToUiAsync("ok", $"Системный hosts применён: {_hostsStatus.EntryCount} записей, источник Flowseal {WinwsProfileComposer.FlowsealCommit[..7]}{overrideDetail}{hostsDetail}.");
                         }
                         catch (Exception ex)
                         {
@@ -897,6 +1048,10 @@ public partial class MainWindow : Window
                 await PostUiAsync(new { type = "log", level = "warn", message = "Все профили выключены. Сетевые настройки восстановлены." });
             }
         }
+        catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested)
+        {
+            await LogToUiAsync("info", "Текущая операция запуска отменена.");
+        }
         finally
         {
             _protectionTransitioning = false;
@@ -916,17 +1071,17 @@ public partial class MainWindow : Window
             yield return "Phasmophobia stability-first";
     }
 
-    private async Task<IReadOnlyList<HostsOverride>> CreateHostsOverridesAsync(BypassProfileSettings profiles)
+    private async Task<IReadOnlyList<HostsOverride>> CreateHostsOverridesAsync(BypassProfileSettings profiles, CancellationToken cancellationToken)
     {
         var overrides = new List<HostsOverride>();
         if (profiles.YouTube || profiles.Web)
-            overrides.AddRange(await CreateYoutubeHostsOverridesAsync());
+            overrides.AddRange(await CreateYoutubeHostsOverridesAsync(cancellationToken));
 
         var robloxSelected = profiles.GameFilter && _settings.GameFilter.SelectedGames
             .Any(game => game.Equals("roblox", StringComparison.OrdinalIgnoreCase));
         if (robloxSelected)
         {
-            var resolution = await _robloxThumbnailResolver.ResolveAsync(_lifetime.Token);
+            var resolution = await _robloxThumbnailResolver.ResolveAsync(cancellationToken);
             if (!resolution.Succeeded)
             {
                 await LogToUiAsync("warn", $"Roblox CDN: не удалось получить временный DNS для {RobloxThumbnailResolver.ThumbnailHost}: {resolution.Detail}. Правила winws всё равно применены.");
@@ -941,30 +1096,42 @@ public partial class MainWindow : Window
         return overrides;
     }
 
-    private async Task<IReadOnlyList<HostsOverride>> CreateYoutubeHostsOverridesAsync()
+    private async Task<IReadOnlyList<HostsOverride>> CreateYoutubeHostsOverridesAsync(CancellationToken cancellationToken)
     {
         var hosts = new[]
         {
             "www.youtube.com",
-            "youtube.com",
             "suggestqueries.google.com",
             "suggestqueries-clients6.youtube.com",
             "youtubei.googleapis.com",
-            "youtube.googleapis.com",
-            "jnn-pa.googleapis.com"
+            "i.ytimg.com"
         };
-        var overrides = new List<HostsOverride>();
-        foreach (var host in hosts)
+        var tasks = hosts.Select(async host =>
         {
-            var resolution = await _secureDnsResolver.ResolveAsync(host, verifyTls: true, _lifetime.Token);
+            var probeUrl = host switch
+            {
+                "www.youtube.com" => "https://www.youtube.com/generate_204",
+                "i.ytimg.com" => "https://i.ytimg.com/generate_204",
+                "s.ytimg.com" => "https://s.ytimg.com/",
+                "yt3.ggpht.com" => "https://yt3.ggpht.com/",
+                _ => null
+            };
+            var resolution = await _dnsOverrides.ResolveBestAsync(
+                host,
+                verifyTls: true,
+                httpProbeUrl: probeUrl,
+                timeout: TimeSpan.FromSeconds(2),
+                cancellationToken: cancellationToken);
             if (!resolution.Succeeded)
             {
                 await LogToUiAsync("warn", $"YouTube DNS: не удалось закрепить {host}: {resolution.Detail}.");
-                continue;
+                return null;
             }
 
-            overrides.Add(new HostsOverride(resolution.Address!, host));
-        }
+            await LogToUiAsync("info", $"YouTube DNS: {host} → {resolution.Address} через {resolution.Source}.");
+            return new HostsOverride(resolution.Address!, host);
+        }).ToArray();
+        var overrides = (await Task.WhenAll(tasks)).Where(item => item is not null).Cast<HostsOverride>().ToList();
 
         if (overrides.Count != 0)
             await LogToUiAsync("ok", $"YouTube DNS: закреплено {overrides.Count} доменов для системного DNS Windows.");
@@ -1118,7 +1285,7 @@ public partial class MainWindow : Window
             var active = _protectionStarted.HasValue;
             if (active && !_advisorRunning && DateTimeOffset.UtcNow >= _nextHealthCheckUtc)
             {
-                _nextHealthCheckUtc = DateTimeOffset.UtcNow.AddSeconds(15);
+                _nextHealthCheckUtc = DateTimeOffset.UtcNow.AddSeconds(30);
                 _ = RunHealthChecksGuardedAsync(cancellationToken);
             }
             var pings = _healthStatuses.ToDictionary(x => x.Key, x => x.Value.IsHealthy ? x.Value.LatencyMs : null, StringComparer.OrdinalIgnoreCase);
@@ -1140,7 +1307,8 @@ public partial class MainWindow : Window
         if (Interlocked.Exchange(ref _healthCheckRunning, 1) != 0) return;
         try
         {
-            await RunHealthChecksAsync(cancellationToken);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _healthCheckCts.Token);
+            await RunHealthChecksAsync(linked.Token);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
         catch (Exception ex)
@@ -1172,6 +1340,18 @@ public partial class MainWindow : Window
         if (generation != Volatile.Read(ref _healthGeneration)) return;
         foreach (var result in results)
         {
+            if (result.IsHealthy)
+            {
+                _healthFailureStreaks.Remove(result.Id);
+            }
+            else if (_healthStatuses.TryGetValue(result.Id, out var lastHealthy) && lastHealthy.IsHealthy &&
+                     result.State is not ServiceHealthState.NotSelected and not ServiceHealthState.WinwsStopped)
+            {
+                var failures = _healthFailureStreaks.GetValueOrDefault(result.Id) + 1;
+                _healthFailureStreaks[result.Id] = failures;
+                if (failures < 2)
+                    continue;
+            }
             var changed = !_healthStatuses.TryGetValue(result.Id, out var previous) || previous.State != result.State || previous.Detail != result.Detail;
             _healthStatuses[result.Id] = result;
             if (changed)
@@ -1273,16 +1453,81 @@ public partial class MainWindow : Window
     }
 
 
+    private async Task<bool> TryInstallPendingUpdateOnStartupAsync()
+    {
+        try
+        {
+            var pending = await _pendingUpdates.LoadAsync(_lifetime.Token);
+            if (pending is null) return false;
+            if (pending.Status == "failed")
+            {
+                _startupUpdateError = $"Предыдущее обновление не установилось: {pending.LastError}";
+                return false;
+            }
+            if (pending.Status != "install-on-next-start") return false;
+
+            if (!File.Exists(pending.ZipPath) || !await HashVerifier.MatchesAsync(pending.ZipPath, pending.Sha256, _lifetime.Token))
+            {
+                _startupUpdateError = "Отложенное обновление повреждено. Файл состояния сброшен, запуск продолжается без обновления.";
+                await _pendingUpdates.ClearAsync(_lifetime.Token);
+                await AppendApplicationLogLineAsync($"[WARN] {_startupUpdateError}");
+                return false;
+            }
+
+            if (!File.Exists(Path.Combine(AppContext.BaseDirectory, "updater", "VortexPass.Updater.exe")))
+            {
+                _startupUpdateError = "Отложенное обновление не запущено: в portable-комплекте нет updater/VortexPass.Updater.exe.";
+                await AppendApplicationLogLineAsync($"[ERROR] {_startupUpdateError}");
+                return false;
+            }
+
+            pending.Status = "install-now";
+            pending.LastError = null;
+            await _pendingUpdates.SaveAsync(pending, _lifetime.Token);
+            StartUpdaterProcess(pending);
+            _allowClose = true;
+            System.Windows.Application.Current.Shutdown();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _startupUpdateError = $"Отложенное обновление не запущено: {ex.Message}";
+            await AppendApplicationLogLineAsync($"[ERROR] {_startupUpdateError}");
+            return false;
+        }
+    }
+
+    private async Task LogUpdateCommandLineAsync()
+    {
+        var args = Environment.GetCommandLineArgs();
+        string? Get(string name)
+        {
+            var index = Array.IndexOf(args, name);
+            return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
+        }
+
+        var from = Get("--updated-from");
+        var to = Get("--updated-to");
+        if (!string.IsNullOrWhiteSpace(from) && !string.IsNullOrWhiteSpace(to))
+            await AppendApplicationLogLineAsync($"[INFO] Обновление установлено: {from} -> {to}");
+    }
+
     private async Task CheckForUpdatesAsync()
     {
         await PostUiAsync(new { type = "update.status", state = "checking", currentVersion = CurrentVersion().ToString(3) });
         _lastUpdate = await _updates.CheckAsync(CurrentVersion(), _lifetime.Token);
         _settings.LastUpdateCheckUtc = DateTimeOffset.UtcNow;
         await _settingsStore.SaveAsync(_settings);
+        var state = _lastUpdate.State switch { UpdateState.Current => "current", UpdateState.Available => "availablePrompt", _ => "failed" };
+        if (_lastUpdate.State == UpdateState.Available && _updatePromptDismissedThisSession)
+            state = "available";
+        var pending = await _pendingUpdates.LoadAsync(_lifetime.Token);
+        if (_lastUpdate.State == UpdateState.Available && pending?.Status == "install-on-next-start" && pending.Version == _lastUpdate.Release?.Version.ToString(3))
+            state = "deferred";
         await PostUiAsync(new
         {
             type = "update.status",
-            state = _lastUpdate.State switch { UpdateState.Current => "current", UpdateState.Available => "available", _ => "failed" },
+            state,
             currentVersion = CurrentVersion().ToString(3),
             availableVersion = _lastUpdate.Release?.Version.ToString(3),
             checkedAt = _settings.LastUpdateCheckUtc,
@@ -1292,33 +1537,105 @@ public partial class MainWindow : Window
 
     private async Task InstallUpdateAsync()
     {
+        await InstallUpdateNowAsync();
+    }
+
+    private async Task InstallUpdateNowAsync()
+    {
         if (_lastUpdate?.State != UpdateState.Available || _lastUpdate.Release is null)
         {
             await CheckForUpdatesAsync();
             return;
         }
-        await PostUiAsync(new { type = "update.status", state = "downloading", currentVersion = CurrentVersion().ToString(3), availableVersion = _lastUpdate.Release.Version.ToString(3) });
+        await PostUiAsync(new { type = "update.status", state = "preparing", currentVersion = CurrentVersion().ToString(3), availableVersion = _lastUpdate.Release.Version.ToString(3) });
         try
         {
-            var downloaded = await _updates.DownloadAsync(_lastUpdate.Release, cancellationToken: _lifetime.Token);
-            var updaterSource = Path.Combine(AppContext.BaseDirectory, "updater");
-            var updaterTemp = Path.Combine(Path.GetTempPath(), "VortexPass-updater", Guid.NewGuid().ToString("N"));
-            if (!File.Exists(Path.Combine(updaterSource, "VortexPass.Updater.exe"))) throw new FileNotFoundException("Не найден VortexPass.Updater.exe.");
-            CopyDirectory(updaterSource, updaterTemp);
-            var updaterExe = Path.Combine(updaterTemp, "VortexPass.Updater.exe");
-            var appExe = Path.Combine(AppContext.BaseDirectory, "VortexPass.exe");
-            Process.Start(new ProcessStartInfo(updaterExe)
-            {
-                UseShellExecute = true,
-                WorkingDirectory = updaterTemp,
-                Arguments = $"--pid {Environment.ProcessId} --zip \"{downloaded.ZipPath}\" --target \"{AppContext.BaseDirectory}\" --restart \"{appExe}\""
-            });
+            var pending = await PrepareUpdateStateAsync(_lastUpdate.Release, "install-now");
+            await PostUiAsync(new { type = "update.status", state = "installing", currentVersion = CurrentVersion().ToString(3), availableVersion = pending.Version });
+            StartUpdaterProcess(pending);
             await ShutdownAsync();
         }
         catch (Exception ex)
         {
-            await PostUiAsync(new { type = "update.status", state = "failed", currentVersion = CurrentVersion().ToString(3), error = ex.Message });
+            await PostUiAsync(new { type = "update.status", state = "failed", currentVersion = CurrentVersion().ToString(3), availableVersion = _lastUpdate.Release.Version.ToString(3), error = ex.Message });
         }
+    }
+
+    private async Task DeferUpdateAsync()
+    {
+        if (_lastUpdate?.State != UpdateState.Available || _lastUpdate.Release is null)
+        {
+            await CheckForUpdatesAsync();
+            return;
+        }
+        await PostUiAsync(new { type = "update.status", state = "preparing", currentVersion = CurrentVersion().ToString(3), availableVersion = _lastUpdate.Release.Version.ToString(3) });
+        try
+        {
+            var pending = await PrepareUpdateStateAsync(_lastUpdate.Release, "install-on-next-start");
+            _updatePromptDismissedThisSession = true;
+            await PostUiAsync(new { type = "update.status", state = "deferred", currentVersion = CurrentVersion().ToString(3), availableVersion = pending.Version, checkedAt = _settings.LastUpdateCheckUtc });
+        }
+        catch (Exception ex)
+        {
+            await PostUiAsync(new { type = "update.status", state = "failed", currentVersion = CurrentVersion().ToString(3), availableVersion = _lastUpdate.Release.Version.ToString(3), error = ex.Message });
+        }
+    }
+
+    private async Task<PendingUpdateState> PrepareUpdateStateAsync(ReleaseInfo release, string status)
+    {
+        EnsureUpdaterAvailable();
+        var downloaded = await _updates.DownloadAsync(release, cancellationToken: _lifetime.Token);
+        var state = new PendingUpdateState
+        {
+            Status = status,
+            Version = release.Version.ToString(3),
+            Sha256 = downloaded.Sha256,
+            ZipPath = downloaded.ZipPath,
+            TargetPath = AppContext.BaseDirectory,
+            RestartPath = Path.Combine(AppContext.BaseDirectory, "VortexPass.exe"),
+            LastError = null
+        };
+        await _pendingUpdates.SaveAsync(state, _lifetime.Token);
+        return state;
+    }
+
+    private void EnsureUpdaterAvailable()
+    {
+        var updaterExe = Path.Combine(AppContext.BaseDirectory, "updater", "VortexPass.Updater.exe");
+        if (!File.Exists(updaterExe))
+            throw new FileNotFoundException("Не найден updater/VortexPass.Updater.exe. Соберите полный portable-комплект через dist.bat.", updaterExe);
+    }
+
+    private void StartUpdaterProcess(PendingUpdateState state)
+    {
+        EnsureUpdaterAvailable();
+        var updaterSource = Path.Combine(AppContext.BaseDirectory, "updater");
+        var updaterTemp = Path.Combine(Path.GetTempPath(), "VortexPass-updater", Guid.NewGuid().ToString("N"));
+        CopyDirectory(updaterSource, updaterTemp);
+        var updaterExe = Path.Combine(updaterTemp, "VortexPass.Updater.exe");
+        var start = new ProcessStartInfo(updaterExe)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = updaterTemp
+        };
+        start.ArgumentList.Add("--pid");
+        start.ArgumentList.Add(Environment.ProcessId.ToString());
+        start.ArgumentList.Add("--zip");
+        start.ArgumentList.Add(state.ZipPath);
+        start.ArgumentList.Add("--sha256");
+        start.ArgumentList.Add(state.Sha256);
+        start.ArgumentList.Add("--target");
+        start.ArgumentList.Add(state.TargetPath);
+        start.ArgumentList.Add("--restart");
+        start.ArgumentList.Add(state.RestartPath);
+        start.ArgumentList.Add("--state");
+        start.ArgumentList.Add(_pendingUpdates.StatePath);
+        start.ArgumentList.Add("--from");
+        start.ArgumentList.Add(CurrentVersion().ToString(3));
+        start.ArgumentList.Add("--to");
+        start.ArgumentList.Add(state.Version);
+        Process.Start(start);
     }
 
     private static void CopyDirectory(string source, string target)
@@ -1352,11 +1669,16 @@ public partial class MainWindow : Window
     {
         try
         {
-            var line = $"{DateTimeOffset.Now:O} [ERROR] {source}: {exception}{Environment.NewLine}";
-            await File.AppendAllTextAsync(_applicationLogPath, line);
+            await AppendApplicationLogLineAsync($"[ERROR] {source}: {exception}");
         }
         catch { }
         await PostUiAsync(new { type = "log", level = "error", message = $"{source}: {exception.Message}" });
+    }
+
+    private async Task AppendApplicationLogLineAsync(string message)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(_applicationLogPath)!);
+        await File.AppendAllTextAsync(_applicationLogPath, $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}");
     }
 
     private async Task ResetApplicationLogAsync()

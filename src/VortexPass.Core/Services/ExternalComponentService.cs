@@ -9,11 +9,16 @@ public sealed class ExternalComponentService : IDisposable
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
     private readonly string _baseDirectory;
+    private readonly WinDivertDriverService _winDivertDriver;
     private readonly Dictionary<string, Process> _processes = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, ServiceStatus> _statuses = new(StringComparer.OrdinalIgnoreCase);
     private ExternalComponentManifest _manifest = new();
 
-    public ExternalComponentService(string baseDirectory) => _baseDirectory = baseDirectory;
+    public ExternalComponentService(string baseDirectory)
+    {
+        _baseDirectory = baseDirectory;
+        _winDivertDriver = new WinDivertDriverService(baseDirectory);
+    }
 
     public event EventHandler<ServiceStatus>? StatusChanged;
     public event EventHandler<string>? DiagnosticReceived;
@@ -46,6 +51,8 @@ public sealed class ExternalComponentService : IDisposable
     {
         if (_manifest.Components.Count == 0)
             throw new InvalidOperationException("Манифест компонентов пуст или имеет неверный формат.");
+        if (_processes.Values.All(process => process.HasExited))
+            await CleanupWinDivertAsync(cancellationToken, "перед запуском");
         foreach (var component in _manifest.Components)
             await StartAsync(component.Id, cancellationToken);
     }
@@ -158,6 +165,20 @@ public sealed class ExternalComponentService : IDisposable
             process.Dispose();
             _processes.Remove(id);
             PublishStatus(new ServiceStatus(id, component.DisplayName, ServiceState.Stopped));
+        }
+        await CleanupWinDivertAsync(CancellationToken.None, "после остановки winws");
+    }
+
+    private async Task CleanupWinDivertAsync(CancellationToken cancellationToken, string stage)
+    {
+        try
+        {
+            var result = await _winDivertDriver.StopAndDeleteOwnedAsync(cancellationToken);
+            PublishDiagnostic($"[WinDivert] {stage}: {result.Detail}.");
+        }
+        catch (Exception ex)
+        {
+            PublishDiagnostic($"[WinDivert] {stage}: очистка не выполнена — {ex.Message}");
         }
     }
 

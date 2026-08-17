@@ -151,10 +151,51 @@ tochka-tech.com
 tochka.com
 vtb.ru
 steamcommunity.com
+curseforge.com
+www.curseforge.com
+api.curseforge.com
+minecraft.curseforge.com
+forgecdn.net
+media.forgecdn.net
+edge.forgecdn.net
+mediafilez.forgecdn.net
+overwolf.com
+api.overwolf.com
+content.overwolf.com
+overwolfcdn.com
+curseforge-overwolf-client-prod.s3.amazonaws.com
+battle.net
+blizzard.com
+blizzard.net
+cdn.blizzard.com
+dist.blizzard.com
+level3.blizzard.com
+patch.battle.net
+blz-contentstack.com
+blzddist1-a.akamaihd.net
+blznav.akamaized.net
+akamaized.net
+akamaihd.net
 """;
 
     public static List<string> CreateExclusions() => Exclusions
         .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
         .Distinct(StringComparer.OrdinalIgnoreCase)
         .ToList();
+
+    public static int MergeDefaultExclusions(List<string>? target)
+    {
+        if (target is null) return 0;
+        var existing = new HashSet<string>(target, StringComparer.OrdinalIgnoreCase);
+        var added = 0;
+        foreach (var domain in CreateExclusions())
+        {
+            if (!existing.Add(domain)) continue;
+            target.Add(domain);
+            added++;
+        }
+
+        target.Sort(StringComparer.OrdinalIgnoreCase);
+        return added;
+    }
 }

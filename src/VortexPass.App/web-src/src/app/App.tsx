@@ -94,7 +94,7 @@ interface Metrics {
 }
 
 interface UpdateInfo {
-  state: "idle" | "checking" | "current" | "available" | "failed" | "downloading";
+  state: "idle" | "checking" | "current" | "available" | "availablePrompt" | "preparing" | "deferred" | "installing" | "failed" | "downloading";
   currentVersion?: string;
   availableVersion?: string;
   checkedAt?: string;
@@ -108,14 +108,16 @@ interface GameFilterInfo { selectedGames: string[]; protocol: "udp" | "tcp" | "a
 interface DomainListsInfo { bypass: string[]; exclusions: string[] }
 interface SettingsInfo { autostart: boolean; tray: boolean }
 interface FavoriteProfile { level: string; tuning: number }
-interface AdvisorCandidate { level: string; tuning: number; label: string; healthy: number; total: number; latencyMs: number | null; summary: string }
+interface AdvisorCandidate { level: string; tuning: number; label: string; healthy: number; total: number; latencyMs: number | null; summary: string; score?: number; source?: string }
 interface AdvisorInfo {
   state: "idle" | "detecting" | "testing" | "complete" | "failed";
   provider?: string;
   level?: string;
+  tuning?: number;
   progress?: number;
   total?: number;
   message?: string;
+  best?: string;
   error?: string;
   candidates?: AdvisorCandidate[];
 }
@@ -577,6 +579,7 @@ function Dashboard({
   hosts,
   advisor,
   onRunAdvisor,
+  onStopAdvisor,
   onAdvisorCandidateSelected,
   onProfileSelected,
   onFavoriteToggle,
@@ -604,6 +607,7 @@ function Dashboard({
   hosts: HostsInfo;
   advisor: AdvisorInfo;
   onRunAdvisor: () => void;
+  onStopAdvisor: () => void;
   onAdvisorCandidateSelected: (candidate: AdvisorCandidate) => void;
   onProfileSelected: (profile: FavoriteProfile) => void;
   onFavoriteToggle: (profile: FavoriteProfile, favorite: boolean) => void;
@@ -702,10 +706,10 @@ function Dashboard({
 
           {/* Button */}
           <motion.button
-            whileHover={pending ? {} : { scale: 1.04 }}
-            whileTap={pending ? {} : { scale: 0.95 }}
+            whileHover={pending && !protection ? {} : { scale: 1.04 }}
+            whileTap={pending && !protection ? {} : { scale: 0.95 }}
             onClick={onToggleProtection}
-            disabled={pending}
+            disabled={pending && !protection}
             className="relative w-24 h-24 rounded-full flex items-center justify-center transition-all duration-300 focus:outline-none"
             style={{
               background: protection
@@ -743,11 +747,11 @@ function Dashboard({
                 color: protection ? "#fff" : "#4A4A6A",
               }}
             >
-               {pending ? "Запуск защиты…" : protection ? "Защита активна" : "Запустить защиту"}
+               {pending ? (protection ? "Остановить защиту" : "Запуск защиты…") : protection ? "Защита активна" : "Запустить защиту"}
             </h2>
             <p className="text-[12px] font-mono mt-1" style={{ color: protection ? "#8080C0" : "#2A2A44" }}>
               {pending
-                ? "Проверяем файлы и запускаем winws"
+                ? (protection ? "Нажмите, чтобы прервать проверку и остановить" : "Проверяем файлы и запускаем winws")
                 : protection
                 ? "winws · WinDivert — работают"
                 : "Нажмите, чтобы включить все службы"}
@@ -798,24 +802,41 @@ function Dashboard({
               <div className="text-[9px] font-mono text-[#3A3A5E] mt-1.5">Проверка может занять несколько минут. Выполняется один HTTPS-запрос к ipapi.co; публичный IP в VortexPass не сохраняется.</div>
             </div>
           </div>
-          <motion.button whileHover={advisor.state === "detecting" || advisor.state === "testing" ? {} : { scale: 1.02 }} whileTap={{ scale: 0.98 }}
-            type="button" onClick={onRunAdvisor} disabled={pending || advisor.state === "detecting" || advisor.state === "testing"}
-            className="px-4 py-2.5 rounded-xl text-[11px] font-semibold whitespace-nowrap disabled:opacity-50"
-            style={{ color: "#C2BCFF", background: "rgba(108,92,231,0.14)", border: "1px solid rgba(108,92,231,0.32)" }}>
-            {advisor.state === "detecting" || advisor.state === "testing" ? "Идёт диагностика…" : "Подобрать профиль"}
-          </motion.button>
+          {advisor.state === "detecting" || advisor.state === "testing" ? (
+            <motion.button whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}
+              type="button" onClick={onStopAdvisor}
+              className="px-4 py-2.5 rounded-xl text-[11px] font-semibold whitespace-nowrap"
+              style={{ color: "#FF9AAA", background: "rgba(255,77,109,0.12)", border: "1px solid rgba(255,77,109,0.3)" }}>
+              Стоп
+            </motion.button>
+          ) : (
+            <motion.button whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}
+              type="button" onClick={onRunAdvisor} disabled={pending}
+              className="px-4 py-2.5 rounded-xl text-[11px] font-semibold whitespace-nowrap disabled:opacity-50"
+              style={{ color: "#C2BCFF", background: "rgba(108,92,231,0.14)", border: "1px solid rgba(108,92,231,0.32)" }}>
+              Подобрать профиль
+            </motion.button>
+          )}
         </div>
 
         {(advisor.state === "detecting" || advisor.state === "testing") && (
           <motion.div initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} className="relative mt-4">
             <div className="flex justify-between text-[10px] font-mono mb-2">
               <span className="text-[#7777A8]">{advisor.message ?? "Проверяем сеть…"}</span>
-              <span className="text-[#4A4A6A]">{advisor.provider ?? "Провайдер определяется"}</span>
+              <span className="text-[#4A4A6A]">
+                {advisor.state === "testing" ? `${Math.min((advisor.progress ?? 0) + 1, advisor.total ?? 20)}/${advisor.total ?? 20}` : "DNS/provider"}
+                {advisor.provider ? ` · ${advisor.provider}` : ""}
+              </span>
             </div>
             <div className="h-1.5 rounded-full overflow-hidden bg-white/[0.04]">
               <motion.div className="h-full rounded-full" animate={{ width: `${advisor.state === "detecting" ? 5 : Math.max(5, (((advisor.progress ?? 0) + 1) / (advisor.total ?? 20)) * 100)}%` }}
                 style={{ background: "linear-gradient(90deg, #6C5CE7, #0078D4)" }} />
             </div>
+            {advisor.best && (
+              <div className="text-[9px] font-mono text-[#5F5F88] mt-2">
+                Лучший сейчас: <span className="text-[#A99BFF]">{advisor.best}</span>
+              </div>
+            )}
           </motion.div>
         )}
 
@@ -840,7 +861,10 @@ function Dashboard({
                         {index === 0 && <span className="text-[8px] font-mono text-[#00D68F]">ЛУЧШИЙ</span>}
                       </div>
                       <div className="text-[9px] font-mono text-[#55557A] mt-1">{candidate.summary}</div>
-                      <div className="text-[9px] font-mono text-[#3A3A5E] mt-1">{candidate.latencyMs != null ? `Среднее ${candidate.latencyMs} мс` : "Без замера задержки"}</div>
+                      <div className="text-[9px] font-mono text-[#3A3A5E] mt-1">
+                        {candidate.latencyMs != null ? `Среднее ${candidate.latencyMs} мс` : "Без замера задержки"}
+                        {candidate.score != null ? ` · score ${candidate.score}` : ""}
+                      </div>
                       <div className="text-[9px] font-semibold text-[#A99BFF] mt-2">Выбрать этот профиль →</div>
                     </button>
                     <motion.button type="button" whileTap={{ scale: 0.82 }} disabled={favoriteLimitReached}
@@ -1667,14 +1691,98 @@ function DomainListEditor({ title, description, values, emptyText, onSave }: {
   );
 }
 
+function UpdatePromptModal({ update }: { update: UpdateInfo }) {
+  const busy = update.state === "preparing" || update.state === "installing" || update.state === "downloading";
+  const visible = update.state === "availablePrompt" || busy || update.state === "failed";
+  if (!visible) return null;
+
+  const failed = update.state === "failed";
+  const description = failed
+    ? (update.error ?? "Проверьте подключение к GitHub или updater.log.")
+    : "Можно обновиться сейчас или применить обновление при следующем запуске.";
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        className="fixed inset-0 z-50 flex items-center justify-center px-6"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        style={{ background: "rgba(4,4,10,0.62)", backdropFilter: "blur(18px)", WebkitBackdropFilter: "blur(18px)" }}
+      >
+        <motion.div
+          initial={{ opacity: 0, y: 18, scale: 0.96 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: 10, scale: 0.98 }}
+          transition={{ type: "spring", stiffness: 320, damping: 30 }}
+          className="w-full max-w-[430px] rounded-[26px] p-5"
+          style={{
+            background: "linear-gradient(145deg, rgba(23,23,34,0.96), rgba(12,12,20,0.98))",
+            border: "1px solid rgba(255,255,255,0.12)",
+            boxShadow: "0 24px 70px rgba(0,0,0,0.55), 0 0 45px rgba(108,92,231,0.18)",
+          }}
+        >
+          <div className="flex items-start gap-4">
+            <div className="w-12 h-12 rounded-2xl flex items-center justify-center flex-shrink-0"
+              style={{ background: failed ? "rgba(255,107,107,0.12)" : "rgba(108,92,231,0.16)", border: `1px solid ${failed ? "rgba(255,107,107,0.28)" : "rgba(108,92,231,0.36)"}` }}>
+              {busy ? (
+                <motion.span animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 0.9, ease: "linear" }}>
+                  <RefreshCw size={22} className="text-[#B5AEFC]" />
+                </motion.span>
+              ) : failed ? (
+                <AlertTriangle size={22} className="text-[#FF6B6B]" />
+              ) : (
+                <Download size={22} className="text-[#B5AEFC]" />
+              )}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="text-xl font-bold text-white" style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}>
+                {failed ? "Обновление не установлено" : "Вышло новое обновление"}
+              </div>
+              <div className="text-[12px] font-mono text-[#8B87B8] mt-1">v{update.availableVersion ?? "—"}</div>
+              <div className="text-sm text-[#8D91B5] mt-3 leading-relaxed">
+                {busy ? (update.state === "installing" ? "Updater запущен. VortexPass закроется и откроется уже в новой версии." : "Скачиваю и проверяю ZIP-архив обновления…") : description}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-end gap-3 mt-6">
+            {failed ? (
+              <button type="button" onClick={() => postNativeMessage("update.dismissError")} className="px-4 py-2.5 rounded-xl text-sm font-semibold text-[#C7C2FF]"
+                style={{ background: "rgba(108,92,231,0.13)", border: "1px solid rgba(108,92,231,0.28)" }}>
+                Закрыть
+              </button>
+            ) : (
+              <>
+                <button type="button" disabled={busy} onClick={() => postNativeMessage("update.defer")} className="px-4 py-2.5 rounded-xl text-sm font-semibold transition-opacity disabled:opacity-45"
+                  style={{ color: "#B6B7D8", background: "rgba(255,255,255,0.055)", border: "1px solid rgba(255,255,255,0.09)" }}>
+                  Не сейчас
+                </button>
+                <button type="button" disabled={busy} onClick={() => postNativeMessage("update.installNow")} className="px-4 py-2.5 rounded-xl text-sm font-semibold transition-opacity disabled:opacity-45"
+                  style={{ color: "#FFFFFF", background: "linear-gradient(135deg, #6C5CE7, #2E8BFF)", border: "1px solid rgba(181,174,252,0.42)", boxShadow: "0 10px 26px rgba(108,92,231,0.28)" }}>
+                  Обновиться сейчас
+                </button>
+              </>
+            )}
+          </div>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+
 function SettingsTab({ update, domains, settings, onSettingsChange, onSaveDomains }: { update: UpdateInfo; domains: DomainListsInfo; settings: SettingsInfo; onSettingsChange: (name: keyof SettingsInfo, value: boolean) => void; onSaveDomains: (value: DomainListsInfo) => void }) {
-  const handleUpdate = () => postNativeMessage(update.state === "available" ? "update.install" : "update.check");
+  const handleUpdate = () => postNativeMessage(update.state === "available" || update.state === "availablePrompt" ? "update.installNow" : "update.check");
 
   const updateMeta = {
     idle: { label: "Проверить обновления GitHub", color: "#B5AEFC", bg: "rgba(108,92,231,0.15)", border: "rgba(108,92,231,0.3)" },
     checking: { label: "Проверка обновлений GitHub…", color: "#B5AEFC", bg: "rgba(108,92,231,0.15)", border: "rgba(108,92,231,0.3)" },
     current: { label: "У вас актуальная версия", color: "#00D68F", bg: "rgba(0,214,143,0.1)", border: "rgba(0,214,143,0.3)" },
     available: { label: `Скачать v${update.availableVersion ?? ""} с GitHub`, color: "#FFB340", bg: "rgba(255,179,64,0.1)", border: "rgba(255,179,64,0.3)" },
+    availablePrompt: { label: `Доступна v${update.availableVersion ?? ""}`, color: "#FFB340", bg: "rgba(255,179,64,0.1)", border: "rgba(255,179,64,0.3)" },
+    preparing: { label: "Подготовка обновления…", color: "#B5AEFC", bg: "rgba(108,92,231,0.15)", border: "rgba(108,92,231,0.3)" },
+    deferred: { label: "Обновление установится при следующем запуске", color: "#00D68F", bg: "rgba(0,214,143,0.1)", border: "rgba(0,214,143,0.3)" },
+    installing: { label: "Запуск updater…", color: "#B5AEFC", bg: "rgba(108,92,231,0.15)", border: "rgba(108,92,231,0.3)" },
     failed: { label: "Повторить проверку", color: "#FF6B6B", bg: "rgba(255,107,107,0.1)", border: "rgba(255,107,107,0.3)" },
     downloading: { label: `Скачивание v${update.availableVersion ?? ""}…`, color: "#B5AEFC", bg: "rgba(108,92,231,0.15)", border: "rgba(108,92,231,0.3)" },
   };
@@ -1790,10 +1898,10 @@ function SettingsTab({ update, domains, settings, onSettingsChange, onSaveDomain
 
         {/* Check button */}
         <motion.button
-          whileHover={update.state === "checking" || update.state === "downloading" ? {} : { scale: 1.015, y: -1 }}
-          whileTap={update.state === "checking" || update.state === "downloading" ? {} : { scale: 0.98 }}
+          whileHover={["checking", "downloading", "preparing", "installing"].includes(update.state) ? {} : { scale: 1.015, y: -1 }}
+          whileTap={["checking", "downloading", "preparing", "installing"].includes(update.state) ? {} : { scale: 0.98 }}
           onClick={handleUpdate}
-          disabled={update.state === "checking" || update.state === "downloading" || update.state === "current"}
+          disabled={["checking", "downloading", "preparing", "installing", "deferred", "current"].includes(update.state)}
           className="w-full flex items-center justify-center gap-2.5 py-3 rounded-xl font-semibold text-sm transition-all duration-300"
           style={{
             fontFamily: "'Plus Jakarta Sans', sans-serif",
@@ -1801,12 +1909,12 @@ function SettingsTab({ update, domains, settings, onSettingsChange, onSaveDomain
             color: meta.color,
             border: `1px solid ${meta.border}`,
             boxShadow:
-              update.state === "idle" || update.state === "available"
+              update.state === "idle" || update.state === "available" || update.state === "availablePrompt"
                 ? "0 4px 16px rgba(108,92,231,0.2)"
                 : "none",
           }}
         >
-          {update.state === "checking" || update.state === "downloading" ? (
+          {["checking", "downloading", "preparing", "installing"].includes(update.state) ? (
             <motion.span
               animate={{ rotate: 360 }}
               transition={{ repeat: Infinity, duration: 0.9, ease: "linear" }}
@@ -1968,7 +2076,7 @@ export default function App() {
 
   // Sync: master protection toggle controls all services
   const handleToggleProtection = () => {
-    if (controlsBusy) return;
+    if (controlsBusy && !protection) return;
     const next = !protection;
     postNativeMessage("protection.set", next);
   };
@@ -2014,6 +2122,7 @@ export default function App() {
         hosts={hosts}
         advisor={advisor}
         onRunAdvisor={() => postNativePayload({ type: "advisor.run" })}
+        onStopAdvisor={() => postNativePayload({ type: "advisor.stop" })}
         onAdvisorCandidateSelected={(candidate) => {
           if (controlsBusy) return;
           handleProfileSelected(candidate);
@@ -2106,6 +2215,7 @@ export default function App() {
           opacity: protection ? 1 : 0.4,
         }}
       />
+      <UpdatePromptModal update={update} />
 
       {/* ══ SIDEBAR ══════════════════════════════════════════ */}
       <aside

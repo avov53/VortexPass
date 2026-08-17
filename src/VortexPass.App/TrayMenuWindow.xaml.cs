@@ -27,9 +27,9 @@ public partial class TrayMenuWindow : Window
         StatusText.Text = transitionInProgress ? "Применяем изменения…" : protectionEnabled ? "Защита активна" : "Защита выключена";
         StatusHint.Text = transitionInProgress ? "Working" : protectionEnabled ? "Live" : "Idle";
         StatusHint.Foreground = Brush(protectionEnabled ? "#00D68F" : "#FF626078");
-        ProtectionButton.IsEnabled = !transitionInProgress;
+        ProtectionButton.IsEnabled = !transitionInProgress || protectionEnabled;
         ProtectionGlyph.Foreground = Brush(protectionEnabled ? "#00D68F" : "#FFC5BFFF");
-        ProtectionText.Text = transitionInProgress ? "Подождите…" : protectionEnabled ? "Остановить защиту" : "Запустить защиту";
+        ProtectionText.Text = transitionInProgress && !protectionEnabled ? "Подождите…" : protectionEnabled ? "Остановить защиту" : "Запустить защиту";
     }
 
     private static System.Windows.Media.SolidColorBrush Brush(string value) =>

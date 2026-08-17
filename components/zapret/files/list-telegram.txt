@@ -17,3 +17,11 @@ aurora.web.telegram.org
 vesta.web.telegram.org
 kws.web.telegram.org
 zws.web.telegram.org
+kws2.web.telegram.org
+kws2-1.web.telegram.org
+kws4.web.telegram.org
+kws4-1.web.telegram.org
+zws2.web.telegram.org
+zws2-1.web.telegram.org
+zws4.web.telegram.org
+zws4-1.web.telegram.org

@@ -22,7 +22,51 @@ public sealed class HostsFileManager
         "suggestqueries-clients6.youtube.com",
         "youtubei.googleapis.com",
         "youtube.googleapis.com",
-        "jnn-pa.googleapis.com"
+        "jnn-pa.googleapis.com",
+        "i.ytimg.com",
+        "s.ytimg.com",
+        "yt3.ggpht.com",
+        "yt4.ggpht.com",
+        "yt3.googleusercontent.com",
+        "youtube-pa.googleapis.com",
+        "youtubeembeddedplayer.googleapis.com",
+        "clients1.google.com",
+        "clients2.google.com",
+        "clients3.google.com",
+        "clients4.google.com",
+        "clients5.google.com",
+        "clients6.google.com",
+        "web.telegram.org",
+        "webk.telegram.org",
+        "webz.telegram.org",
+        "pluto.web.telegram.org",
+        "venus.web.telegram.org",
+        "aurora.web.telegram.org",
+        "vesta.web.telegram.org",
+        "kws.web.telegram.org",
+        "zws.web.telegram.org",
+        "kws2.web.telegram.org",
+        "kws2-1.web.telegram.org",
+        "kws4.web.telegram.org",
+        "kws4-1.web.telegram.org",
+        "zws2.web.telegram.org",
+        "zws2-1.web.telegram.org",
+        "zws4.web.telegram.org",
+        "zws4-1.web.telegram.org",
+        "telegram.org",
+        "t.me",
+        "telegram.me",
+        "telegram-cdn.org",
+        "cdn-telegram.org",
+        "telegramusercontent.com",
+        "telesco.pe",
+        "cdn.telesco.pe",
+        "cdn1.telesco.pe",
+        "cdn2.telesco.pe",
+        "cdn3.telesco.pe",
+        "cdn4.telesco.pe",
+        "cdn5.telesco.pe",
+        "cdn6.telesco.pe"
     };
 
     private readonly string _assetPath;
@@ -75,14 +119,40 @@ public sealed class HostsFileManager
             .Distinct()
             .ToArray();
         if (flowsealEntries.Length < 20) throw new InvalidDataException("Закреплённый hosts-набор не содержит ожидаемые Telegram Web и Discord voice записи.");
+        var stableTelegramWebAddress = flowsealEntries
+            .FirstOrDefault(entry => entry.Host.Equals("web.telegram.org", StringComparison.OrdinalIgnoreCase))
+            .Address;
+        var telegramWebAliases = stableTelegramWebAddress is null
+            ? Array.Empty<(IPAddress Address, string Host)>()
+            : new (IPAddress Address, string Host)[]
+            {
+                (stableTelegramWebAddress, "webk.telegram.org"),
+                (stableTelegramWebAddress, "webz.telegram.org")
+            };
         var additionalEntries = overrides
             .Where(entry => IsAllowedHost(entry.Host))
             .Select(entry => (Address: entry.Address, Host: entry.Host.TrimEnd('.').ToLowerInvariant()))
             .ToArray();
-        var entries = flowsealEntries.Concat(additionalEntries).Distinct().ToArray();
+        // The signed Flowseal entries are SNI-aware routes. A raw TCP probe to their IP
+        // does not contain a hostname and can be blocked by the very DPI rules that winws
+        // is meant to bypass, so it must not be used to discard the trusted Telegram block.
+        var trustedEntries = flowsealEntries.Concat(telegramWebAliases).Distinct().ToArray();
+        var candidateEntries = trustedEntries.Concat(additionalEntries).Distinct().ToArray();
+        var reachableAddresses = new HashSet<IPAddress>();
+        var skippedAddresses = new List<IPAddress>();
+        foreach (var address in additionalEntries.Select(x => x.Address).Distinct())
+        {
+            if (await IsReachableAsync(address, cancellationToken))
+                reachableAddresses.Add(address);
+            else
+                skippedAddresses.Add(address);
+        }
 
-        foreach (var address in entries.Select(x => x.Address).Distinct())
-            await EnsureReachableAsync(address, cancellationToken);
+        var entries = candidateEntries
+            .Where(entry => trustedEntries.Contains(entry) || reachableAddresses.Contains(entry.Address))
+            .ToArray();
+        if (entries.Length == 0)
+            throw new IOException("Все IP из hosts-набора сейчас недоступны по TCP 443; системный hosts не изменён.");
 
         Directory.CreateDirectory(Path.GetDirectoryName(_backupPath)!);
         var original = File.Exists(_hostsPath) ? await File.ReadAllTextAsync(_hostsPath, cancellationToken) : string.Empty;
@@ -95,7 +165,10 @@ public sealed class HostsFileManager
         var updated = string.IsNullOrEmpty(clean) ? block.ToString() : $"{clean}{Environment.NewLine}{Environment.NewLine}{block}";
         await AtomicWriteAsync(updated, cancellationToken);
         await FlushDnsAsync(cancellationToken);
-        return GetStatus();
+        var status = GetStatus();
+        return skippedAddresses.Count == 0
+            ? status
+            : status with { Detail = $"{status.Detail}; пропущено недоступных IP: {string.Join(", ", skippedAddresses.Distinct())}" };
     }
 
     public async Task<HostsFileStatus> RestoreAsync(CancellationToken cancellationToken = default)
@@ -171,7 +244,7 @@ public sealed class HostsFileManager
         host == "web.telegram.org" || host == "api.telegram.org" || host.EndsWith(".web.telegram.org", StringComparison.Ordinal) ||
         host.EndsWith(".discord.media", StringComparison.Ordinal) || AllowedDynamicHosts.Contains(host);
 
-    private static async Task EnsureReachableAsync(IPAddress address, CancellationToken cancellationToken)
+    private static async Task<bool> IsReachableAsync(IPAddress address, CancellationToken cancellationToken)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(4));
@@ -179,10 +252,12 @@ public sealed class HostsFileManager
         {
             using var client = new TcpClient(address.AddressFamily);
             await client.ConnectAsync(address, 443, timeout.Token);
+            return true;
         }
         catch (Exception ex) when (ex is SocketException or OperationCanceledException)
         {
-            throw new IOException($"IP {address} из hosts-набора сейчас недоступен по TCP 443; системный hosts не изменён.", ex);
+            cancellationToken.ThrowIfCancellationRequested();
+            return false;
         }
     }
 

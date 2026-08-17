@@ -22,6 +22,30 @@ $manifest = Get-Content -LiteralPath $manifestFullPath -Raw -Encoding UTF8 | Con
 $failures = [System.Collections.Generic.List[string]]::new()
 $checked = 0
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $command = Get-Command Get-FileHash -ErrorAction SilentlyContinue
+    if ($null -ne $command) {
+        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = $sha.ComputeHash($stream)
+            return ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+        }
+        finally {
+            $sha.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
 foreach ($component in $manifest.components) {
     foreach ($file in $component.requiredFiles) {
         $relativePath = [string]$file.path
@@ -44,7 +68,7 @@ foreach ($component in $manifest.components) {
         }
 
         $expected = ([string]$file.sha256).Trim().ToLowerInvariant()
-        $actual = (Get-FileHash -LiteralPath $candidatePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $actual = Get-Sha256Hex -Path $candidatePath
         if ($expected -ne $actual) {
             $failures.Add("SHA-256 mismatch: $relativePath (manifest $expected, actual $actual)")
         }
