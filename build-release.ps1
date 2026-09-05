@@ -17,12 +17,19 @@ if ($pnpm) {
 }
 
 Remove-Item -LiteralPath $publish -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Path $publish -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $publish 'bin') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $publish 'updater') -Force | Out-Null
 dotnet publish (Join-Path $root 'src\VortexPass.App\VortexPass.App.csproj') -c Release -r win-x64 --self-contained true -p:Version=$Version -p:AssemblyInformationalVersion=$Version -o $publish
 dotnet publish (Join-Path $root 'src\VortexPass.Updater\VortexPass.Updater.csproj') -c Release -r win-x64 --self-contained true -o (Join-Path $publish 'updater')
-Copy-Item -LiteralPath (Join-Path $root 'components\zapret') -Destination (Join-Path $publish 'bin') -Recurse -Force
+Copy-Item -Path (Join-Path $root 'components\zapret\*') -Destination (Join-Path $publish 'bin') -Recurse -Force
+
+& (Join-Path $root 'scripts\Test-ComponentManifest.ps1') -ManifestPath (Join-Path $publish 'assets\external-components.json') -ComponentsRoot (Join-Path $publish 'bin')
+
+$artifactsDir = Join-Path $root 'artifacts'
+New-Item -ItemType Directory -Path $artifactsDir -Force | Out-Null
 Compress-Archive -Path (Join-Path $publish '*') -DestinationPath $package -Force
 $hash = (Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash.ToLowerInvariant()
 Set-Content -LiteralPath "$package.sha256" -Value "$hash  VortexPass-win-x64.zip" -NoNewline
 Write-Host "Release package: $package"
+Write-Host "SHA256: $hash"
 Write-Host "Upload VortexPass-win-x64.zip and VortexPass-win-x64.zip.sha256 to GitHub release v$Version"

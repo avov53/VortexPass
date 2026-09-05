@@ -3,6 +3,9 @@ namespace VortexPass.Core.Models;
 public sealed class AppSettings
 {
     public bool StartWithWindows { get; set; }
+    public bool StartProtectionOnStartup { get; set; }
+    public string StartupStrategy { get; set; } = "auto";
+    public string SelectedDnsProvider { get; set; } = "auto";
     public bool MinimizeToTray { get; set; } = true;
     public DateTimeOffset? LastUpdateCheckUtc { get; set; }
     public BypassProfileSettings Profiles { get; set; } = new();
@@ -50,6 +53,7 @@ public sealed class GameFilterSettings
 {
     public List<string> SelectedGames { get; set; } = [];
     public string Protocol { get; set; } = "all";
+    public string IpsetMode { get; set; } = "any";
 
     public bool HasSelectedGames => SelectedGames.Count > 0;
 }

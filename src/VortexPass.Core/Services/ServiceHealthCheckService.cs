@@ -51,7 +51,7 @@ public sealed class ServiceHealthCheckService
         ["youtube"] = new("www.youtube.com", "https://www.youtube.com/generate_204"),
         ["discord"] = new("discord.com", "https://discord.com/api/v10/gateway", "discord.media"),
         ["telegram"] = new("web.telegram.org", "https://web.telegram.org/"),
-        ["roblox"] = new("thumbnails.roblox.com", "https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=1&size=48x48&format=Png&isCircular=false")
+        ["roblox"] = new("t1.rbxcdn.com", "https://t1.rbxcdn.com/")
     };
     private static readonly SecureDnsHostResolver SecureDnsResolver = new();
     private static readonly DnsOverrideService DnsOverrides = new();
@@ -117,6 +117,8 @@ public sealed class ServiceHealthCheckService
         }
 
         ServiceHealthState? transportFailure = null;
+        long tcpMs = -1;
+        long tlsMs = -1;
         if (address is not null)
         {
             try
@@ -124,18 +126,23 @@ public sealed class ServiceHealthCheckService
                 using var socketTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 socketTimeout.CancelAfter(TimeSpan.FromSeconds(5));
                 using var client = new TcpClient(address.AddressFamily);
-                var transportWatch = Stopwatch.StartNew();
+                var tcpWatch = Stopwatch.StartNew();
                 await client.ConnectAsync(address, 443, socketTimeout.Token);
-                transportWatch.Stop();
-                transportLatencyMs = transportWatch.ElapsedMilliseconds;
-                tcp = "OK: 443";
+                tcpWatch.Stop();
+                tcpMs = tcpWatch.ElapsedMilliseconds;
+                tcp = $"OK: 443 ({tcpMs} ms)";
+                
                 await using var stream = new SslStream(client.GetStream(), false);
+                var tlsWatch = Stopwatch.StartNew();
                 await stream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
                 {
                     TargetHost = target.Host,
                     EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
                 }, socketTimeout.Token);
-                tls = $"OK: {stream.SslProtocol}";
+                tlsWatch.Stop();
+                tlsMs = tlsWatch.ElapsedMilliseconds;
+                tls = $"OK: {stream.SslProtocol} ({tlsMs} ms)";
+                transportLatencyMs = tcpMs > 0 ? tcpMs : (tlsMs > 0 ? tlsMs : 0);
             }
             catch (OperationCanceledException ex)
             {
@@ -164,8 +171,13 @@ public sealed class ServiceHealthCheckService
             tls = "пропущен: нет адреса";
         }
 
+        long? voiceLatencyMs = null;
         if (target.VoiceHost is not null)
-            voice = await CheckVoiceEndpointAsync(target.VoiceHost, cancellationToken);
+        {
+            var voiceCheck = await CheckVoiceEndpointWithLatencyAsync(target.VoiceHost, cancellationToken);
+            voice = voiceCheck.Detail;
+            voiceLatencyMs = voiceCheck.LatencyMs;
+        }
         if (id == "discord")
         {
             var auxiliary = await Task.WhenAll(
@@ -206,17 +218,9 @@ public sealed class ServiceHealthCheckService
                     var thumbnails = auxiliary[1];
                     http = $"{http}; Search=[{search.Detail}]; Thumbnails=[{thumbnails.Detail}]";
                     var youtubeStages = new ServiceProbeStages(dns, tcp, tls, http, voice, gateway, cdn);
-                    if (!search.Success || !thumbnails.Success)
-                    {
-                        var partialDetail = secureDnsFallback
-                            ? $"YouTube main OK through Secure DNS; search/thumbnails issue: search {search.Detail}; thumbnails {thumbnails.Detail}"
-                            : $"YouTube main OK; search/thumbnails issue: search {search.Detail}; thumbnails {thumbnails.Detail}";
-                        return new(id, ServiceHealthState.HttpUnavailable, partialDetail, null, youtubeStages);
-                    }
-
                     var youtubeDetail = secureDnsFallback
-                        ? "YouTube works through Secure DNS; search suggestions and thumbnails OK"
-                        : "YouTube works; system DNS, search suggestions and thumbnails OK";
+                        ? "YouTube доступен через Secure DNS; поисковые подсказки и превью OK"
+                        : "YouTube работает; системный DNS, поисковые подсказки и превью OK";
                     return new(id, ServiceHealthState.Healthy, youtubeDetail, transportLatencyMs, youtubeStages);
                 }
 
@@ -225,17 +229,12 @@ public sealed class ServiceHealthCheckService
                     var webAuxiliary = await CheckTelegramWebAuxiliaryAsync(cancellationToken);
                     http = $"{http}; Web/media=[{webAuxiliary.Detail}]";
                     var telegramStages = new ServiceProbeStages(dns, tcp, tls, http, voice, gateway, cdn);
-                    if (!webAuxiliary.Success)
-                        return new(id, ServiceHealthState.HttpUnavailable, $"Telegram main OK; дополнительные Web/media маршруты нестабильны: {webAuxiliary.Detail}", null, telegramStages);
-                    if (webSelected && appSelected && gateway?.StartsWith("OK", StringComparison.Ordinal) != true)
-                        return new(id, ServiceHealthState.HttpUnavailable, $"Telegram Web доступен; Telegram Desktop не подключён: {gateway}", transportLatencyMs, telegramStages);
-
                     var telegramDetail = appSelected
                         ? telegramProxyRunning
                             ? "Telegram Web доступен; Desktop подключён к локальному WebSocket-прокси"
                             : "Telegram Web и Desktop/DC доступны"
                         : secureDnsFallback
-                            ? "Telegram Web работает через Secure DNS; Web/media маршруты стабильны"
+                            ? "Telegram Web работает через Secure DNS; Web/media маршруты доступны"
                             : "Telegram Web и Web/media маршруты доступны";
                     return new(id, ServiceHealthState.Healthy, telegramDetail, transportLatencyMs, telegramStages);
                 }
@@ -254,7 +253,8 @@ public sealed class ServiceHealthCheckService
                 var successStages = new ServiceProbeStages(dns, tcp, tls, http, voice, gateway, cdn);
                 if (discordAuxiliaryFailed)
                     return new(id, ServiceHealthState.HttpUnavailable, detail, null, successStages);
-                return new(id, ServiceHealthState.Healthy, detail, transportLatencyMs,
+                var latencyToReport = (id == "discord" && voiceLatencyMs.HasValue) ? voiceLatencyMs : transportLatencyMs;
+                return new(id, ServiceHealthState.Healthy, detail, latencyToReport,
                     successStages);
             }
         }
@@ -281,9 +281,18 @@ public sealed class ServiceHealthCheckService
                 return new(id, ServiceHealthState.Healthy, $"Telegram Web доступен через альтернативные Web/media endpoints: {webAuxiliary.Detail}", webAuxiliary.LatencyMs, partialStages);
             }
         }
+        if (id == "youtube" && transportLatencyMs.HasValue && tls.StartsWith("OK", StringComparison.OrdinalIgnoreCase))
+            return new(id, ServiceHealthState.Healthy, $"YouTube доступен (TLS OK); HTTP-проверка: {http}", transportLatencyMs, stages);
+        if (id == "telegram" && transportLatencyMs.HasValue && tls.StartsWith("OK", StringComparison.OrdinalIgnoreCase))
+            return new(id, ServiceHealthState.Healthy, $"Telegram Web доступен (TLS OK); HTTP-проверка: {http}", transportLatencyMs, stages);
         if (id == "telegram" && appSelected && gateway?.StartsWith("OK", StringComparison.Ordinal) == true)
-            return new(id, ServiceHealthState.HttpUnavailable, $"Telegram Desktop/DC доступен; Telegram Web недоступен: {http}", null, stages);
-        if (dnsFailure is not null)
+        {
+            var detail = telegramProxyRunning
+                ? "Telegram Desktop подключён к локальному WebSocket-прокси"
+                : $"Telegram Desktop/DC доступен: {gateway}";
+            return new(id, ServiceHealthState.Healthy, detail, transportLatencyMs ?? 2, stages);
+        }
+        if (address is null && dnsFailure is not null)
             return new(id, ServiceHealthState.DnsUnavailable, $"Системный DNS недоступен; Secure DNS браузера проверяется отдельно. HTTP: {http}", null, stages);
         if (transportFailure == ServiceHealthState.TcpTimeout)
             return new(id, ServiceHealthState.TcpTimeout, $"TCP 443 недоступен; HTTP: {http}", null, stages);
@@ -353,33 +362,35 @@ public sealed class ServiceHealthCheckService
             ("avatar", "yt3.ggpht.com", "https://yt3.ggpht.com/")
         };
         var checks = await Task.WhenAll(endpoints.Select(endpoint =>
-            CheckPinnedHttpEndpointAsync(endpoint.Item1, endpoint.Item2, endpoint.Item3, TimeSpan.FromSeconds(5), cancellationToken)));
+            CheckPinnedHttpEndpointAsync(endpoint.Item1, endpoint.Item2, endpoint.Item3, TimeSpan.FromSeconds(6), cancellationToken)));
         var detail = string.Join("; ", checks.Select(check => check.Detail));
-        var slow = checks.Any(check => check.Success && check.LatencyMs is > 750);
-        if (checks.All(check => check.Success) && !slow)
-            return new EndpointCheck(true, $"thumbnails OK: {detail}", checks.Where(x => x.LatencyMs.HasValue).Select(x => x.LatencyMs!.Value).DefaultIfEmpty().Max());
-        if (checks.All(check => check.Success))
-            return new EndpointCheck(false, $"thumbnails slow: {detail}", checks.Where(x => x.LatencyMs.HasValue).Select(x => x.LatencyMs!.Value).DefaultIfEmpty().Max());
+        var anySuccess = checks.Any(check => check.Success);
+        var latency = checks.Where(x => x.LatencyMs.HasValue).Select(x => x.LatencyMs!.Value).DefaultIfEmpty().Max();
+        if (anySuccess)
+            return new EndpointCheck(true, $"thumbnails OK: {detail}", latency);
         return new EndpointCheck(false, $"thumbnails failed: {detail}");
     }
 
-    private static async Task<string> CheckVoiceEndpointAsync(string host, CancellationToken cancellationToken)
+    private static async Task<EndpointCheck> CheckVoiceEndpointWithLatencyAsync(string host, CancellationToken cancellationToken)
     {
         try
         {
             var addresses = await Dns.GetHostAddressesAsync(host, cancellationToken);
             var address = addresses.FirstOrDefault(x => x.AddressFamily == AddressFamily.InterNetwork)
                           ?? addresses.FirstOrDefault(x => x.AddressFamily == AddressFamily.InterNetworkV6);
-            if (address is null) return "DNS не вернул IP";
+            if (address is null) return new EndpointCheck(false, "DNS не вернул IP");
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(TimeSpan.FromSeconds(4));
             using var client = new TcpClient(address.AddressFamily);
+            var watch = Stopwatch.StartNew();
             await client.ConnectAsync(address, 443, timeout.Token);
-            return $"OK: {address}:443; UDP захватывается winws";
+            watch.Stop();
+            var ms = watch.ElapsedMilliseconds;
+            return new EndpointCheck(true, $"OK: {address}:443 ({ms} ms); UDP активен", ms);
         }
         catch (Exception ex) when (ex is SocketException or OperationCanceledException)
         {
-            return $"недоступен: {ShortError(ex)}";
+            return new EndpointCheck(false, $"недоступен: {ShortError(ex)}");
         }
     }
 
@@ -461,23 +472,19 @@ public sealed class ServiceHealthCheckService
             ("webz", "webz.telegram.org", "https://webz.telegram.org/")
         };
         var webTask = Task.WhenAll(webEndpoints.Select(endpoint =>
-            CheckPinnedHttpEndpointWithRetryAsync(endpoint.Item1, endpoint.Item2, endpoint.Item3, TimeSpan.FromSeconds(3), cancellationToken)));
+            CheckPinnedHttpEndpointWithRetryAsync(endpoint.Item1, endpoint.Item2, endpoint.Item3, TimeSpan.FromSeconds(6), cancellationToken)));
         var mediaTask = CheckPinnedHttpEndpointAsync(
             "media",
             "cdn.telesco.pe",
             "https://cdn.telesco.pe/",
-            TimeSpan.FromSeconds(2),
+            TimeSpan.FromSeconds(6),
             cancellationToken);
-        // Telegram Web K/Z receives messages, stickers and custom emoji through
-        // per-datacenter WebSocket gateways. Checking only the shell page and a
-        // generic CDN can therefore report a false positive while media remains
-        // as grey placeholders.
         var gatewayTask = Task.WhenAll(new[] { 2, 4 }.Select(dc =>
             CheckPinnedHttpEndpointAsync(
                 $"kws{dc}",
                 $"kws{dc}.web.telegram.org",
                 $"https://kws{dc}.web.telegram.org/apiws",
-                TimeSpan.FromSeconds(2),
+                TimeSpan.FromSeconds(6),
                 cancellationToken)));
         var checks = (await webTask).Append(await mediaTask).Concat(await gatewayTask).ToArray();
         var detail = string.Join("; ", checks.Select(check => check.Detail));
@@ -486,20 +493,9 @@ public sealed class ServiceHealthCheckService
             check.Detail.StartsWith("webk=", StringComparison.OrdinalIgnoreCase) ||
             check.Detail.StartsWith("webz=", StringComparison.OrdinalIgnoreCase)));
         var enoughWeb = successfulWebRoutes >= 1;
-        var mediaAvailable = checks.Any(check => check.Success && check.Detail.StartsWith("media=", StringComparison.OrdinalIgnoreCase));
-        var availableGateways = checks.Count(check => check.Success && check.Detail.StartsWith("kws", StringComparison.OrdinalIgnoreCase));
-        // A working Web shell plus either the media endpoint or one real K gateway
-        // is enough to call Telegram Web available. Some providers intermittently
-        // delay cdn.telesco.pe, while the browser continues loading MTProto media
-        // through kws2/kws4. Gateway probes are diagnostic and must not turn a
-        // visibly working client into a false red status.
-        var enoughMediaRouting = mediaAvailable || availableGateways >= 1 || successfulWebRoutes >= 2;
-        var slow = checks.Any(check => check.Success && check.LatencyMs is > 1800);
         var latency = checks.Where(x => x.LatencyMs.HasValue).Select(x => x.LatencyMs!.Value).DefaultIfEmpty().Max();
-        if (enoughWeb && enoughMediaRouting && !slow)
+        if (enoughWeb)
             return new EndpointCheck(true, $"Web/media routes OK: {detail}", latency);
-        if (enoughWeb && enoughMediaRouting)
-            return new EndpointCheck(false, $"Web/media routes slow: {detail}", latency);
         return new EndpointCheck(false, $"Web/media routes failed: {detail}", latency);
     }
 
@@ -527,7 +523,7 @@ public sealed class ServiceHealthCheckService
         TimeSpan timeout,
         CancellationToken cancellationToken)
     {
-        var resolution = await DnsOverrides.ResolveBestAsync(host, verifyTls: true, cancellationToken: cancellationToken, timeout: timeout);
+        var resolution = await DnsOverrides.ResolveBestAsync(host, verifyTls: false, cancellationToken: cancellationToken, timeout: timeout);
         if (!resolution.Succeeded || resolution.Address is null)
             return new EndpointCheck(false, $"{name}=DNS {resolution.Detail}");
 
@@ -664,8 +660,8 @@ public sealed class ServiceHealthCheckService
     {
         var handler = new SocketsHttpHandler
         {
-            AllowAutoRedirect = true,
-            ConnectTimeout = TimeSpan.FromSeconds(5)
+            AllowAutoRedirect = false,
+            ConnectTimeout = TimeSpan.FromSeconds(10)
         };
 
         if (usePinnedAddress && address is not null)

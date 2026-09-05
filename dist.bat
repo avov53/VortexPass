@@ -5,7 +5,7 @@ set "ROOT=%~dp0"
 set "DIST=%ROOT%dist"
 set "STAGING=%ROOT%dist.next"
 set "VERSION=%~1"
-if "%VERSION%"=="" set "VERSION=0.5.0"
+if "%VERSION%"=="" set "VERSION=0.6.0"
 
 echo.
 echo === VortexPass %VERSION% ^| win-x64 Release build ===
@@ -26,11 +26,22 @@ if not errorlevel 1 (
   )
   popd
 ) else (
-  if not exist "%ROOT%src\VortexPass.App\web-dist\index.html" (
-    echo ERROR: pnpm was not found and the prebuilt web interface is missing.
-    goto :error
+  where npm >nul 2>&1
+  if not errorlevel 1 (
+    pushd "%ROOT%src\VortexPass.App\web-src" || goto :error
+    call npm run build
+    if errorlevel 1 (
+      popd
+      goto :error
+    )
+    popd
+  ) else (
+    if not exist "%ROOT%src\VortexPass.App\web-dist\index.html" (
+      echo ERROR: Neither pnpm nor npm was found and the prebuilt web interface is missing.
+      goto :error
+    )
+    echo Neither pnpm nor npm was found; using the checked prebuilt web interface.
   )
-  echo pnpm was not found; using the checked prebuilt web interface.
 )
 
 if exist "%STAGING%" rmdir /s /q "%STAGING%" >nul 2>&1

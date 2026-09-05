@@ -168,6 +168,12 @@ public partial class MainWindow : Window
         {
             await _settingsStore.SaveAsync(_settings, _lifetime.Token);
         }
+        var isStartup = Environment.GetCommandLineArgs().Any(arg => arg.Equals("--startup", StringComparison.OrdinalIgnoreCase));
+        if (isStartup)
+        {
+            WindowState = WindowState.Minimized;
+            Hide();
+        }
         if (!_settings.StartWithWindows)
             _startupService.SetEnabled(false, Path.Combine(AppContext.BaseDirectory, "VortexPass.exe"));
         _trayIcon.Visible = true;
@@ -192,7 +198,15 @@ public partial class MainWindow : Window
             var currentVersion = CurrentVersion().ToString(3);
             var initialJson = JsonSerializer.Serialize(new
             {
-                settings = new { autostart = _settings.StartWithWindows, tray = _settings.MinimizeToTray },
+                settings = new
+                {
+                    autostart = _settings.StartWithWindows,
+                    tray = _settings.MinimizeToTray,
+                    selectedDnsProvider = _settings.SelectedDnsProvider,
+                    startProtectionOnStartup = _settings.StartProtectionOnStartup,
+                    startupStrategy = _settings.StartupStrategy,
+                    gameFilterIpsetMode = _settings.GameFilter.IpsetMode
+                },
                 profiles = new
                 {
                     youtube = _settings.Profiles.YouTube,
@@ -249,6 +263,20 @@ public partial class MainWindow : Window
             await LogToUiAsync("info", $"Исключения обновлены: добавлено {_startupAddedDefaultExclusions} доменов для CurseForge/Battle.net.");
         _ = RunMetricsLoopAsync(_lifetime.Token);
         _ = CheckForUpdatesAsync();
+
+        var isStartup = Environment.GetCommandLineArgs().Any(arg => arg.Equals("--startup", StringComparison.OrdinalIgnoreCase));
+        if (isStartup && _settings.StartProtectionOnStartup)
+        {
+            if (_settings.StartupStrategy.Equals("auto", StringComparison.OrdinalIgnoreCase))
+            {
+                _ = RunProfileAdvisorAsync();
+            }
+            else
+            {
+                _settings.BypassLevel = WinwsProfileComposer.NormalizeLevel(_settings.StartupStrategy);
+                _ = SetProtectionAsync(true);
+            }
+        }
     }
 
     private async void WebViewMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
@@ -282,6 +310,47 @@ public partial class MainWindow : Window
                     _settings.MinimizeToTray = value;
                     await _settingsStore.SaveAsync(_settings);
                     await PublishSettingsStatusAsync();
+                    break;
+                case "settings.startProtectionOnStartup":
+                    _settings.StartProtectionOnStartup = value;
+                    await _settingsStore.SaveAsync(_settings);
+                    await PublishSettingsStatusAsync();
+                    break;
+                case "settings.startupStrategy":
+                    var strat = root.TryGetProperty("strategy", out var rawStrat) ? rawStrat.GetString() : null;
+                    if (!string.IsNullOrWhiteSpace(strat))
+                    {
+                        _settings.StartupStrategy = strat;
+                        await _settingsStore.SaveAsync(_settings);
+                        await PublishSettingsStatusAsync();
+                        if (!strat.Equals("auto", StringComparison.OrdinalIgnoreCase) && _protectionStarted.HasValue)
+                        {
+                            await SetBypassLevelAsync(strat, _settings.BypassTuning);
+                        }
+                    }
+                    break;
+                case "settings.dnsProvider":
+                    var dns = root.TryGetProperty("provider", out var rawDns) ? rawDns.GetString() : null;
+                    if (!string.IsNullOrWhiteSpace(dns))
+                    {
+                        _settings.SelectedDnsProvider = dns;
+                        await _settingsStore.SaveAsync(_settings);
+                        await PublishSettingsStatusAsync();
+                        await LogToUiAsync("info", $"Выбран DNS-сервер: {dns}");
+                    }
+                    break;
+                case "gamefilter.ipsetMode":
+                    var ipsetMode = root.TryGetProperty("mode", out var rawMode) ? rawMode.GetString() : null;
+                    if (!string.IsNullOrWhiteSpace(ipsetMode))
+                    {
+                        _settings.GameFilter.IpsetMode = ipsetMode;
+                        await _settingsStore.SaveAsync(_settings);
+                        await PublishSettingsStatusAsync();
+                        if (_protectionStarted.HasValue)
+                        {
+                            await ApplyProfilesAsync();
+                        }
+                    }
                     break;
                 case "protection.set":
                     await SetProtectionAsync(value);
@@ -656,7 +725,7 @@ public partial class MainWindow : Window
     {
         if (_settings.Profiles.YouTube || _settings.Profiles.Web) yield return "youtube";
         if (_settings.Profiles.Discord || _settings.Profiles.Web) yield return "discord";
-        if (_settings.Profiles.Telegram || _settings.Profiles.Web) yield return "telegram";
+        if (_settings.Profiles.Telegram) yield return "telegram";
         if (_settings.Profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("roblox", StringComparison.OrdinalIgnoreCase))) yield return "roblox";
         if (_settings.Profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("phasmophobia", StringComparison.OrdinalIgnoreCase))) yield return "phasmophobia";
     }
@@ -1031,10 +1100,12 @@ public partial class MainWindow : Window
                     {
                         await RestoreHostsCoreAsync();
                     }
-                    _nextHealthCheckUtc = DateTimeOffset.MinValue;
+                    _nextHealthCheckUtc = DateTimeOffset.UtcNow.AddSeconds(20);
                     await PostUiAsync(new { type = "log", level = "ok", message = $"Профили активны: {string.Join(", ", ActiveProfileNames())}." });
                     if (_activeProfiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("phasmophobia", StringComparison.OrdinalIgnoreCase)))
                         await LogToUiAsync("info", "Phasmophobia: игровой UDP оставлен прямым для стабильности сессии; VortexPass обрабатывает только домены Photon/Unity/Vivox/Steam.");
+                    
+                    _ = RunHealthChecksGuardedAsync(CancellationToken.None);
                 }
             }
             else
@@ -1081,15 +1152,18 @@ public partial class MainWindow : Window
             .Any(game => game.Equals("roblox", StringComparison.OrdinalIgnoreCase));
         if (robloxSelected)
         {
-            var resolution = await _robloxThumbnailResolver.ResolveAsync(cancellationToken);
+            var resolution = await _robloxThumbnailResolver.ResolveAsync(_settings.SelectedDnsProvider, cancellationToken);
             if (!resolution.Succeeded)
             {
                 await LogToUiAsync("warn", $"Roblox CDN: не удалось получить временный DNS для {RobloxThumbnailResolver.ThumbnailHost}: {resolution.Detail}. Правила winws всё равно применены.");
             }
             else
             {
-                await LogToUiAsync("ok", $"Roblox CDN: временный DNS для {RobloxThumbnailResolver.ThumbnailHost} подтверждён ({resolution.Detail}).");
-                overrides.Add(new HostsOverride(resolution.Address!, RobloxThumbnailResolver.ThumbnailHost));
+                await LogToUiAsync("ok", $"Roblox CDN: временный DNS для {RobloxThumbnailResolver.AllRobloxCdnHosts.Length} CDN-доменов подтверждён ({resolution.Detail}).");
+                foreach (var host in RobloxThumbnailResolver.AllRobloxCdnHosts)
+                {
+                    overrides.Add(new HostsOverride(resolution.Address!, host));
+                }
             }
         }
 
@@ -1108,19 +1182,12 @@ public partial class MainWindow : Window
         };
         var tasks = hosts.Select(async host =>
         {
-            var probeUrl = host switch
-            {
-                "www.youtube.com" => "https://www.youtube.com/generate_204",
-                "i.ytimg.com" => "https://i.ytimg.com/generate_204",
-                "s.ytimg.com" => "https://s.ytimg.com/",
-                "yt3.ggpht.com" => "https://yt3.ggpht.com/",
-                _ => null
-            };
             var resolution = await _dnsOverrides.ResolveBestAsync(
                 host,
                 verifyTls: true,
-                httpProbeUrl: probeUrl,
-                timeout: TimeSpan.FromSeconds(2),
+                httpProbeUrl: null,
+                timeout: TimeSpan.FromSeconds(4),
+                preferredProvider: _settings.SelectedDnsProvider,
                 cancellationToken: cancellationToken);
             if (!resolution.Succeeded)
             {
@@ -1260,7 +1327,11 @@ public partial class MainWindow : Window
     {
         type = "settings.status",
         autostart = _settings.StartWithWindows,
-        tray = _settings.MinimizeToTray
+        tray = _settings.MinimizeToTray,
+        selectedDnsProvider = _settings.SelectedDnsProvider,
+        startProtectionOnStartup = _settings.StartProtectionOnStartup,
+        startupStrategy = _settings.StartupStrategy,
+        gameFilterIpsetMode = _settings.GameFilter.IpsetMode
     });
 
     private void UpdateTrayState(bool protectionEnabled)
@@ -1330,7 +1401,7 @@ public partial class MainWindow : Window
         {
             _healthChecks.CheckAsync("youtube", profiles.YouTube || profiles.Web, winwsRunning, cancellationToken),
             _healthChecks.CheckAsync("discord", profiles.Discord || profiles.Web, winwsRunning, cancellationToken),
-            _healthChecks.CheckAsync("telegram", profiles.Telegram || profiles.Web, winwsRunning, cancellationToken, profiles.Telegram, profiles.Web, _telegramProxy.IsRunning, _telegramProxy.HasTelegramClientActivity)
+            _healthChecks.CheckAsync("telegram", profiles.Telegram, winwsRunning, cancellationToken, profiles.Telegram, profiles.Web, _telegramProxy.IsRunning, _telegramProxy.HasTelegramClientActivity)
         };
         if (profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("roblox", StringComparison.OrdinalIgnoreCase)))
             checks.Add(_healthChecks.CheckAsync("roblox", true, winwsRunning, cancellationToken));
@@ -1352,18 +1423,24 @@ public partial class MainWindow : Window
                 if (failures < 2)
                     continue;
             }
-            var changed = !_healthStatuses.TryGetValue(result.Id, out var previous) || previous.State != result.State || previous.Detail != result.Detail;
             _healthStatuses[result.Id] = result;
-            if (changed)
+            if (result.State is not ServiceHealthState.NotSelected and not ServiceHealthState.WinwsStopped)
             {
-                var level = result.IsHealthy ? "ok" : result.State is ServiceHealthState.NotSelected or ServiceHealthState.WinwsStopped ? "info" : "error";
-                var latency = result.LatencyMs is null ? string.Empty : $" ({result.LatencyMs} ms)";
+                var level = result.IsHealthy ? "ok" : "error";
+                var latency = result.LatencyMs is null ? string.Empty : $" (пинг: {result.LatencyMs} ms)";
                 var stages = result.Stages is null ? string.Empty :
-                    $" DNS=[{result.Stages.Dns}]; TCP=[{result.Stages.Tcp}]; TLS=[{result.Stages.Tls}]; HTTP=[{result.Stages.Http}]" +
-                    (result.Stages.Voice is null ? string.Empty : $"; Voice=[{result.Stages.Voice}]") +
-                    (result.Stages.Gateway is null ? string.Empty : $"; Gateway=[{result.Stages.Gateway}]") +
-                    (result.Stages.Cdn is null ? string.Empty : $"; CDN=[{result.Stages.Cdn}]");
-                await LogToUiAsync(level, $"Проверка {ServiceDisplayName(result.Id)}: {result.Detail}{latency}.{stages}");
+                    $" [DNS: {result.Stages.Dns}] [TCP: {result.Stages.Tcp}] [TLS: {result.Stages.Tls}] [HTTP: {result.Stages.Http}]" +
+                    (result.Stages.Voice is null ? string.Empty : $" [Voice/Media: {result.Stages.Voice}]") +
+                    (result.Stages.Gateway is null ? string.Empty : $" [Gateway: {result.Stages.Gateway}]") +
+                    (result.Stages.Cdn is null ? string.Empty : $" [CDN: {result.Stages.Cdn}]");
+                
+                var diagHeader = result.IsHealthy ? "[DIAG/OK]" : "[DIAG/WARN]";
+                await LogToUiAsync(level, $"{diagHeader} {ServiceDisplayName(result.Id)}: {result.Detail}{latency}.{stages}");
+
+                if (result.LatencyMs.HasValue && result.LatencyMs.Value > 120)
+                {
+                    await LogToUiAsync("info", $"[DIAG/SPIKE] {ServiceDisplayName(result.Id)}: повышенная задержка ({result.LatencyMs.Value} ms). Проверьте DNS-резолвер в настройках или сетевой маршрут провайдера.");
+                }
             }
         }
         await PublishHealthSnapshotAsync(winwsRunning);
@@ -1371,7 +1448,7 @@ public partial class MainWindow : Window
 
     private async Task PublishHealthSnapshotAsync(bool winwsRunning)
     {
-        foreach (var id in new[] { "youtube", "discord", "telegram", "phasmophobia" })
+        foreach (var id in new[] { "youtube", "discord", "telegram", "phasmophobia", "roblox" })
         {
             if (!IsServiceSelected(id))
                 _healthStatuses[id] = new ServiceHealthResult(id, ServiceHealthState.NotSelected, "Не выбран");
@@ -1400,8 +1477,9 @@ public partial class MainWindow : Window
         {
             "youtube" => profiles.YouTube || profiles.Web,
             "discord" => profiles.Discord || profiles.Web,
-            "telegram" => profiles.Telegram || profiles.Web,
+            "telegram" => profiles.Telegram,
             "phasmophobia" => profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("phasmophobia", StringComparison.OrdinalIgnoreCase)),
+            "roblox" => profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("roblox", StringComparison.OrdinalIgnoreCase)),
             _ => false
         };
     }

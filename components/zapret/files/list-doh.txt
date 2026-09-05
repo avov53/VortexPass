@@ -1,0 +1,8 @@
+dns.google
+cloudflare-dns.com
+one.one.one.one
+1dot1dot1dot1.cloudflare-dns.com
+chrome.cloudflare-dns.com
+mozilla.cloudflare-dns.com
+doh.opendns.com
+dns.quad9.net

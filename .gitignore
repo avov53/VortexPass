@@ -10,12 +10,16 @@ artifacts/
 # Temporary component downloads and packaging output
 components-temp/
 dist/
+dist.next/
+dist.build.*/
 dist.zip
+release/
 
 # Local logs and editor/user files
 *.log
 *.user
 *.suo
+*не_для_гитхаб*
 .vs/
 .idea/
 .vscode/

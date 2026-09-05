@@ -50,7 +50,14 @@ type Tab = "dashboard" | "profiles" | "youtube" | "telegram" | "gamefilter" | "s
 type NativeWebView = { postMessage: (message: unknown) => void };
 type NativeWindow = Window & {
   chrome?: { webview?: NativeWebView };
-  __vortexSettings?: { autostart?: boolean; tray?: boolean };
+  __vortexSettings?: {
+    autostart?: boolean;
+    tray?: boolean;
+    selectedDnsProvider?: "auto" | "google" | "cloudflare";
+    startProtectionOnStartup?: boolean;
+    startupStrategy?: "auto" | "light" | "moderate" | "medium" | "complex" | "aggressive";
+    gameFilterIpsetMode?: "any" | "loaded" | "none";
+  };
   __vortexRuntime?: Record<string, any>;
 };
 
@@ -62,8 +69,11 @@ function postNativePayload(payload: Record<string, unknown>) {
   (window as NativeWindow).chrome?.webview?.postMessage(payload);
 }
 
-function nativeSetting(name: "autostart" | "tray", fallback: boolean) {
-  return (window as NativeWindow).__vortexSettings?.[name] ?? fallback;
+function nativeSetting<K extends keyof NonNullable<NativeWindow["__vortexSettings"]>>(
+  name: K,
+  fallback: NonNullable<NativeWindow["__vortexSettings"]>[K]
+) {
+  return ((window as NativeWindow).__vortexSettings?.[name] ?? fallback) as NonNullable<NativeWindow["__vortexSettings"]>[K];
 }
 
 function useNativeMessage(handler: (message: any) => void) {
@@ -104,9 +114,16 @@ interface UpdateInfo {
 interface HealthItem { state: string; detail: string; latencyMs: number | null; stages?: Record<string, string | null> }
 type HealthMap = Record<string, HealthItem>;
 interface HostsInfo { applied: boolean; entryCount: number; updatedAt?: string; detail: string; sourceCommit?: string }
-interface GameFilterInfo { selectedGames: string[]; protocol: "udp" | "tcp" | "all" }
+interface GameFilterInfo { selectedGames: string[]; protocol: "udp" | "tcp" | "all"; ipsetMode?: "any" | "loaded" | "none" }
 interface DomainListsInfo { bypass: string[]; exclusions: string[] }
-interface SettingsInfo { autostart: boolean; tray: boolean }
+interface SettingsInfo {
+  autostart: boolean;
+  tray: boolean;
+  selectedDnsProvider?: "auto" | "google" | "cloudflare";
+  startProtectionOnStartup?: boolean;
+  startupStrategy?: "auto" | "light" | "moderate" | "medium" | "complex" | "aggressive";
+  gameFilterIpsetMode?: "any" | "loaded" | "none";
+}
 interface FavoriteProfile { level: string; tuning: number }
 interface AdvisorCandidate { level: string; tuning: number; label: string; healthy: number; total: number; latencyMs: number | null; summary: string; score?: number; source?: string }
 interface AdvisorInfo {
@@ -286,7 +303,7 @@ function GlassCard({
 }) {
   return (
     <div
-      className={`rounded-2xl transition-all duration-200 ${className}`}
+      className={`relative rounded-2xl transition-all duration-200 ${className}`}
       style={{
         background: "rgba(255,255,255,0.038)",
         backdropFilter: "blur(24px)",
@@ -392,7 +409,7 @@ function Select({
   const selected = options.find((o) => o.value === value)!;
 
   return (
-    <div ref={ref} className="relative">
+    <div ref={ref} className={`relative ${open ? "z-50" : "z-10"}`}>
       <button
         onClick={() => setOpen(!open)}
         className="w-full flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-xl text-sm transition-all duration-150"
@@ -1449,7 +1466,7 @@ function GameFilterTab({
 }) {
   const [open, setOpen] = useState(false);
   const games = [
-    { id: "phasmophobia", name: "Phasmophobia", subtitle: "Photon · стабильный прямой UDP", color: "#F7B955" },
+    { id: "phasmophobia", name: "Phasmophobia", subtitle: "Photon and Vivox · лобби, войс-чат (1024-65535)", color: "#F7B955" },
     { id: "roblox", name: "Roblox", subtitle: "Изображения, аватары и CDN", color: "#6AA8FF" },
   ] as const;
   const selectedGames = games.filter((game) => info.selectedGames.includes(game.id));
@@ -1477,7 +1494,7 @@ function GameFilterTab({
             <Dot on={active} pulse={active} />
           </div>
           <div className="text-[11px] font-mono text-[#3A3A5E] mt-1">
-            {active ? `Активен · ${info.protocol === "all" ? "UDP + TCP" : info.protocol.toUpperCase()} · Phasmophobia UDP direct` : "Применяется только после главной кнопки запуска"}
+            {active ? `Активен · ${info.protocol === "all" ? "UDP + TCP" : info.protocol.toUpperCase()} · Phasmophobia (Photon and Vivox)` : "Применяется только после главной кнопки запуска"}
           </div>
         </div>
         <Toggle checked={selected} onChange={onToggle} disabled={pending} />
@@ -1536,7 +1553,7 @@ function GameFilterTab({
             </button>
           ))}
         </div>
-        <p className="text-[10px] font-mono text-[#4A4A6A] mt-4">Изменения сохранены и будут применены при следующем запуске защиты. Для Phasmophobia игровой UDP остаётся прямым, VortexPass обрабатывает только домены сервисов.</p>
+        <p className="text-[10px] font-mono text-[#4A4A6A] mt-4">Изменения сохранены и будут применены при следующем запуске защиты. VortexPass перехватывает порты 1024-65535 для серверов матчей и войс-чата Vivox с обходом блокировок.</p>
       </GlassCard>
     </div>
   );
@@ -1673,7 +1690,7 @@ function DomainListEditor({ title, description, values, emptyText, onSave }: {
       <div className="mt-3 text-[10px] font-mono text-[#4A4A6A]">{values.length ? `${values.length} доменов сохранено` : emptyText}</div>
       <AnimatePresence>
         {editing && (
-          <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }} className="overflow-hidden">
+          <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} exit={{ opacity: 0, height: 0 }} className="overflow-visible">
             <textarea value={draft} onChange={(event) => setDraft(event.target.value)} spellCheck={false}
               placeholder="example.com\ncdn.example.com"
               className="domain-list-textarea w-full h-44 mt-4 px-3 py-3 rounded-xl resize-y text-[11px] font-mono text-[#B8B8D0] outline-none focus:ring-2 focus:ring-[#6C5CE7]/40"
@@ -1771,7 +1788,201 @@ function UpdatePromptModal({ update }: { update: UpdateInfo }) {
   );
 }
 
-function SettingsTab({ update, domains, settings, onSettingsChange, onSaveDomains }: { update: UpdateInfo; domains: DomainListsInfo; settings: SettingsInfo; onSettingsChange: (name: keyof SettingsInfo, value: boolean) => void; onSaveDomains: (value: DomainListsInfo) => void }) {
+function SmoothSelect<T extends string>({
+  value,
+  onChange,
+  options,
+  placeholder = "Выберите...",
+}: {
+  value: T;
+  onChange: (val: T) => void;
+  options: { id: T; label: string; description?: string; icon?: React.ReactNode }[];
+  placeholder?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const selected = options.find((o) => o.id === value);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (ref.current && !ref.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    if (open) {
+      document.addEventListener("mousedown", handleClickOutside);
+      return () => document.removeEventListener("mousedown", handleClickOutside);
+    }
+  }, [open]);
+
+  return (
+    <div className={`relative min-w-[230px] ${open ? "z-50" : "z-10"}`} ref={ref}>
+      <motion.button
+        type="button"
+        onClick={() => setOpen((prev) => !prev)}
+        whileTap={{ scale: 0.98 }}
+        className="w-full flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-xl text-left transition-all duration-200 cursor-pointer"
+        style={{
+          background: open ? "rgba(108,92,231,0.16)" : "rgba(255,255,255,0.05)",
+          border: `1px solid ${open ? "rgba(108,92,231,0.4)" : "rgba(255,255,255,0.08)"}`,
+          boxShadow: open ? "0 0 16px rgba(108,92,231,0.15)" : "none",
+        }}
+      >
+        <div className="flex items-center gap-2.5 min-w-0 flex-1">
+          {selected?.icon && <div className="text-[#B5AEFC] flex-shrink-0">{selected.icon}</div>}
+          <div className="truncate">
+            <div className="text-[12px] font-semibold text-white truncate">
+              {selected?.label ?? placeholder}
+            </div>
+            {selected?.description && (
+              <div className="text-[10px] text-[#4A4A6A] truncate mt-0.5">
+                {selected.description}
+              </div>
+            )}
+          </div>
+        </div>
+        <motion.span animate={{ rotate: open ? 180 : 0 }} transition={{ duration: 0.2 }}>
+          <ChevronDown size={14} className="text-[#6A6A8A] flex-shrink-0" />
+        </motion.span>
+      </motion.button>
+
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            initial={{ opacity: 0, y: -6, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -6, scale: 0.98 }}
+            transition={{ duration: 0.15, ease: "easeOut" }}
+            className="absolute z-[100] left-0 right-0 mt-1.5 p-1.5 rounded-xl overflow-hidden shadow-2xl"
+            style={{
+              background: "rgba(18,18,28,0.98)",
+              backdropFilter: "blur(20px)",
+              WebkitBackdropFilter: "blur(20px)",
+              border: "1px solid rgba(255,255,255,0.12)",
+              boxShadow: "0 20px 50px rgba(0,0,0,0.6), 0 0 30px rgba(108,92,231,0.15)",
+            }}
+          >
+            <div className="flex flex-col gap-1 max-h-60 overflow-y-auto">
+              {options.map((opt) => {
+                const isSelected = opt.id === value;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => {
+                      onChange(opt.id);
+                      setOpen(false);
+                    }}
+                    className="w-full flex items-center justify-between gap-2.5 px-3 py-2 rounded-lg text-left transition-colors hover:bg-white/5 cursor-pointer"
+                    style={{
+                      background: isSelected ? "rgba(108,92,231,0.14)" : "transparent",
+                    }}
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                      {opt.icon && (
+                        <div className={isSelected ? "text-[#B5AEFC]" : "text-[#5A5A7A]"}>
+                          {opt.icon}
+                        </div>
+                      )}
+                      <div className="truncate">
+                        <div
+                          className="text-[12px] font-semibold truncate"
+                          style={{ color: isSelected ? "#C7C2FF" : "#E2E2F0" }}
+                        >
+                          {opt.label}
+                        </div>
+                        {opt.description && (
+                          <div className="text-[10px] text-[#4A4A6A] truncate">
+                            {opt.description}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    {isSelected && <Check size={13} className="text-[#B5AEFC] flex-shrink-0" strokeWidth={3} />}
+                  </button>
+                );
+              })}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+const dnsOptions = [
+  {
+    id: "auto" as const,
+    label: "Автоматически",
+    description: "Подбор самого быстрого DNS с минимальным пингом",
+    icon: <Sparkles size={14} />,
+  },
+  {
+    id: "google" as const,
+    label: "Google Public DNS",
+    description: "dns.google · 8.8.8.8 (защита от ТСПУ)",
+    icon: <Globe size={14} />,
+  },
+  {
+    id: "cloudflare" as const,
+    label: "Cloudflare DNS",
+    description: "cloudflare-dns.com · 1.1.1.1 (защита от ТСПУ)",
+    icon: <Zap size={14} />,
+  },
+];
+
+const strategyOptions = [
+  {
+    id: "auto" as const,
+    label: "Автоматически",
+    description: "Умный подбор стратегии с минимальной задержкой при входе",
+    icon: <Sparkles size={14} />,
+  },
+  {
+    id: "light" as const,
+    label: "Легкая (Light)",
+    description: "Минимальное вмешательство, autottl=2",
+    icon: <Zap size={14} />,
+  },
+  {
+    id: "moderate" as const,
+    label: "Умеренная (Moderate)",
+    description: "Базовый fakedsplit, repeats=4",
+    icon: <Zap size={14} />,
+  },
+  {
+    id: "medium" as const,
+    label: "Средняя (Medium)",
+    description: "Стабильный multisplit, seqovl=681, repeats=6",
+    icon: <Zap size={14} />,
+  },
+  {
+    id: "complex" as const,
+    label: "Сложная (Complex)",
+    description: "Усиленный fakedsplit, repeats=8",
+    icon: <Zap size={14} />,
+  },
+  {
+    id: "aggressive" as const,
+    label: "Агрессивная (Aggressive)",
+    description: "Максимальный desync со stun-фейками, repeats=12",
+    icon: <Zap size={14} />,
+  },
+];
+
+function SettingsTab({
+  update,
+  domains,
+  settings,
+  onSettingsChange,
+  onSaveDomains,
+}: {
+  update: UpdateInfo;
+  domains: DomainListsInfo;
+  settings: SettingsInfo;
+  onSettingsChange: (name: keyof SettingsInfo, value: any) => void;
+  onSaveDomains: (value: DomainListsInfo) => void;
+}) {
   const handleUpdate = () => postNativeMessage(update.state === "available" || update.state === "availablePrompt" ? "update.installNow" : "update.check");
 
   const updateMeta = {
@@ -1799,12 +2010,12 @@ function SettingsTab({ update, domains, settings, onSettingsChange, onSaveDomain
           Настройки
         </h2>
         <p className="text-sm text-[#3A3A5E] mt-1">
-          Поведение приложения и обновление VortexPass
+          Поведение приложения, DNS-сервер и обновление VortexPass
         </p>
       </div>
 
       {/* Behaviour */}
-      <GlassCard className="p-5">
+      <GlassCard className="relative z-30 p-5">
         <SectionLabel>Запуск и поведение</SectionLabel>
 
         <div className="flex items-center justify-between">
@@ -1816,11 +2027,56 @@ function SettingsTab({ update, domains, settings, onSettingsChange, onSaveDomain
               Запускать вместе с Windows
             </div>
             <div className="text-[11px] text-[#3A3A5E] mt-0.5">
-              Добавляет VortexPass в автозагрузку через реестр HKCU\Run
+              Запуск с правами администратора при входе в систему (Task Scheduler)
             </div>
           </div>
           <Toggle checked={settings.autostart} onChange={(value) => onSettingsChange("autostart", value)} />
         </div>
+
+        <AnimatePresence>
+          {settings.autostart && (
+            <motion.div
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: "auto" }}
+              exit={{ opacity: 0, height: 0 }}
+              transition={{ duration: 0.25, ease: "easeInOut" }}
+              className="overflow-hidden"
+            >
+              <div className="pt-4 flex flex-col gap-4 border-t border-white/[0.06] mt-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-sm font-medium text-white" style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}>
+                      Автоматически запускать защиту при старте
+                    </div>
+                    <div className="text-[11px] text-[#3A3A5E] mt-0.5">
+                      Сразу активировать сетевое ускорение при входе в Windows
+                    </div>
+                  </div>
+                  <Toggle
+                    checked={settings.startProtectionOnStartup ?? false}
+                    onChange={(value) => onSettingsChange("startProtectionOnStartup", value)}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <div className="text-sm font-medium text-white" style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}>
+                      Какую стратегию запускать
+                    </div>
+                    <div className="text-[11px] text-[#3A3A5E] mt-0.5">
+                      Автоподбор с минимальной задержкой или фиксированный уровень
+                    </div>
+                  </div>
+                  <SmoothSelect
+                    value={settings.startupStrategy ?? "auto"}
+                    onChange={(val) => onSettingsChange("startupStrategy", val)}
+                    options={strategyOptions}
+                  />
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         <Divider />
 
@@ -1840,8 +2096,32 @@ function SettingsTab({ update, domains, settings, onSettingsChange, onSaveDomain
         </div>
       </GlassCard>
 
+      {/* DNS Configuration */}
+      <GlassCard className="relative z-20 p-5">
+        <SectionLabel>Сетевые настройки и DNS</SectionLabel>
+
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <div
+              className="text-sm font-medium text-white"
+              style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}
+            >
+              Использовать DNS-сервер
+            </div>
+            <div className="text-[11px] text-[#3A3A5E] mt-0.5">
+              Защищенный DNS over HTTPS (DoH) с десинком TCP 443 против блокировок ТСПУ
+            </div>
+          </div>
+          <SmoothSelect
+            value={settings.selectedDnsProvider ?? "auto"}
+            onChange={(val) => onSettingsChange("selectedDnsProvider", val)}
+            options={dnsOptions}
+          />
+        </div>
+      </GlassCard>
+
       {/* Application updates */}
-      <GlassCard className="p-5">
+      <GlassCard className="relative z-10 p-5">
         <SectionLabel>Обновление приложения</SectionLabel>
 
         <div className="flex items-start gap-3 mb-5">
@@ -1931,7 +2211,7 @@ function SettingsTab({ update, domains, settings, onSettingsChange, onSaveDomain
       </GlassCard>
 
       {/* App info */}
-      <GlassCard className="p-5">
+      <GlassCard className="relative z-0 p-5">
         <SectionLabel>О приложении</SectionLabel>
         <div className="grid grid-cols-2 gap-3">
           {[
@@ -2030,7 +2310,14 @@ export default function App() {
   const [logs, setLogs] = useState<LogEntry[]>(SEED_LOGS);
   const [metrics, setMetrics] = useState<Metrics>({ uptimeSeconds: 0, trafficBytes: 0, packets: 0, youtubePing: null, discordPing: null, telegramPing: null });
   const [update, setUpdate] = useState<UpdateInfo>({ state: "idle", currentVersion: (window as NativeWindow).__vortexRuntime?.app?.version });
-  const [settings, setSettings] = useState<SettingsInfo>({ autostart: nativeSetting("autostart", false), tray: nativeSetting("tray", true) });
+  const [settings, setSettings] = useState<SettingsInfo>({
+    autostart: nativeSetting("autostart", false),
+    tray: nativeSetting("tray", true),
+    selectedDnsProvider: nativeSetting("selectedDnsProvider", "auto"),
+    startProtectionOnStartup: nativeSetting("startProtectionOnStartup", false),
+    startupStrategy: nativeSetting("startupStrategy", "auto"),
+    gameFilterIpsetMode: nativeSetting("gameFilterIpsetMode", "any"),
+  });
   const [advisor, setAdvisor] = useState<AdvisorInfo>({ state: "idle" });
 
   useNativeMessage((message) => {
@@ -2046,7 +2333,17 @@ export default function App() {
     }
     if (message.type === "health.status") setHealth((message.services ?? {}) as HealthMap);
     if (message.type === "hosts.status") setHosts(message as HostsInfo);
-    if (message.type === "settings.status") setSettings({ autostart: Boolean(message.autostart), tray: Boolean(message.tray) });
+    if (message.type === "settings.status") {
+      setSettings((current) => ({
+        ...current,
+        autostart: Boolean(message.autostart),
+        tray: Boolean(message.tray),
+        selectedDnsProvider: message.selectedDnsProvider ?? current.selectedDnsProvider ?? "auto",
+        startProtectionOnStartup: Boolean(message.startProtectionOnStartup ?? current.startProtectionOnStartup),
+        startupStrategy: message.startupStrategy ?? current.startupStrategy ?? "auto",
+        gameFilterIpsetMode: message.gameFilterIpsetMode ?? current.gameFilterIpsetMode ?? "any",
+      }));
+    }
     if (message.type === "advisor.status") setAdvisor(message as AdvisorInfo);
     if (message.type === "configuration.status") {
       if (message.gameFilter) setGameFilter(message.gameFilter as GameFilterInfo);
@@ -2192,7 +2489,11 @@ export default function App() {
     settings: <SettingsTab update={update} domains={domains} settings={settings}
       onSettingsChange={(name, value) => {
         setSettings((current) => ({ ...current, [name]: value }));
-        postNativeMessage(name === "autostart" ? "settings.autostart" : "settings.tray", value);
+        if (name === "autostart") postNativeMessage("settings.autostart", value as boolean);
+        else if (name === "tray") postNativeMessage("settings.tray", value as boolean);
+        else if (name === "startProtectionOnStartup") postNativeMessage("settings.startProtectionOnStartup", value as boolean);
+        else if (name === "startupStrategy") postNativePayload({ type: "settings.startupStrategy", strategy: value });
+        else if (name === "selectedDnsProvider") postNativePayload({ type: "settings.dnsProvider", provider: value });
       }}
       onSaveDomains={(value) => { setDomains(value); postNativePayload({ type: "domains.set", bypass: value.bypass, exclusions: value.exclusions }); }} />,
   };

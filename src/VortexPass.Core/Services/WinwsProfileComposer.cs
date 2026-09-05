@@ -42,12 +42,28 @@ public static class WinwsProfileComposer
             udpPorts.Add("50000-50100");
         }
 
+        var gameProtocol = NormalizeGameProtocol(gameFilter.Protocol);
+        var includeGameFilter = profiles.GameFilter && (gameFilter.HasSelectedGames || includePhasmophobia || includeRoblox);
+        if (includeGameFilter)
+        {
+            if (gameProtocol is "all" or "tcp")
+                tcpPortRanges.Add("1024-65535");
+            if (gameProtocol is "all" or "udp")
+                udpPorts.Add("1024-65535");
+        }
+
         var capture = new List<string>
         {
             $"--wf-tcp={string.Join(',', tcpPorts.Select(x => x.ToString()).Concat(tcpPortRanges))}",
             $"--wf-udp={string.Join(',', udpPorts)}"
         };
         var rules = new List<string>();
+
+        // DNS over HTTPS (DoH) protection against TSPU resets
+        rules.Add($"--filter-tcp=443 --hostlist=files\\list-doh.txt " +
+                  TcpStrategy(level, tuning, "681", "files\\tls_clienthello_www_google_com.bin") + ExclusionOption(exclusionListPath) + " --new");
+        rules.Add($"--filter-tcp=443 --ipset=files\\list-doh-ipset.txt " +
+                  TcpStrategy(level, tuning, "681", "files\\tls_clienthello_www_google_com.bin") + ExclusionOption(exclusionListPath) + " --new");
 
         if (includeYouTubeWeb)
             AddDomainRules(rules, "files\\list-youtube.txt", level, tuning, includeHttp: true, exclusionListPath);
@@ -56,7 +72,12 @@ public static class WinwsProfileComposer
             AddDomainRules(rules, "files\\list-discord.txt", level, tuning, includeHttp: true, exclusionListPath);
 
         if (includeTelegramWeb || includeTelegramDesktop)
+        {
             AddDomainRules(rules, "files\\list-telegram.txt", level, tuning, includeHttp: false, exclusionListPath);
+            var ipsetOption = $"--ipset={QuotePath("files\\list-telegram-ipset.txt")}";
+            rules.Add($"--filter-tcp=443,5222 {ipsetOption} " +
+                      TcpStrategy(level, tuning, "681", "files\\tls_clienthello_www_google_com.bin") + ExclusionOption(exclusionListPath) + " --new");
+        }
 
         if (includeRoblox)
             AddDomainRules(rules, "files\\list-roblox.txt", level, tuning, includeHttp: true, exclusionListPath);
@@ -72,9 +93,27 @@ public static class WinwsProfileComposer
             rules.Add($"--filter-udp=19294-19344,50000-50100 --filter-l7=discord,stun " +
                       "--dpi-desync=fake --dpi-desync-fake-discord=files\\ACTIVE_DISCORD_UDP.bin " +
                       "--dpi-desync-fake-stun=files\\ACTIVE_DISCORD_UDP.bin " +
-                      $"--dpi-desync-repeats={Repeats(level, tuning)} --new");
+                      $"--dpi-desync-repeats={Repeats(level, tuning)} --dpi-desync-cutoff=d2 --new");
             rules.Add("--filter-tcp=2053,2083,2087,2096,8443 --hostlist-domains=discord.media " +
                       TcpStrategy(level, tuning, "681", "files\\tls_clienthello_www_google_com.bin") + ExclusionOption(exclusionListPath) + " --new");
+        }
+
+        if (includeGameFilter)
+        {
+            if (gameProtocol is "all" or "udp")
+            {
+                var gameUdpRepeats = Math.Clamp(2 + NormalizeTuning(tuning), 2, 5);
+                rules.Add($"--filter-udp=1024-65535 --dpi-desync=fake --dpi-desync-repeats={gameUdpRepeats} " +
+                          "--dpi-desync-any-protocol=1 --dpi-desync-fake-unknown-udp=files\\ACTIVE_GAME_UDP.bin " +
+                          "--dpi-desync-cutoff=d2 --new");
+            }
+
+            if (gameProtocol is "all" or "tcp")
+            {
+                rules.Add($"--filter-tcp=1024-65535 --dpi-desync=multisplit --dpi-desync-any-protocol=1 " +
+                          "--dpi-desync-cutoff=n3 --dpi-desync-split-seqovl=568 --dpi-desync-split-pos=1 " +
+                          "--dpi-desync-split-seqovl-pattern=files\\tls_clienthello_4pda_to.bin --new");
+            }
         }
 
         return $"{string.Join(' ', capture)} {string.Join(' ', rules)}";
@@ -93,7 +132,7 @@ public static class WinwsProfileComposer
         rules.Add($"--filter-tcp=443 {hostlistOption} " +
                   TcpStrategy(level, tuning, "681", "files\\tls_clienthello_www_google_com.bin") + exclusionOption + " --new");
         rules.Add($"--filter-udp=443 {hostlistOption} --filter-l7=quic --dpi-desync=fake " +
-                  $"--dpi-desync-repeats={Repeats(level, tuning)} --dpi-desync-fake-quic=files\\quic_initial_www_google_com.bin{exclusionOption} --new");
+                  $"--dpi-desync-repeats={Repeats(level, tuning)} --dpi-desync-fake-quic=files\\quic_initial_www_google_com.bin --dpi-desync-cutoff=d2{exclusionOption} --new");
     }
 
     private static string QuotePath(string value) => value.Contains(' ') ? $"\"{value}\"" : value;

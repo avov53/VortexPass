@@ -38,7 +38,7 @@ public sealed class DnsOverrideService
     [
         new("Cloudflare DNS", "https://1.1.1.1/dns-query"),
         new("Google DNS", "https://dns.google/resolve"),
-        new("OpenDNS", "https://doh.opendns.com/dns-query")
+        new("Quad9 DNS", "https://dns.quad9.net/dns-query")
     ];
     private static readonly ConcurrentDictionary<string, CachedResolution> Cache = new(StringComparer.OrdinalIgnoreCase);
 
@@ -47,25 +47,36 @@ public sealed class DnsOverrideService
         bool verifyTls = true,
         string? httpProbeUrl = null,
         TimeSpan? timeout = null,
+        string? preferredProvider = null,
         CancellationToken cancellationToken = default)
     {
         var normalizedHost = host.Trim().TrimEnd('.').ToLowerInvariant();
         var timeoutValue = timeout ?? TimeSpan.FromSeconds(5);
         var errors = new List<string>();
 
-        var cacheKey = $"{normalizedHost}|{httpProbeUrl ?? string.Empty}|{verifyTls}";
+        var cacheKey = $"{normalizedHost}|{httpProbeUrl ?? string.Empty}|{verifyTls}|{preferredProvider ?? "auto"}";
         if (Cache.TryGetValue(cacheKey, out var cached) && cached.ExpiresAt > DateTimeOffset.UtcNow)
             return cached.Result;
 
-        var system = await TrySystemDnsAsync(normalizedHost, verifyTls, httpProbeUrl, timeoutValue, cancellationToken);
-        if (system.Succeeded)
+        var activeProviders = (preferredProvider?.ToLowerInvariant()) switch
         {
-            Cache[cacheKey] = new(system, DateTimeOffset.UtcNow.AddMinutes(10));
-            return system;
-        }
-        errors.Add(system.Detail);
+            "google" => Providers.Where(p => p.Name.Contains("Google", StringComparison.OrdinalIgnoreCase)).ToArray(),
+            "cloudflare" => Providers.Where(p => p.Name.Contains("Cloudflare", StringComparison.OrdinalIgnoreCase)).ToArray(),
+            _ => Providers
+        };
 
-        var providerTasks = Providers
+        if (string.IsNullOrWhiteSpace(preferredProvider) || preferredProvider.Equals("auto", StringComparison.OrdinalIgnoreCase))
+        {
+            var system = await TrySystemDnsAsync(normalizedHost, verifyTls, httpProbeUrl, timeoutValue, cancellationToken);
+            if (system.Succeeded)
+            {
+                Cache[cacheKey] = new(system, DateTimeOffset.UtcNow.AddMinutes(10));
+                return system;
+            }
+            errors.Add(system.Detail);
+        }
+
+        var providerTasks = activeProviders
             .Select(provider => TryProviderAsync(provider, normalizedHost, verifyTls, httpProbeUrl, timeoutValue, cancellationToken))
             .ToArray();
         var providerResults = await Task.WhenAll(providerTasks);
@@ -132,6 +143,16 @@ public sealed class DnsOverrideService
                 .Where(answer => answer.Type == 1 && IPAddress.TryParse(answer.Data, out _))
                 .Select(answer => IPAddress.Parse(answer.Data))
                 .ToArray();
+
+            if (addresses.Length == 0)
+            {
+                var cname = payload.Answer.FirstOrDefault(answer => answer.Type == 5)?.Data?.Trim().TrimEnd('.');
+                if (!string.IsNullOrWhiteSpace(cname) && !cname.Equals(host, StringComparison.OrdinalIgnoreCase))
+                {
+                    return await TryProviderAsync(provider, cname, verifyTls, httpProbeUrl, timeout, cancellationToken);
+                }
+            }
+
             return await ValidateAddressesAsync(host, addresses, provider.Name, verifyTls, httpProbeUrl, timeout, linked.Token);
         }
         catch (Exception ex) when (ex is HttpRequestException or SocketException or AuthenticationException or JsonException or OperationCanceledException)
@@ -189,7 +210,7 @@ public sealed class DnsOverrideService
     {
         using var handler = new SocketsHttpHandler
         {
-            AllowAutoRedirect = true,
+            AllowAutoRedirect = false,
             ConnectTimeout = timeout,
             ConnectCallback = async (context, token) =>
             {
