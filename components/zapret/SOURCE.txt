@@ -6,6 +6,7 @@ Repository: https://github.com/Flowseal/zapret-discord-youtube
 License: MIT (see FLOWSEAL-LICENSE.txt)
 
 VortexPass invokes winws.exe directly. No batch or command scripts are included or executed.
+The VortexPass-maintained files/list-warp.txt is a narrow allowlist used only while the official Cloudflare WARP client is connecting or connected.
 
 Telegram Desktop fallback component
 

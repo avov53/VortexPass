@@ -41,11 +41,63 @@ import {
   Star,
   Play,
   SlidersHorizontal,
+  Cloud,
 } from "lucide-react";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type Tab = "dashboard" | "profiles" | "youtube" | "telegram" | "gamefilter" | "settings";
+type Tab = "dashboard" | "profiles" | "youtube" | "telegram" | "warp" | "gamefilter" | "settings";
+
+type WarpProbeState = "available" | "restricted" | "partial" | "serviceError" | "unavailable" | "timedOut" | "routeUnconfirmed" | "availabilityUnknown" | "regionRestricted";
+type WarpEndpointDiagnostic = { label: string; state: WarpProbeState; detail: string; httpStatus?: number; latencyMs?: number };
+type WarpScenarioDiagnostic = { state: WarpProbeState; summary: string; endpoints: Record<string, WarpEndpointDiagnostic> };
+type WarpPerformanceEndpoint = { label: string; available: boolean; medianLatencyMs?: number; jitterMs?: number; detail: string };
+type WarpPerformance = { warpConnected: boolean; checkedAt: string; summary: string; verdict?: string; recommendation?: string; endpoints: Record<string, WarpPerformanceEndpoint> };
+type WarpRouteProfile = { id: string; name: string; kind: "site" | "game"; builtInId?: string; enabled: boolean; connection: "auto" | "direct" | "warpProxy" | "warpSystem"; domains: string[]; ipRanges: string[]; executablePath?: string };
+
+type WarpInfo = {
+  state: "notInstalled" | "disconnected" | "connecting" | "connected" | "error";
+  installed: boolean;
+  connected: boolean;
+  pending: boolean;
+  detail: string;
+  error?: string;
+  version?: string;
+  cliPath?: string;
+  checkedAt?: string;
+  progress?: number;
+  stage?: string;
+  registered?: boolean;
+  serviceRunning?: boolean;
+  protocol?: string;
+  routingMode?: "smart" | "full" | "proxy" | "dnsOnly";
+  effectiveRoutingMode?: string;
+  protocolPreference?: "auto" | "masque" | "wireguard";
+  masquePreference?: "h3-with-h2-fallback" | "h3-only" | "h2-only";
+  dnsMode?: "auto" | "udp" | "doh" | "dot" | "system";
+  proxyPort?: number;
+  profiles?: WarpRouteProfile[];
+  optimization?: { selectedProtocol: string; reason: string; checkedAt: string; routeDecisions?: Record<string, string> };
+  routingConflicts?: string[];
+  routingWarnings?: string[];
+  bootstrapActive?: boolean;
+  telegramCompatibilityActive?: boolean;
+  scenarios: { telegram: boolean; games: boolean };
+  performance?: WarpPerformance;
+  diagnostics?: {
+    routeActive: boolean;
+    dnsAvailable: boolean;
+    latencyMs?: number;
+    externalIp?: string;
+    coloCode?: string;
+    traceLocationCode?: string;
+    pop?: { code: string; city: string; country: string; status?: string; displayName: string };
+    detail: string;
+    checkedAt: string;
+    scenarios?: Record<string, string>;
+    scenarioDetails?: Record<string, WarpScenarioDiagnostic>;
+  };
+};
 
 type NativeWebView = { postMessage: (message: unknown) => void };
 type NativeWindow = Window & {
@@ -53,7 +105,7 @@ type NativeWindow = Window & {
   __vortexSettings?: {
     autostart?: boolean;
     tray?: boolean;
-    selectedDnsProvider?: "auto" | "google" | "cloudflare";
+    selectedDnsProvider?: "auto" | "google" | "cloudflare" | "quad9";
     startProtectionOnStartup?: boolean;
     startupStrategy?: "auto" | "light" | "moderate" | "medium" | "complex" | "aggressive";
     gameFilterIpsetMode?: "any" | "loaded" | "none";
@@ -119,7 +171,7 @@ interface DomainListsInfo { bypass: string[]; exclusions: string[] }
 interface SettingsInfo {
   autostart: boolean;
   tray: boolean;
-  selectedDnsProvider?: "auto" | "google" | "cloudflare";
+  selectedDnsProvider?: "auto" | "google" | "cloudflare" | "quad9";
   startProtectionOnStartup?: boolean;
   startupStrategy?: "auto" | "light" | "moderate" | "medium" | "complex" | "aggressive";
   gameFilterIpsetMode?: "any" | "loaded" | "none";
@@ -409,7 +461,7 @@ function Select({
   const selected = options.find((o) => o.value === value)!;
 
   return (
-    <div ref={ref} className={`relative ${open ? "z-50" : "z-10"}`}>
+    <div ref={ref} className={`relative ${open ? "z-[120]" : "z-10"}`}>
       <button
         onClick={() => setOpen(!open)}
         className="w-full flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-xl text-sm transition-all duration-150"
@@ -443,10 +495,9 @@ function Select({
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: -6, scale: 0.98 }}
             transition={{ duration: 0.15 }}
-            className="absolute z-50 w-full mt-1.5 rounded-xl overflow-hidden"
+            className="absolute z-[130] w-full mt-1.5 rounded-xl overflow-hidden"
             style={{
-              background: "rgba(18,18,28,0.96)",
-              backdropFilter: "blur(24px)",
+              background: "#12121C",
               border: "1px solid rgba(255,255,255,0.1)",
               boxShadow: "0 12px 40px rgba(0,0,0,0.5)",
             }}
@@ -1446,7 +1497,162 @@ function TelegramTab({
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// TAB 4 — GAME FILTER
+// TAB 4 — CLOUDFLARE WARP
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function WarpTab({ info, onToggle, onInstall, onRefresh, onPerformance, onOpen, onRestore, onRetry, onRegister, onCopyDiagnostics, onSettings, onOptimize, onProfileSave, onProfileToggle, onProfileDelete }: {
+  info: WarpInfo;
+  onToggle: (value: boolean) => void;
+  onInstall: () => void;
+  onRefresh: () => void;
+  onPerformance: () => void;
+  onOpen: () => void;
+  onRestore: () => void;
+  onRetry: () => void;
+  onRegister: () => void;
+  onCopyDiagnostics: () => void;
+  onSettings: (value: Record<string, unknown>) => void;
+  onOptimize: () => void;
+  onProfileSave: (profile: Partial<WarpRouteProfile>) => void;
+  onProfileToggle: (id: string, value: boolean) => void;
+  onProfileDelete: (id: string) => void;
+}) {
+  const [newProfile, setNewProfile] = useState({ name: "", kind: "site" as "site" | "game", connection: "auto", domains: "", ipRanges: "", executablePath: "" });
+  const connected = info.state === "connected";
+  const color = info.state === "error" ? "#FF4D6D" : connected ? "#00D68F" : info.pending ? "#FFB340" : "#62AFFF";
+  const stateLabel = info.state === "notInstalled" ? "Не установлен" : info.state === "disconnected" ? "Выключен" :
+    info.state === "connecting" ? "Подключение" : info.state === "connected" ? "Подключён" : "Ошибка";
+
+  return (
+    <div className="space-y-5 max-w-5xl mx-auto">
+      <GlassCard className="p-6" glow={connected}>
+        <div className="flex items-center justify-between gap-5">
+          <div className="flex items-center gap-4 min-w-0">
+            <div className="w-12 h-12 rounded-2xl flex items-center justify-center" style={{ background: `${color}18`, border: `1px solid ${color}40` }}>
+              <Cloud size={24} style={{ color }} />
+            </div>
+            <div className="min-w-0">
+              <div className="text-xl font-bold text-white" style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}>Cloudflare WARP</div>
+              <div className="text-[11px] font-mono mt-1" style={{ color }}>{stateLabel} · {info.detail}</div>
+            </div>
+          </div>
+          <Toggle checked={connected} onChange={onToggle} disabled={info.pending || !info.installed} />
+        </div>
+        {info.progress != null && info.pending && (
+          <div className="mt-4 h-1.5 rounded-full overflow-hidden bg-white/5"><div className="h-full bg-[#62AFFF] transition-all" style={{ width: `${Math.round(info.progress * 100)}%` }} /></div>
+        )}
+        <div className="grid grid-cols-4 gap-2 mt-4">
+          {[
+            ["Точка", info.diagnostics?.pop?.code ?? info.diagnostics?.coloCode ?? "—"],
+            ["Регион", info.diagnostics?.pop ? `${info.diagnostics.pop.city}, ${info.diagnostics.pop.country}` : info.diagnostics?.traceLocationCode ?? "—"],
+            ["Пинг", info.diagnostics?.latencyMs != null ? `${info.diagnostics.latencyMs} мс` : "—"],
+            ["Внешний IP", info.diagnostics?.externalIp ?? "—"],
+          ].map(([label, value]) => <div key={label} className="min-w-0 px-3 py-2 rounded-xl bg-black/20 border border-white/[.045]"><div className="text-[8px] font-mono text-[#454568]">{label}</div><div className="text-[10px] font-semibold text-[#B8B8D0] mt-0.5 truncate" title={value}>{value}</div></div>)}
+        </div>
+      </GlassCard>
+
+      {!info.installed && (
+        <GlassCard className="p-5">
+          <SectionLabel>Установка официального клиента</SectionLabel>
+          <p className="text-[11px] text-[#66668A] leading-relaxed mb-4">Установщик загружается с сервера Cloudflare и запускается только после проверки цифровой подписи Cloudflare, Inc. Для системного драйвера потребуется подтверждение Windows UAC.</p>
+          <button type="button" disabled={info.pending} onClick={onInstall} className="w-full py-3 rounded-xl text-sm font-semibold text-white disabled:opacity-50" style={{ background: "linear-gradient(135deg,#0078D4,#6C5CE7)" }}>
+            {info.pending ? "Подождите…" : "Скачать и установить Cloudflare WARP"}
+          </button>
+        </GlassCard>
+      )}
+
+      {info.installed && info.registered === false && (
+        <GlassCard className="p-5">
+          <SectionLabel>Первичная настройка</SectionLabel>
+          <p className="text-[11px] text-[#66668A] leading-relaxed mb-4">Для первого подключения нужна бесплатная регистрация Consumer WARP. VortexPass передаст согласие официальному warp-cli и не будет сохранять идентификаторы, ключи или лицензию.</p>
+          <button type="button" disabled={info.pending} onClick={onRegister} className="w-full py-3 rounded-xl text-sm font-semibold text-white disabled:opacity-50" style={{ background: "linear-gradient(135deg,#0078D4,#6C5CE7)" }}>
+            Принять условия Cloudflare и зарегистрировать
+          </button>
+        </GlassCard>
+      )}
+
+      <GlassCard className="relative z-40 p-5">
+        <div className="flex items-center justify-between gap-3"><SectionLabel>Режим и протокол</SectionLabel><button type="button" disabled={info.pending || !info.installed} onClick={onOptimize} className="px-3 py-2 rounded-xl text-[10px] font-semibold text-[#AFCFFF] bg-[#62AFFF12] border border-[#62AFFF2D]">Автоподбор</button></div>
+        <div className="grid grid-cols-2 gap-3">
+          <div><div className="text-[9px] font-mono text-[#555577] mb-1.5">Маршрутизация</div><Select value={info.routingMode ?? "smart"} onChange={(routingMode) => onSettings({ routingMode })} options={[{value:"smart",label:"Умный гибрид"},{value:"full",label:"Полный туннель"},{value:"proxy",label:"Локальный proxy"},{value:"dnsOnly",label:"Только DNS"}]} /></div>
+          <div><div className="text-[9px] font-mono text-[#555577] mb-1.5">Протокол</div><Select value={info.protocolPreference ?? "auto"} onChange={(protocol) => onSettings({ protocol })} options={[{value:"auto",label:"Авто"},{value:"masque",label:"MASQUE"},{value:"wireguard",label:"WireGuard"}]} /></div>
+          <div><div className="text-[9px] font-mono text-[#555577] mb-1.5">MASQUE</div><Select value={info.masquePreference ?? "h3-with-h2-fallback"} onChange={(masque) => onSettings({ masque })} options={[{value:"h3-with-h2-fallback",label:"HTTP/3 + fallback"},{value:"h3-only",label:"Только HTTP/3"},{value:"h2-only",label:"Только HTTP/2"}]} /></div>
+          <div><div className="text-[9px] font-mono text-[#555577] mb-1.5">DNS WARP</div><Select value={info.dnsMode ?? "auto"} onChange={(dnsMode) => onSettings({ dnsMode })} options={[{value:"auto",label:"Авто / UDP"},{value:"doh",label:"DNS over HTTPS"},{value:"dot",label:"DNS over TLS"},{value:"system",label:"Системный DNS"}]} /></div>
+        </div>
+        {info.optimization && <div className="mt-3 p-3 rounded-xl bg-black/20 text-[10px] font-mono text-[#75BFFF]">{info.optimization.reason}</div>}
+        <p className="text-[9px] text-[#454560] mt-3">В режиме Auto VortexPass сравнивает MASQUE и WireGuard для текущей сети и откатывает настройку при потере соединения.</p>
+      </GlassCard>
+
+      <GlassCard className="relative z-30 p-5">
+        <SectionLabel>Профили маршрутизации</SectionLabel>
+        <div className="space-y-2">{(info.profiles ?? []).map((profile) => <div key={profile.id} className="p-3 rounded-xl bg-black/20 border border-white/[.05]">
+          <div className="flex items-center gap-3"><Toggle checked={profile.enabled} onChange={(value) => onProfileToggle(profile.id, value)} size="sm"/><div className="min-w-0 flex-1"><div className="text-[11px] font-semibold text-white truncate">{profile.name}</div><div className="text-[8px] font-mono text-[#555577]">{profile.kind === "game" ? "Игра / UDP" : "Web / TCP"} · {profile.connection}</div></div><Select value={profile.connection} onChange={(connection) => onProfileSave({ ...profile, connection: connection as WarpRouteProfile["connection"] })} options={[{value:"auto",label:"Авто"},{value:"direct",label:"Прямой + winws"},...(profile.kind === "site" ? [{value:"warpProxy",label:"WARP proxy"}] : []),{value:"warpSystem",label:"Системный WARP"}]} />{!profile.builtInId && <button onClick={() => onProfileDelete(profile.id)} className="text-[9px] text-[#FF748C]">Удалить</button>}</div>
+          {profile.domains.length > 0 && <div className="text-[8px] font-mono text-[#3F3F5F] mt-2 truncate">{profile.domains.join(", ")}</div>}
+        </div>)}</div>
+        <div className="mt-4 pt-4 border-t border-white/[.06] space-y-2">
+          <div className="grid grid-cols-2 gap-2"><input value={newProfile.name} onChange={(e)=>setNewProfile({...newProfile,name:e.target.value})} placeholder="Название профиля" className="px-3 py-2 rounded-xl bg-black/20 border border-white/[.08] text-xs text-white"/><Select value={newProfile.kind} onChange={(kind)=>setNewProfile({...newProfile,kind:kind as "site"|"game"})} options={[{value:"site",label:"Сайт"},{value:"game",label:"Игра"}]} /></div>
+          <textarea value={newProfile.domains} onChange={(e)=>setNewProfile({...newProfile,domains:e.target.value})} placeholder="Домены, по одному в строке" className="w-full h-16 px-3 py-2 rounded-xl bg-black/20 border border-white/[.08] text-xs text-white resize-none"/>
+          {newProfile.kind === "game" && <><input value={newProfile.executablePath} onChange={(e)=>setNewProfile({...newProfile,executablePath:e.target.value})} placeholder="Путь к .exe (для подписи и диагностики)" className="w-full px-3 py-2 rounded-xl bg-black/20 border border-white/[.08] text-xs text-white"/><textarea value={newProfile.ipRanges} onChange={(e)=>setNewProfile({...newProfile,ipRanges:e.target.value})} placeholder="IP или CIDR для прямых исключений" className="w-full h-12 px-3 py-2 rounded-xl bg-black/20 border border-white/[.08] text-xs text-white resize-none"/></>}
+          <button disabled={!newProfile.name.trim()} onClick={()=>{onProfileSave({name:newProfile.name,kind:newProfile.kind,connection:newProfile.connection as WarpRouteProfile["connection"],enabled:false,domains:newProfile.domains.split(/[,\n]/),ipRanges:newProfile.ipRanges.split(/[,\n]/),executablePath:newProfile.executablePath});setNewProfile({name:"",kind:"site",connection:"auto",domains:"",ipRanges:"",executablePath:""});}} className="w-full py-2.5 rounded-xl text-[11px] font-semibold text-[#D8E9FF] bg-[#62AFFF16] border border-[#62AFFF36] disabled:opacity-40">Создать профиль</button>
+        </div>
+        <p className="text-[9px] text-[#454560] mt-3">Discord voice и игровой UDP не направляются выборочно через SOCKS5. «Системный WARP» действует на весь компьютер.</p>
+        {(info.routingConflicts ?? []).map((value) => <div key={value} className="mt-2 text-[9px] font-mono text-[#FF748C]">Конфликт: {value}</div>)}
+        {(info.routingWarnings ?? []).map((value) => <div key={value} className="mt-2 text-[9px] font-mono text-[#FFB340]">{value}</div>)}
+      </GlassCard>
+
+      {info.state === "error" && (
+        <GlassCard className="p-5" style={{ border: "1px solid rgba(255,77,109,.28)" }}>
+          <SectionLabel>Почему не подключилось</SectionLabel>
+          <div className="text-[11px] font-mono text-[#FF8CA0] leading-relaxed">{info.error ?? info.stage ?? "Cloudflare WARP не сообщил причину."}</div>
+          <div className="grid grid-cols-2 gap-2 mt-4">
+            <button type="button" disabled={info.pending || !info.registered} onClick={onRetry} className="py-2.5 rounded-xl text-[11px] font-semibold text-[#D8E9FF] bg-[#62AFFF16] border border-[#62AFFF36]">Повторить подключение</button>
+            <button type="button" onClick={onCopyDiagnostics} className="py-2.5 rounded-xl text-[11px] font-semibold text-[#FFD1D9] bg-[#FF4D6D0D] border border-[#FF4D6D24]">Скопировать безопасную диагностику</button>
+          </div>
+        </GlassCard>
+      )}
+
+      <GlassCard className="relative z-20 p-5">
+        <div className="flex items-center justify-between gap-3"><SectionLabel>Производительность WARP</SectionLabel><button type="button" disabled={info.pending} onClick={onPerformance} className="px-3 py-2 rounded-xl text-[10px] font-semibold text-[#AFCFFF] bg-[#62AFFF12] border border-[#62AFFF2D]">Проверить производительность</button></div>
+        <p className="text-[10px] text-[#5A5A7A] leading-relaxed">Три коротких измерения Cloudflare, Telegram Web, YouTube и Discord. С выключенным WARP сохраняется прямой baseline; подключение не переключается автоматически.</p>
+        {info.performance && <div className="mt-3 space-y-2">
+          <div className="text-[10px] font-mono" style={{ color: info.performance.verdict === "Worse" ? "#FF8C66" : info.performance.verdict === "Better" ? "#00D68F" : "#AFCFFF" }}>{info.performance.recommendation ?? info.performance.summary}</div>
+          <div className="grid grid-cols-4 gap-2">{Object.entries(info.performance.endpoints).map(([id, endpoint]) => <div key={id} className="p-3 rounded-xl bg-black/20"><div className="text-[9px] font-mono text-[#3A3A5E]">{endpoint.label}</div><div className="text-[11px] font-semibold mt-1" style={{ color: endpoint.available ? "#A9A9C8" : "#FF748C" }}>{endpoint.available && endpoint.medianLatencyMs != null ? `${endpoint.medianLatencyMs} мс` : "Нет ответа"}</div><div className="text-[8px] font-mono text-[#454560] mt-1">{endpoint.available && endpoint.jitterMs != null ? `разброс ${endpoint.jitterMs} мс` : endpoint.detail}</div></div>)}</div>
+        </div>}
+      </GlassCard>
+
+      <GlassCard className="relative z-10 p-5">
+        <div className="flex items-center justify-between"><SectionLabel>Диагностика</SectionLabel><span className="text-[9px] font-mono text-[#3A3A5E]">{info.version ?? "warp-cli —"}</span></div>
+        <div className="grid grid-cols-4 gap-2 mt-3">
+          {[
+            ["Маршрут", info.diagnostics?.routeActive ? "WARP" : "Не подтверждён"],
+            ["DNS", info.diagnostics?.dnsAvailable ? "Доступен" : "Нет данных"],
+            ["Задержка", info.diagnostics?.latencyMs != null ? `${info.diagnostics.latencyMs} мс` : "—"],
+            ["Внешний IP", info.diagnostics?.externalIp ?? "—"],
+          ].map(([label, value]) => <div key={label} className="p-3 rounded-xl bg-black/20"><div className="text-[9px] font-mono text-[#3A3A5E]">{label}</div><div className="text-[11px] font-semibold text-[#A9A9C8] mt-1 truncate">{value}</div></div>)}
+        </div>
+        <div className="grid grid-cols-4 gap-2 mt-2">
+          {[
+            ["Служба", info.serviceRunning ? "Работает" : "Не найдена"],
+            ["Протокол", info.protocol ?? "—"],
+            ["Режим", info.effectiveRoutingMode ?? info.routingMode ?? "—"],
+            ["Bootstrap", info.bootstrapActive ? "Активен" : "Выключен"],
+          ].map(([label, value]) => <div key={label} className="p-3 rounded-xl bg-black/20"><div className="text-[9px] font-mono text-[#3A3A5E]">{label}</div><div className="text-[11px] font-semibold text-[#A9A9C8] mt-1 truncate">{value}</div></div>)}
+        </div>
+        {info.telegramCompatibilityActive && <div className="mt-3 text-[10px] font-mono text-[#62AFFF]">Telegram: режим совместимости WARP активен, прямые desync/CDN-закрепления временно отключены.</div>}
+        {info.error && <div className="mt-3 text-[10px] font-mono text-[#FF748C]">{info.error}</div>}
+        <div className="grid grid-cols-2 gap-2 mt-4">
+          <button type="button" disabled={info.pending} onClick={onRefresh} className="py-2.5 rounded-xl text-[11px] font-semibold text-[#AFCFFF] bg-[#62AFFF12] border border-[#62AFFF2D]">Проверить WARP</button>
+          <button type="button" disabled={!info.installed} onClick={onOpen} className="py-2.5 rounded-xl text-[11px] font-semibold text-[#B9B6D8] bg-white/[.035] border border-white/[.07]">Открыть клиент</button>
+          <button type="button" disabled={!connected || info.pending} onClick={onRestore} className="py-2.5 rounded-xl text-[11px] font-semibold text-[#FF9AAA] bg-[#FF4D6D0D] border border-[#FF4D6D24]">Обычный маршрут</button>
+          <button type="button" onClick={onCopyDiagnostics} className="py-2.5 rounded-xl text-[11px] font-semibold text-[#B9B6D8] bg-white/[.035] border border-white/[.07]">Копировать диагностику</button>
+        </div>
+      </GlassCard>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TAB 5 — GAME FILTER
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function GameFilterTab({
@@ -1929,6 +2135,12 @@ const dnsOptions = [
     description: "cloudflare-dns.com · 1.1.1.1 (защита от ТСПУ)",
     icon: <Zap size={14} />,
   },
+  {
+    id: "quad9" as const,
+    label: "Quad9 DNS",
+    description: "dns.quad9.net · защищённый резервный маршрут",
+    icon: <ShieldCheck size={14} />,
+  },
 ];
 
 const strategyOptions = [
@@ -2264,8 +2476,9 @@ function SettingsTab({
 const NAV: { id: Tab; Icon: BrandIcon; trailingIcon?: BrandIcon; label: string; sub: string; color: string }[] = [
   { id: "dashboard", Icon: LayoutDashboard, label: "Дашборд", sub: "Статус и управление", color: "#A99BFF" },
   { id: "profiles", Icon: SlidersHorizontal, label: "Профили", sub: "20 стратегий · Избранное", color: "#D0A3FF" },
-  { id: "youtube", Icon: YouTubeIcon, trailingIcon: DiscordIcon, label: "YouTube & Discord", sub: "Стратегии обхода DPI", color: "#FF5B72" },
+  { id: "youtube", Icon: YouTubeIcon, trailingIcon: DiscordIcon, label: "YouTube & Discord", sub: "Ускорение сервисов", color: "#FF5B72" },
   { id: "telegram", Icon: TelegramIcon, label: "Telegram", sub: "Desktop · Web", color: "#45C5F5" },
+  { id: "warp", Icon: Cloud, label: "WARP", sub: "Cloudflare · Ускоритель", color: "#62AFFF" },
   { id: "gamefilter", Icon: GameFilterIcon, label: "Game Filter", sub: "Игры · UDP/TCP", color: "#F7B955" },
   { id: "settings", Icon: Settings2, label: "Настройки", sub: "Автозапуск · Обновления", color: "#C7C7E8" },
 ];
@@ -2289,6 +2502,10 @@ export default function App() {
   const [ytSelected, setYtSelected] = useState(Boolean((window as NativeWindow).__vortexRuntime?.profiles?.youtube));
   const [dcSelected, setDcSelected] = useState(Boolean((window as NativeWindow).__vortexRuntime?.profiles?.discord));
   const [tgSelected, setTgSelected] = useState(Boolean((window as NativeWindow).__vortexRuntime?.profiles?.telegram));
+  const [telegramWebSelected, setTelegramWebSelected] = useState(Boolean(
+    (window as NativeWindow).__vortexRuntime?.profiles?.telegramWeb ??
+    (window as NativeWindow).__vortexRuntime?.profiles?.web
+  ));
   const [webBypass, setWebBypass] = useState(Boolean((window as NativeWindow).__vortexRuntime?.profiles?.web));
   const [gameFilterSelected, setGameFilterSelected] = useState(Boolean((window as NativeWindow).__vortexRuntime?.profiles?.gameFilter));
   const [gameFilter, setGameFilter] = useState<GameFilterInfo>(() => ({
@@ -2319,6 +2536,27 @@ export default function App() {
     gameFilterIpsetMode: nativeSetting("gameFilterIpsetMode", "any"),
   });
   const [advisor, setAdvisor] = useState<AdvisorInfo>({ state: "idle" });
+  const [warp, setWarp] = useState<WarpInfo>(() => ({
+    state: (window as NativeWindow).__vortexRuntime?.warp?.state ?? "notInstalled",
+    installed: Boolean((window as NativeWindow).__vortexRuntime?.warp?.installed),
+    connected: (window as NativeWindow).__vortexRuntime?.warp?.state === "connected",
+    pending: false,
+    detail: (window as NativeWindow).__vortexRuntime?.warp?.detail ?? "Проверка клиента WARP",
+    registered: Boolean((window as NativeWindow).__vortexRuntime?.warp?.registered),
+    serviceRunning: Boolean((window as NativeWindow).__vortexRuntime?.warp?.serviceRunning),
+    protocol: (window as NativeWindow).__vortexRuntime?.warp?.protocol,
+    routingMode: (window as NativeWindow).__vortexRuntime?.warp?.routingMode ?? "smart",
+    protocolPreference: (window as NativeWindow).__vortexRuntime?.warp?.protocolPreference ?? "auto",
+    masquePreference: (window as NativeWindow).__vortexRuntime?.warp?.masquePreference ?? "h3-with-h2-fallback",
+    dnsMode: (window as NativeWindow).__vortexRuntime?.warp?.dnsMode ?? "auto",
+    proxyPort: Number((window as NativeWindow).__vortexRuntime?.warp?.proxyPort ?? 41870),
+    profiles: Array.isArray((window as NativeWindow).__vortexRuntime?.warp?.profiles) ? (window as NativeWindow).__vortexRuntime?.warp?.profiles : [],
+    bootstrapActive: false,
+    scenarios: {
+      telegram: Boolean((window as NativeWindow).__vortexRuntime?.warp?.telegram ?? true),
+      games: Boolean((window as NativeWindow).__vortexRuntime?.warp?.games),
+    },
+  }));
 
   useNativeMessage((message) => {
     if (!message?.type) return;
@@ -2345,6 +2583,8 @@ export default function App() {
       }));
     }
     if (message.type === "advisor.status") setAdvisor(message as AdvisorInfo);
+    if (message.type === "warp.status") setWarp(message as WarpInfo);
+    if (message.type === "warp.progress") setWarp((current) => ({ ...current, progress: Number(message.progress ?? 0), pending: true }));
     if (message.type === "configuration.status") {
       if (message.gameFilter) setGameFilter(message.gameFilter as GameFilterInfo);
       if (message.domains) setDomains(message.domains as DomainListsInfo);
@@ -2359,6 +2599,7 @@ export default function App() {
       setYtSelected(Boolean(message.requestedYoutube));
       setDcSelected(Boolean(message.requestedDiscord));
       setTgSelected(Boolean(message.requestedTelegram));
+      setTelegramWebSelected(Boolean(message.requestedTelegramWeb ?? message.telegramWeb));
       setWebBypass(Boolean(message.requestedWeb ?? message.web));
       setGameFilterSelected(Boolean(message.requestedGameFilter));
     }
@@ -2367,7 +2608,7 @@ export default function App() {
     }
   });
 
-  const running = [ytActive, dcActive, tgActive, protection && webBypass, gameFilterActive].filter(Boolean).length;
+  const running = [ytActive, dcActive, tgActive, protection && telegramWebSelected, protection && webBypass, gameFilterActive].filter(Boolean).length;
   const advisorBusy = advisor.state === "detecting" || advisor.state === "testing";
   const controlsBusy = protectionPending || advisorBusy;
 
@@ -2469,11 +2710,30 @@ export default function App() {
       <TelegramTab
         tgActive={tgActive}
         tgSelected={tgSelected}
-        webActive={webBypass}
+        webActive={telegramWebSelected}
         pending={controlsBusy}
         onToggleTg={(value) => { if (!controlsBusy) { setTgSelected(value); postNativeMessage("service.set", value, "telegram"); } }}
-        onToggleWeb={(value) => { if (!controlsBusy) { setWebBypass(value); postNativeMessage("service.set", value, "web"); } }}
+        onToggleWeb={(value) => { if (!controlsBusy) { setTelegramWebSelected(value); postNativeMessage("service.set", value, "telegramweb"); } }}
         onConfigureDesktop={() => postNativeMessage("telegram.proxy.configure")}
+      />
+    ),
+    warp: (
+      <WarpTab
+        info={warp}
+        onToggle={(value) => postNativeMessage("warp.toggle", value)}
+        onInstall={() => postNativeMessage("warp.install")}
+        onRefresh={() => postNativeMessage("warp.refresh")}
+        onPerformance={() => postNativeMessage("warp.performance.refresh")}
+        onOpen={() => postNativeMessage("warp.open")}
+        onRestore={() => postNativeMessage("warp.restore")}
+        onRetry={() => postNativeMessage("warp.retry")}
+        onRegister={() => postNativeMessage("warp.register")}
+        onCopyDiagnostics={() => postNativeMessage("warp.copyDiagnostics")}
+        onSettings={(value) => { setWarp((current) => ({ ...current, ...value })); postNativePayload({ type: "warp.settings.update", ...value }); }}
+        onOptimize={() => postNativeMessage("warp.optimize")}
+        onProfileSave={(profile) => postNativePayload({ type: profile.id ? "warp.profile.update" : "warp.profile.create", profile })}
+        onProfileToggle={(id, value) => postNativePayload({ type: "warp.profile.toggle", id, value })}
+        onProfileDelete={(id) => postNativePayload({ type: "warp.profile.delete", id })}
       />
     ),
     gamefilter: (
@@ -2595,7 +2855,7 @@ export default function App() {
               className="text-[11px] font-mono flex-1 transition-colors duration-300"
               style={{ color: protection ? "#8080C0" : "#2A2A44" }}
             >
-              {protection ? `${running}/5 активно` : "Защита выкл."}
+              {protection ? `${running}/6 активно` : "Защита выкл."}
             </span>
             <Dot on={protection} pulse={protection} />
           </div>

@@ -11,6 +11,13 @@ cdn-telegram.org
 telegramusercontent.com
 telegram.space
 telesco.pe
+cdn.telesco.pe
+cdn1.telesco.pe
+cdn2.telesco.pe
+cdn3.telesco.pe
+cdn4.telesco.pe
+cdn5.telesco.pe
+cdn6.telesco.pe
 pluto.web.telegram.org
 venus.web.telegram.org
 aurora.web.telegram.org

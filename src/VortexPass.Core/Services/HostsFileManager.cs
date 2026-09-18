@@ -27,7 +27,12 @@ public sealed class HostsFileManager
         "s.ytimg.com",
         "yt3.ggpht.com",
         "yt4.ggpht.com",
+        "yt5.ggpht.com",
+        "yt6.ggpht.com",
         "yt3.googleusercontent.com",
+        "yt4.googleusercontent.com",
+        "yt5.googleusercontent.com",
+        "yt6.googleusercontent.com",
         "youtube-pa.googleapis.com",
         "youtubeembeddedplayer.googleapis.com",
         "clients1.google.com",
@@ -102,9 +107,15 @@ public sealed class HostsFileManager
     }
 
     public Task<HostsFileStatus> ApplyAsync(CancellationToken cancellationToken = default) =>
-        ApplyAsync(Array.Empty<HostsOverride>(), cancellationToken);
+        ApplyAsync(Array.Empty<HostsOverride>(), includeStaticFallbacks: false, cancellationToken);
 
     public async Task<HostsFileStatus> ApplyAsync(IEnumerable<HostsOverride> overrides, CancellationToken cancellationToken = default)
+        => await ApplyAsync(overrides, includeStaticFallbacks: false, cancellationToken);
+
+    public async Task<HostsFileStatus> ApplyAsync(
+        IEnumerable<HostsOverride> overrides,
+        bool includeStaticFallbacks,
+        CancellationToken cancellationToken = default)
     {
         if (!File.Exists(_assetPath)) throw new FileNotFoundException("Не найден закреплённый hosts-набор Flowseal.", _assetPath);
         if (!await HashVerifier.MatchesAsync(_assetPath, HostsAssetSha256, cancellationToken))
@@ -136,16 +147,27 @@ public sealed class HostsFileManager
         // The signed Flowseal entries are SNI-aware routes. A raw TCP probe to their IP
         // does not contain a hostname and can be blocked by the very DPI rules that winws
         // is meant to bypass, so it must not be used to discard the trusted Telegram block.
-        var trustedEntries = flowsealEntries.Concat(telegramWebAliases).Distinct().ToArray();
+        // A Telegram fallback must never install the bundled discord.media block.
+        // Those hostnames are region-specific CDN/voice routes and pinning hundreds
+        // of them to one remote address can break an otherwise healthy Discord.
+        var trustedEntries = includeStaticFallbacks
+            ? flowsealEntries
+                .Where(entry => IsTelegramWebFallbackHost(entry.Host))
+                .Concat(telegramWebAliases)
+                .Distinct()
+                .ToArray()
+            : Array.Empty<(IPAddress Address, string Host)>();
         var candidateEntries = trustedEntries.Concat(additionalEntries).Distinct().ToArray();
         var reachableAddresses = new HashSet<IPAddress>();
         var skippedAddresses = new List<IPAddress>();
-        foreach (var address in additionalEntries.Select(x => x.Address).Distinct())
+        var reachability = await Task.WhenAll(additionalEntries.Select(x => x.Address).Distinct().Select(async address =>
+            (Address: address, Reachable: await IsReachableAsync(address, cancellationToken))));
+        foreach (var result in reachability)
         {
-            if (await IsReachableAsync(address, cancellationToken))
-                reachableAddresses.Add(address);
+            if (result.Reachable)
+                reachableAddresses.Add(result.Address);
             else
-                skippedAddresses.Add(address);
+                skippedAddresses.Add(result.Address);
         }
 
         var entries = candidateEntries
@@ -243,6 +265,37 @@ public sealed class HostsFileManager
     private static bool IsAllowedHost(string host) =>
         host == "web.telegram.org" || host == "api.telegram.org" || host.EndsWith(".web.telegram.org", StringComparison.Ordinal) ||
         host.EndsWith(".discord.media", StringComparison.Ordinal) || AllowedDynamicHosts.Contains(host);
+
+    public static bool IsTelegramWebFallbackHost(string host) =>
+        host.Equals("telegram.org", StringComparison.OrdinalIgnoreCase) ||
+        host.Equals("telegram.me", StringComparison.OrdinalIgnoreCase) ||
+        host.Equals("t.me", StringComparison.OrdinalIgnoreCase) ||
+        host.Equals("telesco.pe", StringComparison.OrdinalIgnoreCase) ||
+        host.EndsWith(".telegram.org", StringComparison.OrdinalIgnoreCase) ||
+        host.EndsWith(".web.telegram.org", StringComparison.OrdinalIgnoreCase) ||
+        host.EndsWith(".telesco.pe", StringComparison.OrdinalIgnoreCase);
+
+    public static bool ShouldUseTelegramStaticFallback(
+        bool telegramWebEnabled,
+        bool warpCompatibilityActive,
+        bool emergencyRequested,
+        IEnumerable<HostsOverride> dynamicOverrides)
+    {
+        if (!telegramWebEnabled || warpCompatibilityActive) return false;
+
+        // DNS resolution alone does not prove that the returned Telegram edge is
+        // reachable through the current provider. Keep the signed, SNI-aware
+        // Telegram Web block installed while the direct profile is active and use
+        // measured dynamic entries only as additional candidates. Previously a
+        // DNS answer such as 149.154.167.99 disabled this block before the later
+        // TCP probe rejected the address, leaving browsers with a single unrelated
+        // hosts entry and Telegram Web stuck at "Waiting for network".
+        _ = emergencyRequested;
+        _ = dynamicOverrides;
+        return true;
+    }
+
+    internal static bool IsAllowedDynamicHostForTests(string host) => IsAllowedHost(host);
 
     private static async Task<bool> IsReachableAsync(IPAddress address, CancellationToken cancellationToken)
     {

@@ -1,0 +1,2 @@
+# Component hashes are byte-exact. Never rewrite their line endings during checkout.
+components/zapret/files/*.txt -text

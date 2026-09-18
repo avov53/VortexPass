@@ -1,8 +1,12 @@
 googlevideo.com
 googleusercontent.com
 ggpht.com
+cloudflare-ech.com
 gvt1.com
 gvt2.com
+gstatic.com
+l.google.com
+1e100.net
 video.google.com
 youtube.com
 youtu.be

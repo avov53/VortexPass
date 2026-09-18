@@ -47,12 +47,20 @@ public sealed class ExternalComponentService : IDisposable
         component.Arguments = arguments;
     }
 
-    public async Task StartAllAsync(CancellationToken cancellationToken = default)
+    public async Task StartAllAsync(CancellationToken cancellationToken = default, bool reuseExistingOwnedDriver = false)
     {
         if (_manifest.Components.Count == 0)
             throw new InvalidOperationException("Манифест компонентов пуст или имеет неверный формат.");
-        if (_processes.Values.All(process => process.HasExited))
-            await CleanupWinDivertAsync(cancellationToken, "перед запуском");
+        if (_processes.Values.All(process => process.HasExited) && !reuseExistingOwnedDriver)
+        {
+            var cleanup = await CleanupWinDivertAsync(cancellationToken, "перед запуском");
+            if (!cleanup.Owned && !cleanup.Stopped)
+            {
+                throw new InvalidOperationException(
+                    $"Обнаружен конфликт WinDivert: {cleanup.Detail}. " +
+                    "Закройте другой zapret/обход, отключите его автозапуск и повторите включение защиты.");
+            }
+        }
         foreach (var component in _manifest.Components)
             await StartAsync(component.Id, cancellationToken);
     }
@@ -153,7 +161,7 @@ public sealed class ExternalComponentService : IDisposable
         }
     }
 
-    public async Task StopAllAsync()
+    public async Task StopAllAsync(bool cleanupDriver = true)
     {
         foreach (var (id, process) in _processes.ToArray())
         {
@@ -166,19 +174,22 @@ public sealed class ExternalComponentService : IDisposable
             _processes.Remove(id);
             PublishStatus(new ServiceStatus(id, component.DisplayName, ServiceState.Stopped));
         }
-        await CleanupWinDivertAsync(CancellationToken.None, "после остановки winws");
+        if (cleanupDriver)
+            await CleanupWinDivertAsync(CancellationToken.None, "после остановки winws");
     }
 
-    private async Task CleanupWinDivertAsync(CancellationToken cancellationToken, string stage)
+    private async Task<WinDivertCleanupResult> CleanupWinDivertAsync(CancellationToken cancellationToken, string stage)
     {
         try
         {
             var result = await _winDivertDriver.StopAndDeleteOwnedAsync(cancellationToken);
             PublishDiagnostic($"[WinDivert] {stage}: {result.Detail}.");
+            return result;
         }
         catch (Exception ex)
         {
             PublishDiagnostic($"[WinDivert] {stage}: очистка не выполнена — {ex.Message}");
+            return new(false, false, false, $"не удалось проверить службу WinDivert: {ex.Message}");
         }
     }
 

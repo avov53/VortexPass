@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Security;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Text.Json;
@@ -17,7 +18,7 @@ public sealed record DnsOverrideResult(string Host, IPAddress? Address, string S
 public sealed class DnsOverrideService
 {
     private sealed record CachedResolution(DnsOverrideResult Result, DateTimeOffset ExpiresAt);
-    private sealed record DnsProvider(string Name, string Url);
+    private sealed record DnsProvider(string Id, string Name, string Url, bool WireFormat = false);
 
     private sealed class DnsJsonResponse
     {
@@ -36,11 +37,22 @@ public sealed class DnsOverrideService
 
     private static readonly DnsProvider[] Providers =
     [
-        new("Cloudflare DNS", "https://1.1.1.1/dns-query"),
-        new("Google DNS", "https://dns.google/resolve"),
-        new("Quad9 DNS", "https://dns.quad9.net/dns-query")
+        new("cloudflare", "Cloudflare DNS", "https://cloudflare-dns.com/dns-query"),
+        new("google", "Google DNS", "https://dns.google/resolve"),
+        new("quad9", "Quad9 DNS", "https://dns.quad9.net/dns-query", WireFormat: true)
     ];
     private static readonly ConcurrentDictionary<string, CachedResolution> Cache = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly HttpClient ProviderClient = new(new SocketsHttpHandler
+    {
+        PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+        ConnectTimeout = TimeSpan.FromSeconds(5),
+        EnableMultipleHttp2Connections = true
+    })
+    { Timeout = Timeout.InfiniteTimeSpan };
+
+    static DnsOverrideService() => NetworkChange.NetworkAddressChanged += (_, _) => Cache.Clear();
+
+    public static void InvalidateCache() => Cache.Clear();
 
     public async Task<DnsOverrideResult> ResolveBestAsync(
         string host,
@@ -58,39 +70,30 @@ public sealed class DnsOverrideService
         if (Cache.TryGetValue(cacheKey, out var cached) && cached.ExpiresAt > DateTimeOffset.UtcNow)
             return cached.Result;
 
-        var activeProviders = (preferredProvider?.ToLowerInvariant()) switch
-        {
-            "google" => Providers.Where(p => p.Name.Contains("Google", StringComparison.OrdinalIgnoreCase)).ToArray(),
-            "cloudflare" => Providers.Where(p => p.Name.Contains("Cloudflare", StringComparison.OrdinalIgnoreCase)).ToArray(),
-            _ => Providers
-        };
+        var normalizedProvider = preferredProvider?.Trim().ToLowerInvariant() ?? "auto";
+        var activeProviders = normalizedProvider == "auto"
+            ? Providers
+            : Providers.Where(provider => provider.Id == normalizedProvider).ToArray();
+        if (activeProviders.Length == 0) activeProviders = Providers;
 
-        if (string.IsNullOrWhiteSpace(preferredProvider) || preferredProvider.Equals("auto", StringComparison.OrdinalIgnoreCase))
+        var attempts = new List<Task<DnsOverrideResult>>();
+        if (normalizedProvider == "auto")
         {
-            var system = await TrySystemDnsAsync(normalizedHost, verifyTls, httpProbeUrl, timeoutValue, cancellationToken);
-            if (system.Succeeded)
-            {
-                Cache[cacheKey] = new(system, DateTimeOffset.UtcNow.AddMinutes(10));
-                return system;
-            }
-            errors.Add(system.Detail);
+            attempts.Add(TrySystemDnsAsync(normalizedHost, verifyTls, httpProbeUrl, timeoutValue, cancellationToken));
         }
-
-        var providerTasks = activeProviders
-            .Select(provider => TryProviderAsync(provider, normalizedHost, verifyTls, httpProbeUrl, timeoutValue, cancellationToken))
-            .ToArray();
-        var providerResults = await Task.WhenAll(providerTasks);
-        foreach (var result in providerResults)
+        attempts.AddRange(activeProviders.Select(provider =>
+            TryProviderAsync(provider, normalizedHost, verifyTls, httpProbeUrl, timeoutValue, cancellationToken)));
+        var results = await Task.WhenAll(attempts);
+        var best = SelectFastest(results);
+        if (best is not null)
         {
-            if (result.Succeeded)
-            {
-                Cache[cacheKey] = new(result, DateTimeOffset.UtcNow.AddMinutes(10));
-                return result;
-            }
-            errors.Add(result.Detail);
+            Cache[cacheKey] = new(best, DateTimeOffset.UtcNow.AddMinutes(10));
+            return best;
         }
-
-        return new(normalizedHost, null, "none", string.Join("; ", errors.Take(4)));
+        errors.AddRange(results.Select(result => result.Detail));
+        var failed = new DnsOverrideResult(normalizedHost, null, "none", string.Join("; ", errors.Take(4)));
+        Cache[cacheKey] = new(failed, DateTimeOffset.UtcNow.AddSeconds(30));
+        return failed;
     }
 
     private static async Task<DnsOverrideResult> TrySystemDnsAsync(
@@ -102,10 +105,13 @@ public sealed class DnsOverrideService
     {
         try
         {
+            var watch = Stopwatch.StartNew();
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             linked.CancelAfter(timeout);
             var addresses = await Dns.GetHostAddressesAsync(host, linked.Token);
-            return await ValidateAddressesAsync(host, addresses, "System DNS", verifyTls, httpProbeUrl, timeout, linked.Token);
+            var result = await ValidateAddressesAsync(host, addresses, "System DNS", verifyTls, httpProbeUrl, timeout, linked.Token);
+            watch.Stop();
+            return result with { LatencyMs = result.Succeeded ? watch.ElapsedMilliseconds : null };
         }
         catch (Exception ex) when (ex is SocketException or OperationCanceledException)
         {
@@ -124,36 +130,52 @@ public sealed class DnsOverrideService
     {
         try
         {
+            var watch = Stopwatch.StartNew();
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             linked.CancelAfter(timeout + TimeSpan.FromSeconds(2));
-            using var client = new HttpClient { Timeout = timeout + TimeSpan.FromSeconds(2) };
-            var separator = provider.Url.Contains('?', StringComparison.Ordinal) ? "&" : "?";
-            using var request = new HttpRequestMessage(HttpMethod.Get, $"{provider.Url}{separator}name={Uri.EscapeDataString(host)}&type=A");
-            request.Headers.Accept.ParseAdd("application/dns-json");
-            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, linked.Token);
+            using var request = provider.WireFormat
+                ? new HttpRequestMessage(HttpMethod.Post, provider.Url)
+                : new HttpRequestMessage(HttpMethod.Get, $"{provider.Url}?name={Uri.EscapeDataString(host)}&type=A");
+            if (provider.WireFormat)
+            {
+                request.Content = new ByteArrayContent(BuildDnsWireQuery(host));
+                request.Content.Headers.ContentType = new("application/dns-message");
+                request.Headers.Accept.ParseAdd("application/dns-message");
+            }
+            else
+            {
+                request.Headers.Accept.ParseAdd("application/dns-json");
+            }
+            using var response = await ProviderClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, linked.Token);
             if (!response.IsSuccessStatusCode)
                 return new(host, null, provider.Name, $"{provider.Name} returned HTTP {(int)response.StatusCode}");
 
-            await using var stream = await response.Content.ReadAsStreamAsync(linked.Token);
-            var payload = await JsonSerializer.DeserializeAsync<DnsJsonResponse>(stream, cancellationToken: linked.Token);
-            if (payload?.Status != 0 || payload.Answer is null)
-                return new(host, null, provider.Name, $"{provider.Name} returned no successful A response");
-
-            var addresses = payload.Answer
-                .Where(answer => answer.Type == 1 && IPAddress.TryParse(answer.Data, out _))
-                .Select(answer => IPAddress.Parse(answer.Data))
-                .ToArray();
-
-            if (addresses.Length == 0)
+            IPAddress[] addresses;
+            if (provider.WireFormat)
             {
-                var cname = payload.Answer.FirstOrDefault(answer => answer.Type == 5)?.Data?.Trim().TrimEnd('.');
-                if (!string.IsNullOrWhiteSpace(cname) && !cname.Equals(host, StringComparison.OrdinalIgnoreCase))
+                addresses = ParseDnsWireAddresses(await response.Content.ReadAsByteArrayAsync(linked.Token)).ToArray();
+            }
+            else
+            {
+                await using var stream = await response.Content.ReadAsStreamAsync(linked.Token);
+                var payload = await JsonSerializer.DeserializeAsync<DnsJsonResponse>(stream, cancellationToken: linked.Token);
+                if (payload?.Status != 0 || payload.Answer is null)
+                    return new(host, null, provider.Name, $"{provider.Name} returned no successful A response");
+                addresses = payload.Answer
+                    .Where(answer => answer.Type == 1 && IPAddress.TryParse(answer.Data, out _))
+                    .Select(answer => IPAddress.Parse(answer.Data))
+                    .ToArray();
+                if (addresses.Length == 0)
                 {
-                    return await TryProviderAsync(provider, cname, verifyTls, httpProbeUrl, timeout, cancellationToken);
+                    var cname = payload.Answer.FirstOrDefault(answer => answer.Type == 5)?.Data?.Trim().TrimEnd('.');
+                    if (!string.IsNullOrWhiteSpace(cname) && !cname.Equals(host, StringComparison.OrdinalIgnoreCase))
+                        return await TryProviderAsync(provider, cname, verifyTls, httpProbeUrl, timeout, cancellationToken);
                 }
             }
 
-            return await ValidateAddressesAsync(host, addresses, provider.Name, verifyTls, httpProbeUrl, timeout, linked.Token);
+            var result = await ValidateAddressesAsync(host, addresses, provider.Name, verifyTls, httpProbeUrl, timeout, linked.Token);
+            watch.Stop();
+            return result with { LatencyMs = result.Succeeded ? watch.ElapsedMilliseconds : null };
         }
         catch (Exception ex) when (ex is HttpRequestException or SocketException or AuthenticationException or JsonException or OperationCanceledException)
         {
@@ -243,4 +265,76 @@ public sealed class DnsOverrideService
         var message = exception.InnerException?.Message ?? exception.Message;
         return string.IsNullOrWhiteSpace(message) ? exception.GetType().Name : message.Replace(Environment.NewLine, " ");
     }
+
+    internal static DnsOverrideResult? SelectFastest(IEnumerable<DnsOverrideResult> results) => results
+        .Where(result => result.Succeeded)
+        .OrderBy(result => result.LatencyMs ?? long.MaxValue)
+        .FirstOrDefault();
+
+    internal static void ClearCacheForTests() => Cache.Clear();
+    internal static int CachedEntryCountForTests => Cache.Count;
+
+    internal static byte[] BuildDnsWireQuery(string host)
+    {
+        using var stream = new MemoryStream();
+        // Transaction ID 0 is valid for DoH because the HTTPS request already
+        // correlates the response. RD=1, QDCOUNT=1.
+        stream.Write(new byte[] { 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0 });
+        foreach (var label in host.Trim('.').Split('.'))
+        {
+            var bytes = System.Text.Encoding.ASCII.GetBytes(label);
+            if (bytes.Length is 0 or > 63) throw new ArgumentException("Некорректное DNS-имя.", nameof(host));
+            stream.WriteByte((byte)bytes.Length);
+            stream.Write(bytes);
+        }
+        stream.Write(new byte[] { 0, 0, 1, 0, 1 }); // root, QTYPE=A, QCLASS=IN
+        return stream.ToArray();
+    }
+
+    internal static IReadOnlyList<IPAddress> ParseDnsWireAddresses(byte[] message)
+    {
+        if (message.Length < 12 || (message[3] & 0x0f) != 0) return [];
+        var questions = ReadUInt16(message, 4);
+        var answers = ReadUInt16(message, 6);
+        var offset = 12;
+        for (var i = 0; i < questions; i++)
+        {
+            if (!SkipDnsName(message, ref offset) || offset + 4 > message.Length) return [];
+            offset += 4;
+        }
+        var result = new List<IPAddress>();
+        for (var i = 0; i < answers; i++)
+        {
+            if (!SkipDnsName(message, ref offset) || offset + 10 > message.Length) break;
+            var type = ReadUInt16(message, offset);
+            var dataLength = ReadUInt16(message, offset + 8);
+            offset += 10;
+            if (offset + dataLength > message.Length) break;
+            if (type == 1 && dataLength == 4)
+                result.Add(new IPAddress(message.AsSpan(offset, 4)));
+            offset += dataLength;
+        }
+        return result;
+    }
+
+    private static bool SkipDnsName(byte[] message, ref int offset)
+    {
+        while (offset < message.Length)
+        {
+            var length = message[offset++];
+            if (length == 0) return true;
+            if ((length & 0xc0) == 0xc0)
+            {
+                if (offset >= message.Length) return false;
+                offset++;
+                return true;
+            }
+            if (length > 63 || offset + length > message.Length) return false;
+            offset += length;
+        }
+        return false;
+    }
+
+    private static ushort ReadUInt16(byte[] value, int offset) =>
+        (ushort)((value[offset] << 8) | value[offset + 1]);
 }

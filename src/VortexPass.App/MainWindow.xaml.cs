@@ -5,6 +5,8 @@ using System.Net.NetworkInformation;
 using System.Net.Http;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Interop;
@@ -27,11 +29,14 @@ public partial class MainWindow : Window
     private readonly TelegramDesktopProxyService _telegramProxy;
     private readonly ServiceHealthCheckService _healthChecks = new();
     private readonly SystemProxyManager _proxyManager;
+    private readonly WarpPacService _warpPac = new();
     private readonly HostsFileManager _hostsManager;
     private readonly RobloxThumbnailResolver _robloxThumbnailResolver = new();
     private readonly DnsOverrideService _dnsOverrides = new();
     private readonly UserDomainListService _domainLists;
     private readonly GitHubUpdateService _updates = new();
+    private readonly WarpService _warpService;
+    private readonly WarpBootstrapService _warpBootstrap = new(AppContext.BaseDirectory);
     private readonly PendingUpdateStore _pendingUpdates;
     private readonly Forms.NotifyIcon _trayIcon;
     private readonly TrayMenuWindow _trayMenu;
@@ -65,13 +70,29 @@ public partial class MainWindow : Window
     private CancellationTokenSource _healthCheckCts = new();
     private bool _advisorStopProtectionRequested;
     private int _startupAddedDefaultExclusions;
+    private bool _startupFallbackApplied;
+    private WarpStatus _warpStatus = new(WarpConnectionState.NotInstalled, "Официальный Cloudflare WARP не установлен");
+    private WarpDiagnostics? _warpDiagnostics;
+    private WarpPerformanceResult? _warpPerformance;
+    private WarpPerformanceComparison? _warpPerformanceComparison;
+    private bool _warpTransitioning;
+    private bool _warpTelegramCompatibilityActive;
+    private bool _telegramEmergencyHostsActive;
+    private string? _warpAppliedRoutingMode;
 
     public MainWindow()
     {
         InitializeComponent();
+        if (Environment.GetCommandLineArgs().Any(arg => arg.Equals("--startup", StringComparison.OrdinalIgnoreCase)))
+        {
+            WindowState = WindowState.Minimized;
+            ShowInTaskbar = false;
+            Visibility = Visibility.Hidden;
+        }
         var appData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VortexPass");
         _settingsStore = new AppSettingsStore(appData);
         _pendingUpdates = new PendingUpdateStore(appData);
+        _warpService = new WarpService(appData);
         _applicationLogPath = Path.Combine(appData, "app.log");
         _components = new ExternalComponentService(AppContext.BaseDirectory);
         _telegramProxy = new TelegramDesktopProxyService(AppContext.BaseDirectory, appData);
@@ -94,8 +115,9 @@ public partial class MainWindow : Window
                 if ((_advisorRunning || _protectionTransitioning) && !_protectionRequested) return;
                 await SetProtectionAsync(!_protectionRequested);
             },
+            async () => await SetWarpConnectedAsync(_warpStatus.State != WarpConnectionState.Connected),
             ShutdownAsync);
-        _trayMenu.UpdateState(false, false);
+        _trayMenu.UpdateState(false, false, false, false, false, false);
         _trayIcon.MouseUp += TrayIconMouseUp;
         _trayIcon.DoubleClick += (_, _) => RestoreWindow();
         _advisorHttp.DefaultRequestHeaders.UserAgent.ParseAdd("VortexPass/0.1 (+https://github.com/avov53/VortexPass)");
@@ -124,7 +146,8 @@ public partial class MainWindow : Window
         var workAreaTopLeft = transform?.Transform(new System.Windows.Point(area.Left, area.Top)) ?? new System.Windows.Point(area.Left, area.Top);
         var workAreaBottomRight = transform?.Transform(new System.Windows.Point(area.Right, area.Bottom)) ?? new System.Windows.Point(area.Right, area.Bottom);
         var workArea = new Rect(workAreaTopLeft, workAreaBottomRight);
-        _trayMenu.UpdateState(_protectionRequested, _protectionTransitioning || _advisorRunning);
+        _trayMenu.UpdateState(_protectionRequested, _protectionTransitioning || _advisorRunning,
+            _startupFallbackApplied, HasProtectionError(), _warpStatus.State == WarpConnectionState.Connected, _warpTransitioning);
         _trayMenu.ShowAt(cursorPoint, workArea);
     }
 
@@ -136,6 +159,11 @@ public partial class MainWindow : Window
         _settings = await _settingsStore.LoadAsync(_lifetime.Token);
         _settings.Profiles ??= new BypassProfileSettings();
         _settings.GameFilter ??= new GameFilterSettings();
+        _settings.Warp ??= new WarpSettings();
+        WarpRoutingPlanner.EnsureDefaults(_settings.Warp);
+        // Recover an owned PAC left by a crash before deciding whether the
+        // current session should enable selective WARP routing again.
+        _proxyManager.RestoreIfOwned();
         _settings.GameFilter.SelectedGames ??= [];
         _settings.GameFilter.Protocol = WinwsProfileComposer.NormalizeGameProtocol(_settings.GameFilter.Protocol);
         _settings.CustomBypassDomains ??= [];
@@ -144,6 +172,8 @@ public partial class MainWindow : Window
         _settings.FavoriteProfiles ??= [];
         _settings.FavoriteProfiles = NormalizeFavorites(_settings.FavoriteProfiles);
         _settings.AdvisorHistory ??= [];
+        await _settingsStore.SaveAsync(_settings, _lifetime.Token);
+        _warpStatus = _warpService.Detect();
         _hostsStatus = _hostsManager.GetStatus();
         if (_hostsStatus.Applied)
         {
@@ -164,6 +194,14 @@ public partial class MainWindow : Window
             _settings.ProfileSettingsVersion = 3;
             await _settingsStore.SaveAsync(_settings, _lifetime.Token);
         }
+        if (_settings.ProfileSettingsVersion < 4)
+        {
+            // In v0.6.0 the Telegram Web switch was backed by the broad Web flag.
+            // Preserve effective coverage while separating both settings.
+            _settings.Profiles.TelegramWeb = _settings.Profiles.Web;
+            _settings.ProfileSettingsVersion = 4;
+            await _settingsStore.SaveAsync(_settings, _lifetime.Token);
+        }
         if (_startupAddedDefaultExclusions > 0)
         {
             await _settingsStore.SaveAsync(_settings, _lifetime.Token);
@@ -178,6 +216,8 @@ public partial class MainWindow : Window
             _startupService.SetEnabled(false, Path.Combine(AppContext.BaseDirectory, "VortexPass.exe"));
         _trayIcon.Visible = true;
         await _components.LoadManifestAsync(_lifetime.Token);
+        if (isStartup && _settings.StartProtectionOnStartup)
+            _ = StartProtectionOnWindowsStartupAsync();
 
         var webDirectory = Path.Combine(AppContext.BaseDirectory, "web");
         if (!File.Exists(Path.Combine(webDirectory, "index.html")))
@@ -212,6 +252,7 @@ public partial class MainWindow : Window
                     youtube = _settings.Profiles.YouTube,
                     discord = _settings.Profiles.Discord,
                     telegram = _settings.Profiles.Telegram,
+                    telegramWeb = _settings.Profiles.TelegramWeb,
                     web = _settings.Profiles.Web,
                     gameFilter = _settings.Profiles.GameFilter
                 },
@@ -219,6 +260,29 @@ public partial class MainWindow : Window
                 {
                     selectedGames = _settings.GameFilter.SelectedGames,
                     protocol = WinwsProfileComposer.NormalizeGameProtocol(_settings.GameFilter.Protocol)
+                },
+                warp = new
+                {
+                    telegram = _settings.Warp.Telegram,
+                    games = _settings.Warp.Games,
+                    requestedConnected = _settings.Warp.RequestedConnected,
+                    state = WarpStateName(_warpStatus.State),
+                    detail = _warpStatus.Detail,
+                    installed = _warpStatus.CliPath is not null,
+                    registered = _warpStatus.Registered,
+                    serviceRunning = _warpStatus.ServiceRunning,
+                    protocol = _warpStatus.Protocol,
+                    routingMode = _settings.Warp.RoutingMode,
+                    protocolPreference = _settings.Warp.ProtocolPreference,
+                    masquePreference = _settings.Warp.MasquePreference,
+                    dnsMode = _settings.Warp.DnsMode,
+                    proxyPort = _settings.Warp.ProxyPort,
+                    profiles = _settings.Warp.RouteProfiles.Select(profile => new
+                    {
+                        id = profile.Id, name = profile.Name, kind = profile.Kind, builtInId = profile.BuiltInId,
+                        enabled = profile.Enabled, connection = profile.Connection, domains = profile.Domains,
+                        ipRanges = profile.IpRanges, executablePath = profile.ExecutablePath
+                    })
                 },
                 domains = new
                 {
@@ -257,26 +321,14 @@ public partial class MainWindow : Window
 
         _webReady = true;
         await SendServiceSnapshotAsync();
+        _ = RefreshWarpAsync(runDiagnostics: false);
         if (!string.IsNullOrWhiteSpace(_startupUpdateError))
             await PostUiAsync(new { type = "update.status", state = "failed", currentVersion = CurrentVersion().ToString(3), error = _startupUpdateError });
         if (_startupAddedDefaultExclusions > 0)
-            await LogToUiAsync("info", $"Исключения обновлены: добавлено {_startupAddedDefaultExclusions} доменов для CurseForge/Battle.net.");
+            await LogToUiAsync("info", $"Исключения обновлены: добавлено {_startupAddedDefaultExclusions} служебных доменов для совместимости приложений и WARP.");
         _ = RunMetricsLoopAsync(_lifetime.Token);
         _ = CheckForUpdatesAsync();
 
-        var isStartup = Environment.GetCommandLineArgs().Any(arg => arg.Equals("--startup", StringComparison.OrdinalIgnoreCase));
-        if (isStartup && _settings.StartProtectionOnStartup)
-        {
-            if (_settings.StartupStrategy.Equals("auto", StringComparison.OrdinalIgnoreCase))
-            {
-                _ = RunProfileAdvisorAsync();
-            }
-            else
-            {
-                _settings.BypassLevel = WinwsProfileComposer.NormalizeLevel(_settings.StartupStrategy);
-                _ = SetProtectionAsync(true);
-            }
-        }
     }
 
     private async void WebViewMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
@@ -393,6 +445,52 @@ public partial class MainWindow : Window
                 case "telegram.proxy.configure":
                     await ConfigureTelegramProxyAsync();
                     break;
+                case "warp.toggle":
+                    await SetWarpConnectedAsync(value);
+                    break;
+                case "warp.install":
+                    await InstallWarpAsync();
+                    break;
+                case "warp.refresh":
+                    await RefreshWarpAsync(runDiagnostics: true);
+                    break;
+                case "warp.performance.refresh":
+                    await RefreshWarpPerformanceAsync();
+                    break;
+                case "warp.open":
+                    _warpService.OpenClient();
+                    break;
+                case "warp.restore":
+                    await SetWarpConnectedAsync(false);
+                    break;
+                case "warp.retry":
+                    await SetWarpConnectedAsync(true);
+                    break;
+                case "warp.register":
+                    await RegisterWarpAsync();
+                    break;
+                case "warp.copyDiagnostics":
+                    CopyWarpDiagnostics();
+                    break;
+                case "warp.scenarios":
+                    await SetWarpScenariosAsync(root);
+                    break;
+                case "warp.settings.update":
+                    await UpdateWarpSettingsAsync(root);
+                    break;
+                case "warp.optimize":
+                    await OptimizeWarpAsync();
+                    break;
+                case "warp.profile.create":
+                case "warp.profile.update":
+                    await UpsertWarpProfileAsync(root);
+                    break;
+                case "warp.profile.delete":
+                    await DeleteWarpProfileAsync(root);
+                    break;
+                case "warp.profile.toggle":
+                    await ToggleWarpProfileAsync(root);
+                    break;
                 case "update.check":
                     await CheckForUpdatesAsync();
                     break;
@@ -414,6 +512,755 @@ public partial class MainWindow : Window
             await PostUiAsync(new { type = "log", level = "error", message = ex.Message });
         }
     }
+
+    private async Task SetWarpConnectedAsync(bool connected)
+    {
+        if (_warpTransitioning) return;
+        if (connected && _warpStatus.CliPath is null)
+        {
+            await LogToUiAsync("warn", "Cloudflare WARP не установлен. Откройте вкладку WARP и нажмите «Установить».");
+            await PublishWarpStatusAsync();
+            return;
+        }
+
+        _warpTransitioning = true;
+        ResetHealthChecksAfterRouteChange();
+        DnsOverrideService.InvalidateCache();
+        _warpStatus = _warpStatus with { State = WarpConnectionState.Connecting, Detail = connected ? "Подготовка обхода WARP" : "WARP отключается", Progress = connected ? .05 : null };
+        await PublishWarpStatusAsync();
+        UpdateTrayState(_protectionRequested);
+        try
+        {
+            if (!connected)
+                await StopWarpRoutingAsync(_lifetime.Token);
+            if (connected)
+            {
+                if (!_warpStatus.Registered)
+                    _warpStatus = await _warpService.GetStatusAsync(_lifetime.Token);
+                if (!_warpStatus.Registered)
+                    throw new InvalidOperationException("Сначала выполните бесплатную регистрацию Consumer WARP во вкладке WARP.");
+                await SetWarpBootstrapAsync(true, _lifetime.Token, telegramCompatibility: ShouldUseWarpForTelegram());
+                _warpStatus = await ApplyWarpClientPreferencesAsync(reconnect: false, _lifetime.Token);
+                await LogToUiAsync("info", "WARP bootstrap активен: применены узкие правила TCP/443, QUIC/443 и UDP/2408.");
+            }
+
+            var progress = new Progress<WarpStatus>(status =>
+            {
+                _warpStatus = status;
+                _ = PublishWarpStatusAsync();
+                UpdateTrayState(_protectionRequested);
+            });
+            _warpStatus = await _warpService.SetConnectedAsync(connected, _lifetime.Token, progress);
+            _settings.Warp.RequestedConnected = connected && _warpStatus.State == WarpConnectionState.Connected;
+            _settings.Warp.DetectedCliPath = _warpStatus.CliPath ?? string.Empty;
+            _settings.Warp.LastCheckedUtc = _warpStatus.CheckedAt;
+            _settings.Warp.LastError = _warpStatus.Error ?? string.Empty;
+            if (_warpStatus.State == WarpConnectionState.Connected)
+            {
+                await SetWarpBootstrapAsync(true, _lifetime.Token, telegramCompatibility: ShouldUseWarpForTelegram());
+                await ApplyWarpRoutingAsync(_lifetime.Token);
+                await EnsureTelegramSmartRouteAsync(_lifetime.Token);
+                DnsOverrideService.InvalidateCache();
+                _warpDiagnostics = await _warpService.DiagnoseAsync(
+                    _settings.Warp.Telegram,
+                    _settings.Warp.Games,
+                    _lifetime.Token,
+                    telegramProxyRunning: _telegramProxy.IsRunning,
+                    telegramProxyHasClientActivity: _telegramProxy.HasTelegramClientActivity,
+                    fullTelegramProbe: false,
+                    proxyUri: GetWarpProxyUri());
+            }
+            else if (!connected)
+                _warpDiagnostics = null;
+            if (_warpStatus.State == WarpConnectionState.Error)
+                await RecoverWarpAfterFailureAsync(_warpStatus, _lifetime.Token);
+            else if (!connected)
+                await SetWarpBootstrapAsync(false, _lifetime.Token, telegramCompatibility: false);
+            await _settingsStore.SaveAsync(_settings, _lifetime.Token);
+            await LogToUiAsync(_warpStatus.State == WarpConnectionState.Error ? "error" : "ok", _warpStatus.Detail);
+        }
+        catch (Exception ex)
+        {
+            _warpStatus = _warpStatus with { State = WarpConnectionState.Error, Detail = ex.Message, Error = ex.Message, CheckedAt = DateTimeOffset.UtcNow };
+            _settings.Warp.LastError = ex.Message;
+            await RecoverWarpAfterFailureAsync(_warpStatus, _lifetime.Token);
+            await _settingsStore.SaveAsync(_settings, _lifetime.Token);
+            await LogToUiAsync("error", $"WARP: {ex.Message}");
+        }
+        finally
+        {
+            _warpTransitioning = false;
+            _nextHealthCheckUtc = DateTimeOffset.UtcNow.AddSeconds(12);
+            await PublishWarpStatusAsync();
+            UpdateTrayState(_protectionRequested);
+        }
+    }
+
+    private async Task RecoverWarpAfterFailureAsync(WarpStatus failure, CancellationToken cancellationToken)
+    {
+        // Disconnect first while the bootstrap route still exists. Removing
+        // winws before the daemon leaves Connecting can strand Cloudflare DNS/WFP
+        // filters and make the ordinary Internet appear offline.
+        var recovery = await _warpService.RecoverOrdinaryRouteAsync(cancellationToken);
+        try { await SetWarpBootstrapAsync(false, cancellationToken, telegramCompatibility: false); }
+        catch (Exception restoreError)
+        {
+            await LogToUiAsync("error", $"Не удалось восстановить исходные правила winws: {restoreError.Message}");
+            recovery = recovery with { Succeeded = false, Detail = $"{recovery.Detail} Исходные правила winws не восстановлены: {restoreError.Message}" };
+        }
+
+        _settings.Warp.RequestedConnected = false;
+        DnsOverrideService.InvalidateCache();
+        var original = failure.Error ?? failure.Detail;
+        _warpStatus = failure with
+        {
+            State = WarpConnectionState.Error,
+            Detail = recovery.Succeeded ? $"{original} Обычный интернет восстановлен." : $"{original} {recovery.Detail}",
+            Error = recovery.Succeeded ? $"{original} Обычный интернет восстановлен." : $"{original} {recovery.Detail}",
+            ServiceRunning = recovery.Status.ServiceRunning,
+            Registered = recovery.Status.Registered || failure.Registered,
+            Protocol = recovery.Status.Protocol ?? failure.Protocol,
+            CheckedAt = DateTimeOffset.UtcNow
+        };
+        await LogToUiAsync(recovery.Succeeded ? "warn" : "error", recovery.Detail);
+    }
+
+    private async Task RegisterWarpAsync()
+    {
+        if (_warpTransitioning) return;
+        var confirmation = System.Windows.MessageBox.Show(
+            "Будет создана бесплатная регистрация Consumer WARP. Продолжая, вы принимаете условия использования Cloudflare. VortexPass не сохраняет ID устройства, ключи или лицензию.",
+            "Регистрация Consumer WARP", MessageBoxButton.YesNo, MessageBoxImage.Information);
+        if (confirmation != MessageBoxResult.Yes) return;
+        _warpTransitioning = true;
+        _warpStatus = _warpStatus with { State = WarpConnectionState.Connecting, Detail = "Регистрация Consumer WARP", Progress = .08 };
+        await PublishWarpStatusAsync();
+        try
+        {
+            _warpStatus = await _warpService.RegisterConsumerAsync(_lifetime.Token);
+            if (!_warpStatus.Registered)
+            {
+                _warpService.OpenClient();
+                throw new InvalidOperationException("Эта версия WARP требует завершить первичную настройку в официальном клиенте.");
+            }
+            await LogToUiAsync("ok", "Бесплатная регистрация Consumer WARP готова.");
+        }
+        catch (Exception ex)
+        {
+            _warpStatus = _warpStatus with { State = WarpConnectionState.Error, Detail = ex.Message, Error = ex.Message, CheckedAt = DateTimeOffset.UtcNow };
+            await LogToUiAsync("error", $"Регистрация WARP: {ex.Message}");
+        }
+        finally
+        {
+            _warpTransitioning = false;
+            await PublishWarpStatusAsync();
+        }
+    }
+
+    private void CopyWarpDiagnostics()
+    {
+        try
+        {
+            System.Windows.Clipboard.SetText(WarpService.BuildSafeDiagnosticReport(_warpStatus, _warpDiagnostics, _warpBootstrap.IsActive));
+            _ = LogToUiAsync("ok", "Безопасная диагностика WARP скопирована без идентификаторов, ключей и лицензии.");
+        }
+        catch (Exception ex) { _ = LogToUiAsync("error", $"Не удалось скопировать диагностику WARP: {ex.Message}"); }
+    }
+
+    private async Task SetWarpBootstrapAsync(bool enabled, CancellationToken cancellationToken, bool? telegramCompatibility = null)
+    {
+        var targetCompatibility = telegramCompatibility ?? _warpTelegramCompatibilityActive;
+        if (enabled == _warpBootstrap.IsActive && targetCompatibility == _warpTelegramCompatibilityActive) return;
+        var profiles = _activeProfiles.AnyEnabled ? _activeProfiles : new BypassProfileSettings();
+        var protectionRunning = _components.GetStatuses().Any(status => status.Id == "dpi" && status.State == ServiceState.Running);
+
+        if (enabled)
+        {
+            await _warpBootstrap.StartAsync(WinwsProfileComposer.ComposeWarpBootstrap(), protectionRunning, cancellationToken);
+            _warpTelegramCompatibilityActive = targetCompatibility;
+            // Remove every VortexPass-owned CDN pin before Cloudflare changes
+            // route. The main protection process stays untouched and running.
+            await ApplyRuntimeHostsAsync(profiles, cancellationToken);
+        }
+        else
+        {
+            _warpTelegramCompatibilityActive = false;
+            await _warpBootstrap.StopAsync();
+            DnsOverrideService.InvalidateCache();
+            if (profiles.AnyEnabled)
+                await ApplyRuntimeHostsAsync(profiles, cancellationToken);
+            else
+                await _components.StopAllAsync(); // no main winws: remove the now-unused owned driver
+        }
+        await SendServiceSnapshotAsync();
+    }
+
+    private async Task RefreshWarpAsync(bool runDiagnostics)
+    {
+        if (_warpTransitioning) return;
+        try
+        {
+            _warpStatus = await _warpService.GetStatusAsync(_lifetime.Token);
+            // A user-requested diagnostic refresh is read-only: it must not restart
+            // winws or alter the active protection. Bootstrap reconciliation is
+            // reserved for background/startup status refreshes.
+            var telegramCompatibility = ShouldUseWarpForTelegram();
+            if (!runDiagnostics && _warpStatus.State == WarpConnectionState.Connected &&
+                (!_warpBootstrap.IsActive || _warpTelegramCompatibilityActive != telegramCompatibility))
+                await SetWarpBootstrapAsync(true, _lifetime.Token, telegramCompatibility: telegramCompatibility);
+            else if (!runDiagnostics && _warpStatus.State == WarpConnectionState.Disconnected && (_warpBootstrap.IsActive || _warpTelegramCompatibilityActive))
+                await SetWarpBootstrapAsync(false, _lifetime.Token, telegramCompatibility: false);
+            else if (!runDiagnostics && WarpService.NeedsEmergencyRecovery(_warpStatus.State, _settings.Warp.RequestedConnected, _warpBootstrap.IsActive))
+                await RecoverWarpAfterFailureAsync(_warpStatus, _lifetime.Token);
+            if (!runDiagnostics && _warpStatus.State == WarpConnectionState.Connected)
+            {
+                await ApplyWarpRoutingAsync(_lifetime.Token);
+                await EnsureTelegramSmartRouteAsync(_lifetime.Token);
+            }
+            else if (!runDiagnostics && _warpStatus.State == WarpConnectionState.Disconnected)
+                await StopWarpRoutingAsync(_lifetime.Token);
+            if (runDiagnostics && _warpStatus.State == WarpConnectionState.Connected)
+                _warpDiagnostics = await _warpService.DiagnoseAsync(
+                    _settings.Warp.Telegram,
+                    _settings.Warp.Games,
+                    _lifetime.Token,
+                    telegramProxyRunning: _telegramProxy.IsRunning,
+                    telegramProxyHasClientActivity: _telegramProxy.HasTelegramClientActivity,
+                    fullTelegramProbe: true,
+                    proxyUri: GetWarpProxyUri());
+            _settings.Warp.DetectedCliPath = _warpStatus.CliPath ?? string.Empty;
+            _settings.Warp.LastCheckedUtc = _warpStatus.CheckedAt;
+            _settings.Warp.LastError = _warpStatus.Error ?? string.Empty;
+            await _settingsStore.SaveAsync(_settings, _lifetime.Token);
+        }
+        catch (Exception ex)
+        {
+            _warpStatus = new(WarpConnectionState.Error, ex.Message, Error: ex.Message, CheckedAt: DateTimeOffset.UtcNow);
+        }
+        await PublishWarpStatusAsync();
+        UpdateTrayState(_protectionRequested);
+    }
+
+    private async Task InstallWarpAsync()
+    {
+        if (_warpTransitioning) return;
+        if (_warpService.Detect().CliPath is not null)
+        {
+            await RefreshWarpAsync(runDiagnostics: false);
+            return;
+        }
+        var confirmation = System.Windows.MessageBox.Show(
+            "VortexPass скачает официальный установщик Cloudflare WARP, проверит цифровую подпись Cloudflare и запустит штатную установку Windows. Продолжить?",
+            "Установка Cloudflare WARP", MessageBoxButton.YesNo, MessageBoxImage.Information);
+        if (confirmation != MessageBoxResult.Yes) return;
+
+        _warpTransitioning = true;
+        _warpStatus = new(WarpConnectionState.Connecting, "Скачивание официального установщика WARP");
+        await PublishWarpStatusAsync();
+        try
+        {
+            var progress = new Progress<double>(value => _ = PostUiAsync(new { type = "warp.progress", progress = value }));
+            var installer = await _warpService.DownloadInstallerAsync(progress, _lifetime.Token);
+            _warpStatus = _warpStatus with { Detail = "Ожидание завершения установки WARP" };
+            await PublishWarpStatusAsync();
+            var exitCode = await _warpService.InstallAsync(installer, _lifetime.Token);
+            if (exitCode != 0) throw new InvalidOperationException($"Установщик Cloudflare WARP завершился с кодом {exitCode}.");
+            _warpStatus = await _warpService.GetStatusAsync(_lifetime.Token);
+            await LogToUiAsync("ok", "Официальный Cloudflare WARP установлен. Подключение остаётся выключенным до команды пользователя.");
+        }
+        catch (Exception ex)
+        {
+            _warpStatus = new(WarpConnectionState.Error, ex.Message, Error: ex.Message, CheckedAt: DateTimeOffset.UtcNow);
+            await LogToUiAsync("error", $"Установка WARP: {ex.Message}");
+        }
+        finally
+        {
+            _warpTransitioning = false;
+            await PublishWarpStatusAsync();
+            UpdateTrayState(_protectionRequested);
+        }
+    }
+
+    private async Task SetWarpScenariosAsync(JsonElement root)
+    {
+        if (root.TryGetProperty("telegram", out var telegram) && telegram.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            _settings.Warp.Telegram = telegram.GetBoolean();
+        if (root.TryGetProperty("games", out var games) && games.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            _settings.Warp.Games = games.GetBoolean();
+        await _settingsStore.SaveAsync(_settings, _lifetime.Token);
+        await PublishWarpStatusAsync();
+    }
+
+    private async Task<WarpStatus> ApplyWarpClientPreferencesAsync(bool reconnect, CancellationToken cancellationToken)
+    {
+        var protocol = _settings.Warp.ProtocolPreference;
+        if (protocol == "auto")
+        {
+            protocol = _settings.Warp.NetworkOptimizations
+                .Where(item => item.NetworkKey == WarpService.GetNetworkFingerprint())
+                .OrderByDescending(item => item.CheckedAt)
+                .FirstOrDefault()?.SelectedProtocol?.ToLowerInvariant() ?? "masque";
+        }
+        var effectiveMode = GetEffectiveWarpRoutingMode();
+        var status = await _warpService.ApplyConfigurationAsync(new WarpClientConfiguration(
+            effectiveMode, protocol, _settings.Warp.MasquePreference,
+            _settings.Warp.DnsMode, _settings.Warp.ProxyPort), reconnect, cancellationToken);
+        _warpAppliedRoutingMode = effectiveMode;
+        return status;
+    }
+
+    private string GetEffectiveWarpRoutingMode()
+    {
+        if (_settings.Warp.RoutingMode != "smart") return _settings.Warp.RoutingMode;
+        var decisions = _settings.Warp.NetworkOptimizations
+            .Where(item => item.NetworkKey == WarpService.GetNetworkFingerprint()).OrderByDescending(item => item.CheckedAt)
+            .FirstOrDefault()?.RouteDecisions;
+        return _settings.Warp.RouteProfiles.Where(profile => profile.Enabled).Any(profile =>
+            profile.Connection == "warpSystem" || (profile.Connection == "auto" && decisions?.GetValueOrDefault(profile.Id) == "warpSystem"))
+            ? "full" : "smart";
+    }
+
+    private bool ShouldUseWarpForTelegram() => WarpRoutingPlanner.UsesWarpForBuiltIn(
+        _settings.Warp, WarpService.GetNetworkFingerprint(), "telegram");
+
+    private async Task EnsureTelegramSmartRouteAsync(CancellationToken cancellationToken)
+    {
+        if (_warpStatus.State != WarpConnectionState.Connected || GetEffectiveWarpRoutingMode() is not ("smart" or "proxy")) return;
+        var profile = _settings.Warp.RouteProfiles.FirstOrDefault(item => item.Enabled &&
+            item.BuiltInId.Equals("telegram", StringComparison.OrdinalIgnoreCase) && item.Connection == "auto");
+        if (profile is null) return;
+        var networkKey = WarpService.GetNetworkFingerprint();
+        var existing = _settings.Warp.NetworkOptimizations
+            .Where(item => item.NetworkKey == networkKey).OrderByDescending(item => item.CheckedAt).FirstOrDefault();
+        if (existing?.RouteDecisions.GetValueOrDefault(profile.Id) == "warpProxy") return;
+
+        var target = new Uri("https://web.telegram.org/");
+        var proxyUri = new Uri($"socks5://127.0.0.1:{_settings.Warp.ProxyPort}");
+        var directTask = _warpService.ProbeWebRouteAsync(target, null, cancellationToken);
+        var proxyTask = _warpService.ProbeWebRouteAsync(target, proxyUri, cancellationToken);
+        await Task.WhenAll(directTask, proxyTask);
+        var direct = directTask.Result;
+        var proxy = proxyTask.Result;
+        var selected = WarpRoutingPlanner.SelectMeasuredWebRoute(
+            direct.Available, direct.MedianLatencyMs, proxy.Available, proxy.MedianLatencyMs);
+        if (selected is null)
+        {
+            _telegramEmergencyHostsActive = true;
+            await ApplyRuntimeHostsAsync(_activeProfiles.AnyEnabled ? _activeProfiles : _settings.Profiles, cancellationToken);
+            await LogToUiAsync("warn", $"Telegram Web не ответил напрямую ({direct.Detail}) и через WARP proxy ({proxy.Detail}); включён аварийный подписанный маршрут Flowseal.");
+            return;
+        }
+
+        _telegramEmergencyHostsActive = false;
+
+        if (existing is null)
+        {
+            existing = new WarpNetworkOptimization
+            {
+                NetworkKey = networkKey,
+                SelectedProtocol = _warpStatus.Protocol?.Contains("WireGuard", StringComparison.OrdinalIgnoreCase) == true ? "WireGuard" : "MASQUE"
+            };
+            _settings.Warp.NetworkOptimizations.Add(existing);
+        }
+        existing.RouteDecisions[profile.Id] = selected;
+        existing.CheckedAt = DateTimeOffset.UtcNow;
+        existing.Reason = selected == "warpProxy"
+            ? $"Telegram Web: прямой маршрут не ответил ({direct.Detail}), выбран WARP proxy ({proxy.MedianLatencyMs} мс)."
+            : $"Telegram Web: прямой маршрут подтверждён ({direct.MedianLatencyMs} мс), WARP proxy — {proxy.MedianLatencyMs?.ToString() ?? "нет ответа"} мс.";
+        await _settingsStore.SaveAsync(_settings, cancellationToken);
+        if (selected == "warpProxy")
+        {
+            await ApplyWarpRoutingAsync(cancellationToken);
+            await LogToUiAsync("ok", $"Telegram Web автоматически направлен через локальный WARP proxy ({proxy.MedianLatencyMs} мс); остальные профили не изменены.");
+        }
+        else
+        {
+            await LogToUiAsync("info", existing.Reason);
+        }
+    }
+
+    private Uri? GetWarpProxyUri() =>
+        _warpStatus.State == WarpConnectionState.Connected && GetEffectiveWarpRoutingMode() is "smart" or "proxy"
+            ? new Uri($"socks5://127.0.0.1:{_settings.Warp.ProxyPort}") : null;
+
+    private async Task ApplyWarpRoutingAsync(CancellationToken cancellationToken)
+    {
+        var plan = WarpRoutingPlanner.BuildPlan(_settings.Warp, WarpService.GetNetworkFingerprint());
+        if (plan.Conflicts.Count > 0)
+            throw new InvalidOperationException($"Конфликт WARP-профилей: {string.Join("; ", plan.Conflicts)}");
+        foreach (var warning in plan.Warnings) await LogToUiAsync("warn", warning);
+        var effectiveMode = GetEffectiveWarpRoutingMode();
+        var telegramCompatibility = ShouldUseWarpForTelegram();
+        if (_warpStatus.State == WarpConnectionState.Connected && _warpTelegramCompatibilityActive != telegramCompatibility)
+            await SetWarpBootstrapAsync(true, cancellationToken, telegramCompatibility);
+        var localProxy = effectiveMode is "smart" or "proxy";
+        if (localProxy && plan.ProxyDomains.Count > 0)
+        {
+            var pacUri = await _warpPac.StartAsync(plan.ProxyDomains, _settings.Warp.ProxyPort, _settings.Warp.ProxyPort + 1, cancellationToken);
+            _proxyManager.ApplyPac(pacUri);
+            await LogToUiAsync("ok", $"Умный WARP: {plan.ProxyDomains.Count} доменных зон направлены через локальный SOCKS5; остальной Web-трафик — DIRECT.");
+        }
+        else
+        {
+            await _warpPac.StopAsync();
+            RestoreProxyUnlessWarpPacActive();
+        }
+
+        var fullTunnel = effectiveMode == "full";
+        var owned = await _warpService.SyncSplitTunnelExclusionsAsync(
+            fullTunnel ? plan.DirectDomains : [], fullTunnel ? plan.DirectIpRanges : [],
+            _settings.Warp.OwnedSplitTunnelHosts, _settings.Warp.OwnedSplitTunnelIps, cancellationToken);
+        _settings.Warp.OwnedSplitTunnelHosts = owned.Hosts.ToList();
+        _settings.Warp.OwnedSplitTunnelIps = owned.Ips.ToList();
+        await _settingsStore.SaveAsync(_settings, cancellationToken);
+    }
+
+    private async Task StopWarpRoutingAsync(CancellationToken cancellationToken)
+    {
+        await _warpPac.StopAsync();
+        _proxyManager.RestoreIfOwned();
+        if (_settings.Warp.OwnedSplitTunnelHosts.Count > 0 || _settings.Warp.OwnedSplitTunnelIps.Count > 0)
+        {
+            var owned = await _warpService.SyncSplitTunnelExclusionsAsync([], [], _settings.Warp.OwnedSplitTunnelHosts, _settings.Warp.OwnedSplitTunnelIps, cancellationToken);
+            _settings.Warp.OwnedSplitTunnelHosts = owned.Hosts.ToList();
+            _settings.Warp.OwnedSplitTunnelIps = owned.Ips.ToList();
+        }
+    }
+
+    private void RestoreProxyUnlessWarpPacActive()
+    {
+        if (_warpPac.PacUri is null) _proxyManager.RestoreIfOwned();
+    }
+
+    private async Task UpdateWarpSettingsAsync(JsonElement root)
+    {
+        var previous = (_settings.Warp.RoutingMode, _settings.Warp.ProtocolPreference, _settings.Warp.MasquePreference, _settings.Warp.DnsMode, _settings.Warp.ProxyPort);
+        if (root.TryGetProperty("routingMode", out var routing)) _settings.Warp.RoutingMode = WarpRoutingPlanner.NormalizeRoutingMode(routing.GetString());
+        if (root.TryGetProperty("protocol", out var protocol)) _settings.Warp.ProtocolPreference = WarpRoutingPlanner.NormalizeProtocol(protocol.GetString());
+        if (root.TryGetProperty("masque", out var masque)) _settings.Warp.MasquePreference = WarpRoutingPlanner.NormalizeMasque(masque.GetString());
+        if (root.TryGetProperty("dnsMode", out var dnsMode)) _settings.Warp.DnsMode = WarpRoutingPlanner.NormalizeDnsMode(dnsMode.GetString());
+        if (root.TryGetProperty("proxyPort", out var port) && port.TryGetInt32(out var parsedPort)) _settings.Warp.ProxyPort = Math.Clamp(parsedPort, 1024, 65535);
+        await _settingsStore.SaveAsync(_settings, _lifetime.Token);
+        if (_warpStatus.State == WarpConnectionState.Connected)
+        {
+            _warpTransitioning = true;
+            try
+            {
+                _warpStatus = await ApplyWarpClientPreferencesAsync(reconnect: true, _lifetime.Token);
+                await ApplyWarpRoutingAsync(_lifetime.Token);
+            }
+            catch (Exception ex)
+            {
+                (_settings.Warp.RoutingMode, _settings.Warp.ProtocolPreference, _settings.Warp.MasquePreference, _settings.Warp.DnsMode, _settings.Warp.ProxyPort) = previous;
+                await _settingsStore.SaveAsync(_settings, _lifetime.Token);
+                await LogToUiAsync("error", $"Настройка WARP не применена и отменена: {ex.Message}");
+                try
+                {
+                    _warpStatus = await ApplyWarpClientPreferencesAsync(reconnect: true, _lifetime.Token);
+                    await ApplyWarpRoutingAsync(_lifetime.Token);
+                }
+                catch { }
+            }
+            finally { _warpTransitioning = false; }
+        }
+        await PublishWarpStatusAsync();
+    }
+
+    private async Task UpsertWarpProfileAsync(JsonElement root)
+    {
+        if (!root.TryGetProperty("profile", out var value) || value.ValueKind != JsonValueKind.Object) return;
+        var id = value.TryGetProperty("id", out var idValue) ? idValue.GetString() : null;
+        var existing = _settings.Warp.RouteProfiles.FirstOrDefault(profile => profile.Id == id);
+        existing ??= new WarpRouteProfile { Id = Guid.NewGuid().ToString("N") };
+        if (!_settings.Warp.RouteProfiles.Contains(existing)) _settings.Warp.RouteProfiles.Add(existing);
+        if (string.IsNullOrEmpty(existing.BuiltInId))
+        {
+            existing.Name = value.TryGetProperty("name", out var name) ? (name.GetString() ?? "Новый профиль").Trim() : existing.Name;
+            existing.Kind = value.TryGetProperty("kind", out var kind) && kind.GetString() == "game" ? "game" : "site";
+            existing.ExecutablePath = value.TryGetProperty("executablePath", out var executable) ? executable.GetString() ?? string.Empty : existing.ExecutablePath;
+            existing.Domains = ReadStringArray(value, "domains").Select(WarpRoutingPlanner.NormalizeDomain).Where(item => item is not null).Cast<string>().Distinct().ToList();
+            existing.IpRanges = ReadStringArray(value, "ipRanges").Where(WarpRoutingPlanner.IsIpOrCidr).Distinct().ToList();
+        }
+        existing.Connection = WarpRoutingPlanner.NormalizeConnection(value.TryGetProperty("connection", out var connection) ? connection.GetString() : existing.Connection);
+        if (existing.Kind == "game" && existing.Connection == "warpProxy") existing.Connection = "direct";
+        await SaveAndApplyWarpProfilesAsync();
+    }
+
+    private async Task DeleteWarpProfileAsync(JsonElement root)
+    {
+        var id = root.TryGetProperty("id", out var value) ? value.GetString() : null;
+        _settings.Warp.RouteProfiles.RemoveAll(profile => profile.Id == id && string.IsNullOrEmpty(profile.BuiltInId));
+        await SaveAndApplyWarpProfilesAsync();
+    }
+
+    private async Task ToggleWarpProfileAsync(JsonElement root)
+    {
+        var id = root.TryGetProperty("id", out var value) ? value.GetString() : null;
+        var profile = _settings.Warp.RouteProfiles.FirstOrDefault(item => item.Id == id);
+        if (profile is not null) profile.Enabled = root.TryGetProperty("value", out var enabled) && enabled.ValueKind == JsonValueKind.True;
+        await SaveAndApplyWarpProfilesAsync();
+    }
+
+    private async Task SaveAndApplyWarpProfilesAsync()
+    {
+        await _settingsStore.SaveAsync(_settings, _lifetime.Token);
+        try
+        {
+            if (_warpStatus.State == WarpConnectionState.Connected)
+            {
+                if (_warpAppliedRoutingMode != GetEffectiveWarpRoutingMode())
+                    _warpStatus = await ApplyWarpClientPreferencesAsync(reconnect: true, _lifetime.Token);
+                await ApplyWarpRoutingAsync(_lifetime.Token);
+            }
+        }
+        catch (Exception ex) { await LogToUiAsync("error", ex.Message); }
+        await PublishWarpStatusAsync();
+    }
+
+    private static IEnumerable<string> ReadStringArray(JsonElement root, string property) =>
+        root.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.Array
+            ? value.EnumerateArray().Where(item => item.ValueKind == JsonValueKind.String).Select(item => item.GetString() ?? string.Empty)
+            : [];
+
+    private async Task RefreshWarpPerformanceAsync()
+    {
+        if (_warpTransitioning) return;
+        try
+        {
+            _warpStatus = await _warpService.GetStatusAsync(_lifetime.Token);
+            var connected = _warpStatus.State == WarpConnectionState.Connected;
+            _warpPerformance = await _warpService.MeasurePerformanceAsync(connected, _lifetime.Token, proxyUri: GetWarpProxyUri());
+            if (!connected)
+            {
+                _settings.Warp.PerformanceBaseline = new WarpPerformanceBaseline
+                {
+                    NetworkKey = _warpPerformance.NetworkKey,
+                    CheckedAt = _warpPerformance.CheckedAt,
+                    MedianLatencyMs = _warpPerformance.Endpoints
+                        .Where(item => item.Value.Available && item.Value.MedianLatencyMs.HasValue)
+                        .ToDictionary(item => item.Key, item => item.Value.MedianLatencyMs!.Value, StringComparer.OrdinalIgnoreCase),
+                    JitterMs = _warpPerformance.Endpoints
+                        .Where(item => item.Value.Available && item.Value.JitterMs.HasValue)
+                        .ToDictionary(item => item.Key, item => item.Value.JitterMs!.Value, StringComparer.OrdinalIgnoreCase)
+                };
+                _warpPerformanceComparison = new(WarpPerformanceVerdict.BaselineSaved, "Прямой baseline сохранён для текущей сети.");
+                await _settingsStore.SaveAsync(_settings, _lifetime.Token);
+            }
+            else
+            {
+                var baseline = _settings.Warp.PerformanceBaseline;
+                _warpPerformanceComparison = baseline is not null && baseline.NetworkKey == _warpPerformance.NetworkKey
+                    ? WarpService.ComparePerformance(_warpPerformance.Endpoints, baseline.MedianLatencyMs)
+                    : new(WarpPerformanceVerdict.BaselineUnavailable, "Для этой сети нет прямого baseline. Отключите WARP и выполните проверку один раз.");
+            }
+            await LogToUiAsync("info", $"WARP производительность: {_warpPerformanceComparison.Detail}");
+        }
+        catch (Exception ex)
+        {
+            await LogToUiAsync("error", $"WARP производительность: {ex.Message}");
+        }
+        finally
+        {
+            await PublishWarpStatusAsync();
+        }
+    }
+
+    private async Task OptimizeWarpAsync()
+    {
+        if (_warpTransitioning) return;
+        _warpTransitioning = true;
+        ResetHealthChecksAfterRouteChange();
+        var initiallyConnected = _warpStatus.State == WarpConnectionState.Connected;
+        var networkKey = WarpService.GetNetworkFingerprint();
+        try
+        {
+            await SetWarpBootstrapAsync(true, _lifetime.Token);
+            var customEndpoints = _settings.Warp.RouteProfiles
+                .Where(profile => profile.Enabled && string.IsNullOrEmpty(profile.BuiltInId))
+                .Select(profile => (profile.Id, Domain: profile.Domains.Select(WarpRoutingPlanner.NormalizeDomain).FirstOrDefault(domain => domain is not null)))
+                .Where(item => item.Domain is not null)
+                .ToDictionary(item => item.Id, item => new Uri($"https://{item.Domain}/"));
+            var measurements = new Dictionary<string, WarpPerformanceResult>(StringComparer.OrdinalIgnoreCase);
+            foreach (var protocol in new[] { "masque", "wireguard" })
+            {
+                _warpStatus = _warpStatus with { State = WarpConnectionState.Connecting, Detail = $"Проверка {protocol.ToUpperInvariant()}" };
+                await PublishWarpStatusAsync();
+                _warpStatus = await _warpService.ApplyConfigurationAsync(new WarpClientConfiguration(
+                    GetEffectiveWarpRoutingMode(), protocol, _settings.Warp.MasquePreference, _settings.Warp.DnsMode, _settings.Warp.ProxyPort), reconnect: true, _lifetime.Token);
+                measurements[protocol] = await _warpService.MeasurePerformanceAsync(true, _lifetime.Token, customEndpoints, GetWarpProxyUri());
+            }
+            var medians = measurements.ToDictionary(item => item.Key,
+                item => (long)Math.Round(item.Value.Endpoints.Values.Where(endpoint => endpoint.Available && endpoint.MedianLatencyMs.HasValue)
+                    .Select(endpoint => endpoint.MedianLatencyMs!.Value).DefaultIfEmpty(long.MaxValue / 4).Average()), StringComparer.OrdinalIgnoreCase);
+            var selected = WarpService.SelectFastestProtocol(medians).ToLowerInvariant();
+            var selectedMeasurement = measurements[selected];
+            var baseline = _settings.Warp.PerformanceBaseline?.NetworkKey == networkKey ? _settings.Warp.PerformanceBaseline.MedianLatencyMs : null;
+            var decisions = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var profile in _settings.Warp.RouteProfiles.Where(profile => profile.Enabled && profile.Connection == "auto"))
+            {
+                var endpointKey = profile.BuiltInId switch { "youtube" => "youtube", "discord" => "discord", "telegram" => "telegram", _ => profile.Id };
+                var useWarp = baseline is not null && baseline.TryGetValue(endpointKey, out var direct) &&
+                    selectedMeasurement.Endpoints.TryGetValue(endpointKey, out var warp) && warp.MedianLatencyMs.HasValue &&
+                    warp.MedianLatencyMs.Value < direct + Math.Max(20, direct / 4);
+                decisions[profile.Id] = useWarp ? (profile.Kind == "game" ? "warpSystem" : "warpProxy") : "direct";
+            }
+            _settings.Warp.NetworkOptimizations.RemoveAll(item => item.NetworkKey == networkKey);
+            _settings.Warp.NetworkOptimizations.Add(new WarpNetworkOptimization
+            {
+                NetworkKey = networkKey, SelectedProtocol = selected.Equals("wireguard", StringComparison.OrdinalIgnoreCase) ? "WireGuard" : "MASQUE",
+                Reason = $"{selected.ToUpperInvariant()} показал минимальную медианную задержку ({medians[selected]} мс).",
+                CheckedAt = DateTimeOffset.UtcNow, RouteDecisions = decisions, ProtocolMedianMs = medians
+            });
+            _settings.Warp.NetworkOptimizations = _settings.Warp.NetworkOptimizations.OrderByDescending(item => item.CheckedAt).Take(12).ToList();
+            await _settingsStore.SaveAsync(_settings, _lifetime.Token);
+            _warpStatus = await _warpService.ApplyConfigurationAsync(new WarpClientConfiguration(
+                GetEffectiveWarpRoutingMode(), selected, _settings.Warp.MasquePreference, _settings.Warp.DnsMode, _settings.Warp.ProxyPort), initiallyConnected, _lifetime.Token);
+            if (initiallyConnected) await ApplyWarpRoutingAsync(_lifetime.Token);
+            else
+            {
+                _warpStatus = await _warpService.SetConnectedAsync(false, _lifetime.Token);
+                await SetWarpBootstrapAsync(false, _lifetime.Token, false);
+            }
+            await LogToUiAsync("ok", $"Автооптимизация WARP: {_settings.Warp.NetworkOptimizations.First(item => item.NetworkKey == networkKey).Reason}");
+        }
+        catch (Exception ex)
+        {
+            await LogToUiAsync("error", $"Автооптимизация WARP остановлена с безопасным откатом: {ex.Message}");
+            try
+            {
+                if (initiallyConnected)
+                {
+                    _warpStatus = await ApplyWarpClientPreferencesAsync(reconnect: true, _lifetime.Token);
+                    await ApplyWarpRoutingAsync(_lifetime.Token);
+                }
+                else
+                {
+                    _warpStatus = await _warpService.SetConnectedAsync(false, _lifetime.Token);
+                    await SetWarpBootstrapAsync(false, _lifetime.Token, false);
+                }
+            }
+            catch { _warpStatus = await _warpService.GetStatusAsync(_lifetime.Token); }
+        }
+        finally
+        {
+            _warpTransitioning = false;
+            await PublishWarpStatusAsync();
+        }
+    }
+
+    private Task PublishWarpStatusAsync() => PostUiAsync(new
+    {
+        type = "warp.status",
+        state = WarpStateName(_warpStatus.State),
+        installed = _warpStatus.CliPath is not null,
+        connected = _warpStatus.State == WarpConnectionState.Connected,
+        pending = _warpTransitioning,
+        detail = _warpStatus.Detail,
+        error = _warpStatus.Error,
+        version = _warpStatus.Version,
+        cliPath = _warpStatus.CliPath,
+        checkedAt = _warpStatus.CheckedAt,
+        stage = _warpStatus.Stage,
+        progress = _warpStatus.Progress,
+        registered = _warpStatus.Registered,
+        serviceRunning = _warpStatus.ServiceRunning,
+        protocol = _warpStatus.Protocol,
+        routingMode = _settings.Warp.RoutingMode,
+        effectiveRoutingMode = GetEffectiveWarpRoutingMode(),
+        protocolPreference = _settings.Warp.ProtocolPreference,
+        masquePreference = _settings.Warp.MasquePreference,
+        dnsMode = _settings.Warp.DnsMode,
+        proxyPort = _settings.Warp.ProxyPort,
+        profiles = _settings.Warp.RouteProfiles.Select(profile => new
+        {
+            id = profile.Id, name = profile.Name, kind = profile.Kind, builtInId = profile.BuiltInId,
+            enabled = profile.Enabled, connection = profile.Connection, domains = profile.Domains,
+            ipRanges = profile.IpRanges, executablePath = profile.ExecutablePath
+        }),
+        optimization = _settings.Warp.NetworkOptimizations
+            .Where(item => item.NetworkKey == WarpService.GetNetworkFingerprint())
+            .OrderByDescending(item => item.CheckedAt).FirstOrDefault(),
+        routingConflicts = WarpRoutingPlanner.BuildPlan(_settings.Warp, WarpService.GetNetworkFingerprint()).Conflicts,
+        routingWarnings = WarpRoutingPlanner.BuildPlan(_settings.Warp, WarpService.GetNetworkFingerprint()).Warnings,
+        bootstrapActive = _warpBootstrap.IsActive,
+        telegramCompatibilityActive = _warpTelegramCompatibilityActive,
+        scenarios = new { telegram = _settings.Warp.Telegram, games = _settings.Warp.Games },
+        performance = _warpPerformance is null ? null : new
+        {
+            warpConnected = _warpPerformance.WarpConnected,
+            checkedAt = _warpPerformance.CheckedAt,
+            summary = _warpPerformance.Summary,
+            verdict = _warpPerformanceComparison?.Verdict.ToString(),
+            recommendation = _warpPerformanceComparison?.Detail,
+            endpoints = _warpPerformance.Endpoints.ToDictionary(endpoint => endpoint.Key, endpoint => new
+            {
+                label = endpoint.Value.Label,
+                available = endpoint.Value.Available,
+                medianLatencyMs = endpoint.Value.MedianLatencyMs,
+                jitterMs = endpoint.Value.JitterMs,
+                detail = endpoint.Value.Detail
+            })
+        },
+        diagnostics = _warpDiagnostics is null ? null : new
+        {
+            routeActive = _warpDiagnostics.WarpRouteActive,
+            dnsAvailable = _warpDiagnostics.DnsAvailable,
+            latencyMs = _warpDiagnostics.LatencyMs,
+            externalIp = _warpDiagnostics.ExternalIp,
+            coloCode = _warpDiagnostics.ColoCode,
+            traceLocationCode = _warpDiagnostics.TraceLocationCode,
+            pop = _warpDiagnostics.PopLocation is null ? null : new
+            {
+                code = _warpDiagnostics.PopLocation.Code,
+                city = _warpDiagnostics.PopLocation.City,
+                country = _warpDiagnostics.PopLocation.Country,
+                status = _warpDiagnostics.PopLocation.Status,
+                displayName = _warpDiagnostics.PopLocation.DisplayName
+            },
+            detail = _warpDiagnostics.Detail,
+            checkedAt = _warpDiagnostics.CheckedAt,
+            scenarios = _warpDiagnostics.Scenarios,
+            scenarioDetails = _warpDiagnostics.ScenarioDetails?.ToDictionary(
+                scenario => scenario.Key,
+                scenario => new
+                {
+                    state = WarpProbeStateName(scenario.Value.State),
+                    summary = scenario.Value.Summary,
+                    endpoints = scenario.Value.Endpoints.ToDictionary(
+                        endpoint => endpoint.Key,
+                        endpoint => new
+                        {
+                            label = endpoint.Value.Label,
+                            state = WarpProbeStateName(endpoint.Value.State),
+                            detail = endpoint.Value.Detail,
+                            httpStatus = endpoint.Value.HttpStatus,
+                            latencyMs = endpoint.Value.LatencyMs
+                        })
+                })
+        }
+    });
+
+    private static string WarpProbeStateName(WarpProbeState state) => state switch
+    {
+        WarpProbeState.Available => "available",
+        WarpProbeState.Restricted => "restricted",
+        WarpProbeState.Partial => "partial",
+        WarpProbeState.ServiceError => "serviceError",
+        WarpProbeState.TimedOut => "timedOut",
+        WarpProbeState.RouteUnconfirmed => "routeUnconfirmed",
+        WarpProbeState.AvailabilityUnknown => "availabilityUnknown",
+        WarpProbeState.RegionRestricted => "regionRestricted",
+        _ => "unavailable"
+    };
+
+    private static string WarpStateName(WarpConnectionState state) => state switch
+    {
+        WarpConnectionState.NotInstalled => "notInstalled",
+        WarpConnectionState.Disconnected => "disconnected",
+        WarpConnectionState.Connecting => "connecting",
+        WarpConnectionState.Connected => "connected",
+        _ => "error"
+    };
 
     private async Task SetProtectionAsync(bool enabled)
     {
@@ -459,6 +1306,16 @@ public partial class MainWindow : Window
         try { _healthCheckCts.Cancel(); }
         catch (ObjectDisposedException) { }
         Interlocked.Increment(ref _healthGeneration);
+    }
+
+    private void ResetHealthChecksAfterRouteChange()
+    {
+        try { _healthCheckCts.Cancel(); }
+        catch (ObjectDisposedException) { }
+        _healthCheckCts.Dispose();
+        _healthCheckCts = new CancellationTokenSource();
+        Interlocked.Increment(ref _healthGeneration);
+        _healthFailureStreaks.Clear();
     }
 
     private async Task ConfigureTelegramProxyAsync()
@@ -519,6 +1376,7 @@ public partial class MainWindow : Window
         var savedTuning = WinwsProfileComposer.NormalizeTuning(_settings.BypassTuning);
         var wasRunning = _activeProfiles.AnyEnabled && _components.GetStatuses().Any(x => x.Id == "dpi" && x.State == ServiceState.Running);
         var candidates = new List<AdvisorCandidate>();
+        AdvisorCandidate? selectedCandidate = null;
         ProviderInfo? provider = null;
         try
         {
@@ -572,7 +1430,7 @@ public partial class MainWindow : Window
                                 true,
                                 timeout.Token,
                                 appSelected: id == "telegram" && _settings.Profiles.Telegram,
-                                webSelected: id == "telegram" && _settings.Profiles.Web,
+                                webSelected: id == "telegram" && _settings.Profiles.TelegramWeb,
                                 telegramProxyRunning: id == "telegram" && _telegramProxy.IsRunning));
                         results.AddRange(await Task.WhenAll(checks));
                     }
@@ -611,9 +1469,12 @@ public partial class MainWindow : Window
                 score = item.Score,
                 source = item.Source
             }).ToArray();
+            selectedCandidate = candidates.OrderByDescending(item => item.Score).FirstOrDefault();
             UpdateAdvisorHistory(provider, candidates);
             await PostUiAsync(new { type = "advisor.status", state = "complete", provider = provider?.DisplayName, candidates = best });
-            await LogToUiAsync("ok", $"Автоматический подбор завершён{(provider is null ? "" : $" для {provider.DisplayName}")}. Выберите один из предложенных уровней вручную.");
+            await LogToUiAsync("ok", selectedCandidate is null
+                ? "Автоматический подбор завершён без подходящей стратегии."
+                : $"Автоматический подбор выбрал «{selectedCandidate.Label}»{(provider is null ? "" : $" для {provider.DisplayName}")}.");
         }
         catch (OperationCanceledException) when (advisorToken.IsCancellationRequested && !_lifetime.IsCancellationRequested)
         {
@@ -628,10 +1489,20 @@ public partial class MainWindow : Window
         }
         finally
         {
-            _settings.BypassLevel = savedLevel;
-            _settings.BypassTuning = savedTuning;
+            var activateBest = selectedCandidate is not null && !_advisorStopProtectionRequested;
+            _settings.BypassLevel = activateBest ? selectedCandidate!.Level : savedLevel;
+            _settings.BypassTuning = activateBest ? selectedCandidate!.Tuning : savedTuning;
             await _settingsStore.SaveAsync(_settings, CancellationToken.None);
-            if (!_shutdownStarted && wasRunning && !_advisorStopProtectionRequested)
+            if (!_shutdownStarted && activateBest)
+            {
+                try
+                {
+                    await ApplyProfilesAsync();
+                    await RememberSuccessfulStrategyAsync();
+                }
+                catch (Exception ex) { await LogToUiAsync("error", $"Не удалось запустить выбранный автоподбором профиль: {ex.Message}"); }
+            }
+            else if (!_shutdownStarted && wasRunning && !_advisorStopProtectionRequested)
             {
                 try { await ApplyProfilesAsync(); }
                 catch (Exception ex) { await LogToUiAsync("error", $"Не удалось восстановить прежний профиль после диагностики: {ex.Message}"); }
@@ -725,7 +1596,7 @@ public partial class MainWindow : Window
     {
         if (_settings.Profiles.YouTube || _settings.Profiles.Web) yield return "youtube";
         if (_settings.Profiles.Discord || _settings.Profiles.Web) yield return "discord";
-        if (_settings.Profiles.Telegram) yield return "telegram";
+        if (_settings.Profiles.Telegram || _settings.Profiles.TelegramWeb) yield return "telegram";
         if (_settings.Profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("roblox", StringComparison.OrdinalIgnoreCase))) yield return "roblox";
         if (_settings.Profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("phasmophobia", StringComparison.OrdinalIgnoreCase))) yield return "phasmophobia";
     }
@@ -822,10 +1693,10 @@ public partial class MainWindow : Window
             _protectionTransitioning = true;
             _protectionRequested = false;
             await SendServiceSnapshotAsync();
-            await _components.StopAllAsync();
+            await _components.StopAllAsync(cleanupDriver: !_warpBootstrap.IsActive);
             await _telegramProxy.StopAsync();
             await RestoreHostsCoreAsync();
-            _proxyManager.RestoreIfOwned();
+            RestoreProxyUnlessWarpPacActive();
             _activeProfiles = new BypassProfileSettings();
             _protectionStarted = null;
             await LogToUiAsync("warn", "Защита остановлена. Выбранные профили сохранены.");
@@ -845,6 +1716,7 @@ public partial class MainWindow : Window
             case "youtube": _settings.Profiles.YouTube = enabled; break;
             case "discord": _settings.Profiles.Discord = enabled; break;
             case "telegram": _settings.Profiles.Telegram = enabled; break;
+            case "telegramweb": _settings.Profiles.TelegramWeb = enabled; break;
             case "web": _settings.Profiles.Web = enabled; break;
             case "gamefilter": _settings.Profiles.GameFilter = enabled; break;
             default: throw new ArgumentException($"Неизвестный профиль: {id}");
@@ -1014,10 +1886,12 @@ public partial class MainWindow : Window
                     _settings.GameFilter,
                     runtimeLists.BypassPath,
                     runtimeLists.ExclusionPath,
-                    _settings.BypassTuning);
+                    _settings.BypassTuning,
+                    includeWarpBootstrap: false,
+                    warpCompatibilityMode: false);
                 await LogToUiAsync("info", $"Применение уровня {LevelDisplayName(_settings.BypassLevel)} · {TuningDisplayName(_settings.BypassTuning)}. Сервисы: {string.Join(", ", ActiveProfileNames())}.");
                 await LogToUiAsync("info", $"Пользовательские списки: обход — {runtimeLists.BypassCount}, исключения — {runtimeLists.ExclusionCount}.");
-                await _components.StopAllAsync();
+                await _components.StopAllAsync(cleanupDriver: !_warpBootstrap.IsActive);
                 await _telegramProxy.StopAsync();
                 _components.SetArguments("dpi", arguments);
                 await PostUiAsync(new { type = "log", level = "info", message = "Запуск компонентов обхода…" });
@@ -1026,7 +1900,7 @@ public partial class MainWindow : Window
                 timeout.CancelAfter(TimeSpan.FromSeconds(15));
                 try
                 {
-                    await _components.StartAllAsync(timeout.Token);
+                    await _components.StartAllAsync(timeout.Token, reuseExistingOwnedDriver: _warpBootstrap.IsActive);
                 }
                 catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested)
                 {
@@ -1044,9 +1918,9 @@ public partial class MainWindow : Window
                     ?? _serviceStatuses.Values.FirstOrDefault(x => x.State == ServiceState.Error);
                 if (failed is not null || !componentStatuses.Any(x => x.State == ServiceState.Running))
                 {
-                    await _components.StopAllAsync();
+                    await _components.StopAllAsync(cleanupDriver: !_warpBootstrap.IsActive);
                     await RestoreHostsCoreAsync();
-                    _proxyManager.RestoreIfOwned();
+                    RestoreProxyUnlessWarpPacActive();
                     _activeProfiles = new BypassProfileSettings();
                     _protectionRequested = false;
                     _protectionStarted = null;
@@ -1080,40 +1954,25 @@ public partial class MainWindow : Window
                     {
                         await _telegramProxy.StopAsync();
                     }
-                    var hostsOverrides = await CreateHostsOverridesAsync(_activeProfiles, operationToken);
-                    if (RequiresHosts(_activeProfiles) || hostsOverrides.Count != 0)
-                    {
-                        try
-                        {
-                            _hostsStatus = await _hostsManager.ApplyAsync(hostsOverrides, operationToken);
-                            var overrideDetail = hostsOverrides.Count == 0 ? string.Empty : $"; временных DNS-записей: {hostsOverrides.Count}";
-                            var hostsDetail = string.IsNullOrWhiteSpace(_hostsStatus.Detail) ? string.Empty : $"; {_hostsStatus.Detail}";
-                            await LogToUiAsync("ok", $"Системный hosts применён: {_hostsStatus.EntryCount} записей, источник Flowseal {WinwsProfileComposer.FlowsealCommit[..7]}{overrideDetail}{hostsDetail}.");
-                        }
-                        catch (Exception ex)
-                        {
-                            _hostsStatus = _hostsManager.GetStatus();
-                            await LogToUiAsync("error", $"winws запущен, но hosts не применён: {ex.Message}");
-                        }
-                    }
-                    else
-                    {
-                        await RestoreHostsCoreAsync();
-                    }
-                    _nextHealthCheckUtc = DateTimeOffset.UtcNow.AddSeconds(20);
                     await PostUiAsync(new { type = "log", level = "ok", message = $"Профили активны: {string.Join(", ", ActiveProfileNames())}." });
+                    // winws and the optional Desktop proxy are already usable here.
+                    // Do not make the UI look stuck on "Telegram WS Proxy" while
+                    // temporary Telegram/Roblox DNS entries are being prepared.
+                    await SendServiceSnapshotAsync();
+                    await ApplyRuntimeHostsAsync(_activeProfiles, operationToken);
+                    _nextHealthCheckUtc = DateTimeOffset.UtcNow.AddSeconds(30);
                     if (_activeProfiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("phasmophobia", StringComparison.OrdinalIgnoreCase)))
                         await LogToUiAsync("info", "Phasmophobia: игровой UDP оставлен прямым для стабильности сессии; VortexPass обрабатывает только домены Photon/Unity/Vivox/Steam.");
-                    
+
                     _ = RunHealthChecksGuardedAsync(CancellationToken.None);
                 }
             }
             else
             {
-                await _components.StopAllAsync();
+                await _components.StopAllAsync(cleanupDriver: !_warpBootstrap.IsActive);
                 await _telegramProxy.StopAsync();
                 await RestoreHostsCoreAsync();
-                _proxyManager.RestoreIfOwned();
+                RestoreProxyUnlessWarpPacActive();
                 _activeProfiles = new BypassProfileSettings();
                 _protectionStarted = null;
                 await PostUiAsync(new { type = "log", level = "warn", message = "Все профили выключены. Сетевые настройки восстановлены." });
@@ -1136,6 +1995,7 @@ public partial class MainWindow : Window
         if (_settings.Profiles.YouTube) yield return "YouTube";
         if (_settings.Profiles.Discord) yield return "Discord";
         if (_settings.Profiles.Telegram) yield return "Telegram";
+        if (_settings.Profiles.TelegramWeb) yield return "Telegram Web";
         if (_settings.Profiles.Web) yield return "Web";
         if (_settings.Profiles.GameFilter) yield return $"Game Filter ({_settings.GameFilter.Protocol.ToUpperInvariant()})";
         if (_settings.Profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("phasmophobia", StringComparison.OrdinalIgnoreCase)))
@@ -1145,8 +2005,15 @@ public partial class MainWindow : Window
     private async Task<IReadOnlyList<HostsOverride>> CreateHostsOverridesAsync(BypassProfileSettings profiles, CancellationToken cancellationToken)
     {
         var overrides = new List<HostsOverride>();
-        if (profiles.YouTube || profiles.Web)
-            overrides.AddRange(await CreateYoutubeHostsOverridesAsync(cancellationToken));
+        if (_warpTelegramCompatibilityActive)
+            return overrides;
+
+        // Never pin YouTube CDN hosts. Google rotates both media and image
+        // edges frequently; synchronous validation used to delay protection by
+        // more than 30 seconds and a stale pin could make Firefox even slower.
+
+        if (profiles.TelegramWeb)
+            overrides.AddRange(await CreateTelegramWebHostsOverridesAsync(cancellationToken));
 
         var robloxSelected = profiles.GameFilter && _settings.GameFilter.SelectedGames
             .Any(game => game.Equals("roblox", StringComparison.OrdinalIgnoreCase));
@@ -1170,41 +2037,206 @@ public partial class MainWindow : Window
         return overrides;
     }
 
-    private async Task<IReadOnlyList<HostsOverride>> CreateYoutubeHostsOverridesAsync(CancellationToken cancellationToken)
+    private async Task ApplyRuntimeHostsAsync(BypassProfileSettings profiles, CancellationToken cancellationToken)
+    {
+        var hostsOverrides = await CreateHostsOverridesAsync(profiles, cancellationToken);
+        // A blocked Telegram network often prevents every DNS/TLS candidate
+        // from being verified, which is exactly when the signed Flowseal route
+        // is needed. Apply only its Telegram subset; never restore the old
+        // hundreds of region-specific Discord media pins.
+        var useStaticFallbacks = HostsFileManager.ShouldUseTelegramStaticFallback(
+            profiles.TelegramWeb,
+            _warpTelegramCompatibilityActive,
+            _telegramEmergencyHostsActive,
+            hostsOverrides);
+        if (hostsOverrides.Count == 0 && !useStaticFallbacks)
+        {
+            await RestoreHostsCoreAsync();
+            return;
+        }
+
+        try
+        {
+            _hostsStatus = await _hostsManager.ApplyAsync(hostsOverrides, useStaticFallbacks, cancellationToken);
+            var hostsDetail = string.IsNullOrWhiteSpace(_hostsStatus.Detail) ? string.Empty : $"; {_hostsStatus.Detail}";
+            await LogToUiAsync("ok", $"Системный hosts применён: {_hostsStatus.EntryCount} записей, источник Flowseal {WinwsProfileComposer.FlowsealCommit[..7]}; временных DNS-записей: {hostsOverrides.Count}{hostsDetail}.");
+        }
+        catch (Exception ex)
+        {
+            if (_warpTelegramCompatibilityActive)
+            {
+                try
+                {
+                    _hostsStatus = await _hostsManager.RestoreAsync(cancellationToken);
+                    await LogToUiAsync("warn", $"WARP-режим Telegram: обновить hosts не удалось, поэтому блок VortexPass полностью удалён во избежание CDN-закрепления. {ex.Message}");
+                    return;
+                }
+                catch (Exception restoreError)
+                {
+                    _hostsStatus = _hostsManager.GetStatus();
+                    await LogToUiAsync("error", $"WARP-режим Telegram: не удалось удалить старые hosts-записи: {restoreError.Message}");
+                    return;
+                }
+            }
+            _hostsStatus = _hostsManager.GetStatus();
+            await LogToUiAsync("error", $"winws запущен, но hosts не применён: {ex.Message}");
+        }
+    }
+
+    private async Task StartProtectionOnWindowsStartupAsync()
+    {
+        try
+        {
+            if (!_settings.Profiles.AnyEnabled)
+            {
+                await LogToUiAsync("warn", "Автозащита включена, но ни один профиль не выбран.");
+                return;
+            }
+
+            if (!_settings.StartupStrategy.Equals("auto", StringComparison.OrdinalIgnoreCase))
+            {
+                _settings.BypassLevel = WinwsProfileComposer.NormalizeLevel(_settings.StartupStrategy);
+                await ApplyProfilesAsync();
+                if (await IsCurrentStartupProfileHealthyAsync(_lifetime.Token))
+                    await RememberSuccessfulStrategyAsync();
+                else
+                {
+                    _startupFallbackApplied = true;
+                    UpdateTrayState(_protectionRequested);
+                }
+                return;
+            }
+
+            var sameNetwork = _settings.LastSuccessfulNetworkKey.Equals(CurrentNetworkKey(), StringComparison.Ordinal);
+            _settings.BypassLevel = WinwsProfileComposer.NormalizeLevel(
+                sameNetwork ? _settings.LastSuccessfulStrategy : _settings.BypassLevel);
+            _settings.BypassTuning = WinwsProfileComposer.NormalizeTuning(
+                sameNetwork ? _settings.LastSuccessfulTuning : _settings.BypassTuning);
+            await ApplyProfilesAsync();
+            if (await IsCurrentStartupProfileHealthyAsync(_lifetime.Token))
+            {
+                await RememberSuccessfulStrategyAsync();
+                return;
+            }
+
+            await LogToUiAsync("warn", "Сохранённая стратегия не прошла быструю проверку; запускается короткий fallback-подбор.");
+            var candidates = _settings.AdvisorHistory
+                .OrderByDescending(entry => entry.Score)
+                .Select(entry => new AdvisorStrategy(entry.Level, entry.Tuning))
+                .Concat([
+                    new AdvisorStrategy("light", 0),
+                    new AdvisorStrategy("moderate", 0),
+                    new AdvisorStrategy("medium", 0)
+                ])
+                .DistinctBy(item => $"{item.Level}:{item.Tuning}", StringComparer.OrdinalIgnoreCase)
+                .Where(item => !item.Level.Equals(_settings.BypassLevel, StringComparison.OrdinalIgnoreCase) || item.Tuning != _settings.BypassTuning)
+                .Take(3)
+                .ToArray();
+
+            foreach (var candidate in candidates)
+            {
+                _settings.BypassLevel = WinwsProfileComposer.NormalizeLevel(candidate.Level);
+                _settings.BypassTuning = WinwsProfileComposer.NormalizeTuning(candidate.Tuning);
+                await ApplyProfilesAsync();
+                if (!await IsCurrentStartupProfileHealthyAsync(_lifetime.Token)) continue;
+                await RememberSuccessfulStrategyAsync();
+                await LogToUiAsync("ok", $"Быстрый автоподбор выбрал {ProfileDisplayName(_settings.BypassLevel, _settings.BypassTuning)}.");
+                return;
+            }
+
+            _startupFallbackApplied = true;
+            await LogToUiAsync("warn", "Защита запущена, но быстрые проверки маршрута не пройдены. Требуется ручная проверка.");
+            UpdateTrayState(_protectionRequested);
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
+        catch (Exception ex)
+        {
+            _startupFallbackApplied = true;
+            await AppendBackgroundErrorAsync("Автозапуск защиты", ex);
+            UpdateTrayState(false);
+        }
+    }
+
+    private async Task<bool> IsCurrentStartupProfileHealthyAsync(CancellationToken cancellationToken)
+    {
+        if (!_components.GetStatuses().Any(status => status.Id == "dpi" && status.State == ServiceState.Running)) return false;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+        var profiles = _activeProfiles;
+        var checks = AdvisorServiceIds().Select(id => _healthChecks.CheckAsync(
+            id, true, true, timeout.Token,
+            appSelected: id == "telegram" && profiles.Telegram,
+            webSelected: id == "telegram" && profiles.TelegramWeb,
+            telegramProxyRunning: id == "telegram" && _telegramProxy.IsRunning,
+            telegramProxyHasClientActivity: id == "telegram" && _telegramProxy.HasTelegramClientActivity));
+        try
+        {
+            var results = await Task.WhenAll(checks);
+            return results.Length == 0 || results.All(result => result.IsHealthy);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+    }
+
+    private async Task RememberSuccessfulStrategyAsync()
+    {
+        var level = WinwsProfileComposer.NormalizeLevel(_settings.BypassLevel);
+        var tuning = WinwsProfileComposer.NormalizeTuning(_settings.BypassTuning);
+        var networkKey = CurrentNetworkKey();
+        if (_settings.LastSuccessfulStrategy.Equals(level, StringComparison.OrdinalIgnoreCase) &&
+            _settings.LastSuccessfulTuning == tuning &&
+            _settings.LastSuccessfulNetworkKey.Equals(networkKey, StringComparison.Ordinal) &&
+            _settings.LastSuccessfulStrategyUtc > DateTimeOffset.UtcNow.AddHours(-6))
+        {
+            _startupFallbackApplied = false;
+            UpdateTrayState(_protectionRequested);
+            return;
+        }
+        _settings.LastSuccessfulStrategy = level;
+        _settings.LastSuccessfulTuning = tuning;
+        _settings.LastSuccessfulStrategyUtc = DateTimeOffset.UtcNow;
+        _settings.LastSuccessfulNetworkKey = networkKey;
+        _startupFallbackApplied = false;
+        await _settingsStore.SaveAsync(_settings, CancellationToken.None);
+        UpdateTrayState(_protectionRequested);
+    }
+
+    private static string CurrentNetworkKey()
+    {
+        var identity = string.Join('|', NetworkInterface.GetAllNetworkInterfaces()
+            .Where(adapter => adapter.OperationalStatus == OperationalStatus.Up &&
+                              adapter.NetworkInterfaceType is not NetworkInterfaceType.Loopback and not NetworkInterfaceType.Tunnel)
+            .OrderBy(adapter => adapter.Id, StringComparer.Ordinal)
+            .Select(adapter => $"{adapter.Id}:{adapter.GetIPProperties().DnsSuffix}:{string.Join(',', adapter.GetIPProperties().GatewayAddresses.Select(gateway => gateway.Address))}"));
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)));
+    }
+
+    private async Task<IReadOnlyList<HostsOverride>> CreateTelegramWebHostsOverridesAsync(CancellationToken cancellationToken)
     {
         var hosts = new[]
         {
-            "www.youtube.com",
-            "suggestqueries.google.com",
-            "suggestqueries-clients6.youtube.com",
-            "youtubei.googleapis.com",
-            "i.ytimg.com"
+            "web.telegram.org", "webk.telegram.org", "webz.telegram.org",
+            "kws2.web.telegram.org", "kws4.web.telegram.org", "cdn.telesco.pe"
         };
         var tasks = hosts.Select(async host =>
         {
             var resolution = await _dnsOverrides.ResolveBestAsync(
-                host,
-                verifyTls: true,
-                httpProbeUrl: null,
-                timeout: TimeSpan.FromSeconds(4),
-                preferredProvider: _settings.SelectedDnsProvider,
-                cancellationToken: cancellationToken);
-            if (!resolution.Succeeded)
-            {
-                await LogToUiAsync("warn", $"YouTube DNS: не удалось закрепить {host}: {resolution.Detail}.");
-                return null;
-            }
-
-            await LogToUiAsync("info", $"YouTube DNS: {host} → {resolution.Address} через {resolution.Source}.");
-            return new HostsOverride(resolution.Address!, host);
-        }).ToArray();
+                // DNS selection must not depend on the old Telegram TLS route.
+                // The selected address is subsequently handled by the new
+                // Web/CDN winws profile and checked by normal diagnostics.
+                host, verifyTls: false, timeout: TimeSpan.FromSeconds(4),
+                preferredProvider: _settings.SelectedDnsProvider, cancellationToken: cancellationToken);
+            return resolution.Succeeded && resolution.Address is not null
+                ? new HostsOverride(resolution.Address, host)
+                : null;
+        });
         var overrides = (await Task.WhenAll(tasks)).Where(item => item is not null).Cast<HostsOverride>().ToList();
-
-        if (overrides.Count != 0)
-            await LogToUiAsync("ok", $"YouTube DNS: закреплено {overrides.Count} доменов для системного DNS Windows.");
-        else
-            await LogToUiAsync("warn", "YouTube DNS: не удалось подготовить временные hosts-записи; winws всё равно запущен.");
-
+        await LogToUiAsync(overrides.Count > 0 ? "ok" : "info",
+            overrides.Count > 0
+                ? $"Telegram Web DNS: выбрано быстрых маршрутов — {overrides.Count}."
+                : "Telegram Web DNS: динамические маршруты недоступны; используются обычный DNS и правила winws без закрепления CDN.");
         return overrides;
     }
 
@@ -1308,11 +2340,13 @@ public partial class MainWindow : Window
             youtube = winwsRunning && _activeProfiles.YouTube,
             discord = winwsRunning && _activeProfiles.Discord,
             telegram = winwsRunning && _activeProfiles.Telegram,
+            telegramWeb = winwsRunning && _activeProfiles.TelegramWeb,
             web = winwsRunning && _activeProfiles.Web,
             gameFilter = winwsRunning && _activeProfiles.GameFilter,
             requestedYoutube = _settings.Profiles.YouTube,
             requestedDiscord = _settings.Profiles.Discord,
             requestedTelegram = _settings.Profiles.Telegram,
+            requestedTelegramWeb = _settings.Profiles.TelegramWeb,
             requestedWeb = _settings.Profiles.Web,
             requestedGameFilter = _settings.Profiles.GameFilter
         });
@@ -1321,6 +2355,7 @@ public partial class MainWindow : Window
         await PublishConfigurationAsync();
         await PublishHostsStatusAsync();
         await PublishHealthSnapshotAsync(winwsRunning);
+        await PublishWarpStatusAsync();
     }
 
     private Task PublishSettingsStatusAsync() => PostUiAsync(new
@@ -1343,9 +2378,19 @@ public partial class MainWindow : Window
         }
         if (_shutdownStarted) return;
 
-        _trayIcon.Text = protectionEnabled ? "VortexPass — защита включена" : "VortexPass — защита выключена";
-        _trayMenu.UpdateState(protectionEnabled, _protectionTransitioning || _advisorRunning);
+        var hasError = HasProtectionError();
+        var warpError = _warpStatus.State == WarpConnectionState.Error;
+        _trayIcon.Text = warpError ? "VortexPass — ошибка WARP" :
+            _warpTransitioning ? "VortexPass — WARP подключается" :
+            _warpStatus.State == WarpConnectionState.Connected ? "VortexPass — WARP подключён" :
+            hasError ? "VortexPass — ошибка защиты" :
+            _startupFallbackApplied ? "VortexPass — нужна проверка маршрута" :
+            protectionEnabled ? "VortexPass — защита включена" : "VortexPass — защита выключена";
+        _trayMenu.UpdateState(protectionEnabled, _protectionTransitioning || _advisorRunning,
+            _startupFallbackApplied, hasError, _warpStatus.State == WarpConnectionState.Connected, _warpTransitioning);
     }
+
+    private bool HasProtectionError() => _serviceStatuses.Values.Any(status => status.State == ServiceState.Error);
 
     private async Task RunMetricsLoopAsync(CancellationToken cancellationToken)
     {
@@ -1356,7 +2401,10 @@ public partial class MainWindow : Window
             var active = _protectionStarted.HasValue;
             if (active && !_advisorRunning && DateTimeOffset.UtcNow >= _nextHealthCheckUtc)
             {
-                _nextHealthCheckUtc = DateTimeOffset.UtcNow.AddSeconds(30);
+                // Diagnostics are deliberately sparse: several simultaneous
+                // CDN probes can compete with an actively playing video on a
+                // throttled route and do not need to run every 30 seconds.
+                _nextHealthCheckUtc = DateTimeOffset.UtcNow.AddSeconds(90);
                 _ = RunHealthChecksGuardedAsync(cancellationToken);
             }
             var pings = _healthStatuses.ToDictionary(x => x.Key, x => x.Value.IsHealthy ? x.Value.LatencyMs : null, StringComparer.OrdinalIgnoreCase);
@@ -1381,7 +2429,7 @@ public partial class MainWindow : Window
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _healthCheckCts.Token);
             await RunHealthChecksAsync(linked.Token);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
             await AppendBackgroundErrorAsync("Сетевая проверка", ex);
@@ -1401,7 +2449,7 @@ public partial class MainWindow : Window
         {
             _healthChecks.CheckAsync("youtube", profiles.YouTube || profiles.Web, winwsRunning, cancellationToken),
             _healthChecks.CheckAsync("discord", profiles.Discord || profiles.Web, winwsRunning, cancellationToken),
-            _healthChecks.CheckAsync("telegram", profiles.Telegram, winwsRunning, cancellationToken, profiles.Telegram, profiles.Web, _telegramProxy.IsRunning, _telegramProxy.HasTelegramClientActivity)
+            _healthChecks.CheckAsync("telegram", profiles.Telegram || profiles.TelegramWeb, winwsRunning, cancellationToken, profiles.Telegram, profiles.TelegramWeb, _telegramProxy.IsRunning, _telegramProxy.HasTelegramClientActivity)
         };
         if (profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("roblox", StringComparison.OrdinalIgnoreCase)))
             checks.Add(_healthChecks.CheckAsync("roblox", true, winwsRunning, cancellationToken));
@@ -1414,6 +2462,26 @@ public partial class MainWindow : Window
             if (result.IsHealthy)
             {
                 _healthFailureStreaks.Remove(result.Id);
+            }
+            else if (result.Id == "telegram" &&
+                     result.State is not ServiceHealthState.NotSelected and not ServiceHealthState.WinwsStopped)
+            {
+                // Telegram's synthetic HttpClient probes can lose the first TLS
+                // race immediately after hosts/DNS refresh even while Firefox is
+                // already working. Require two consecutive failed rounds before
+                // replacing the UI status or writing a red diagnostic entry.
+                var failures = _healthFailureStreaks.GetValueOrDefault(result.Id) + 1;
+                _healthFailureStreaks[result.Id] = failures;
+                if (failures < 2)
+                {
+                    _healthStatuses[result.Id] = new ServiceHealthResult(
+                        result.Id,
+                        ServiceHealthState.Checking,
+                        "Основной маршрут ещё проверяется; выполняется повторная диагностика",
+                        result.LatencyMs,
+                        result.Stages);
+                    continue;
+                }
             }
             else if (_healthStatuses.TryGetValue(result.Id, out var lastHealthy) && lastHealthy.IsHealthy &&
                      result.State is not ServiceHealthState.NotSelected and not ServiceHealthState.WinwsStopped)
@@ -1433,7 +2501,7 @@ public partial class MainWindow : Window
                     (result.Stages.Voice is null ? string.Empty : $" [Voice/Media: {result.Stages.Voice}]") +
                     (result.Stages.Gateway is null ? string.Empty : $" [Gateway: {result.Stages.Gateway}]") +
                     (result.Stages.Cdn is null ? string.Empty : $" [CDN: {result.Stages.Cdn}]");
-                
+
                 var diagHeader = result.IsHealthy ? "[DIAG/OK]" : "[DIAG/WARN]";
                 await LogToUiAsync(level, $"{diagHeader} {ServiceDisplayName(result.Id)}: {result.Detail}{latency}.{stages}");
 
@@ -1443,6 +2511,8 @@ public partial class MainWindow : Window
                 }
             }
         }
+        if (_protectionStarted.HasValue && !_advisorRunning && results.Length > 0 && results.All(result => result.IsHealthy))
+            await RememberSuccessfulStrategyAsync();
         await PublishHealthSnapshotAsync(winwsRunning);
     }
 
@@ -1477,7 +2547,7 @@ public partial class MainWindow : Window
         {
             "youtube" => profiles.YouTube || profiles.Web,
             "discord" => profiles.Discord || profiles.Web,
-            "telegram" => profiles.Telegram,
+            "telegram" => profiles.Telegram || profiles.TelegramWeb,
             "phasmophobia" => profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("phasmophobia", StringComparison.OrdinalIgnoreCase)),
             "roblox" => profiles.GameFilter && _settings.GameFilter.SelectedGames.Any(game => game.Equals("roblox", StringComparison.OrdinalIgnoreCase)),
             _ => false
@@ -1486,20 +2556,24 @@ public partial class MainWindow : Window
 
     private static string ServiceDisplayName(string id) => id switch { "youtube" => "YouTube", "discord" => "Discord", "telegram" => "Telegram", "roblox" => "Roblox", "phasmophobia" => "Phasmophobia", _ => id };
 
-    private static bool RequiresHosts(BypassProfileSettings profiles) => profiles.Web || profiles.Discord;
-
     private static BypassProfileSettings CloneProfiles(BypassProfileSettings profiles) => new()
     {
         YouTube = profiles.YouTube,
         Discord = profiles.Discord,
         Telegram = profiles.Telegram,
+        TelegramWeb = profiles.TelegramWeb,
         Web = profiles.Web,
         GameFilter = profiles.GameFilter
     };
 
     private static string LevelDisplayName(string level) => level switch
     {
-        "light" => "Лёгкий", "moderate" => "Умеренный", "medium" => "Средний", "complex" => "Сложный", "aggressive" => "Агрессивный", _ => "Средний"
+        "light" => "Лёгкий",
+        "moderate" => "Умеренный",
+        "medium" => "Средний",
+        "complex" => "Сложный",
+        "aggressive" => "Агрессивный",
+        _ => "Средний"
     };
 
     private static string TuningDisplayName(int tuning) => WinwsProfileComposer.NormalizeTuning(tuning) switch
@@ -1800,6 +2874,7 @@ public partial class MainWindow : Window
 
     private void RestoreWindow()
     {
+        ShowInTaskbar = true;
         Show();
         if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
         Activate();
@@ -1811,6 +2886,20 @@ public partial class MainWindow : Window
         _shutdownStarted = true;
         try
         {
+            try { await StopWarpRoutingAsync(_lifetime.Token); }
+            catch (Exception ex) { await AppendApplicationLogLineAsync($"[WARN] WARP routing cleanup: {ex.Message}"); }
+            if (WarpService.NeedsEmergencyRecovery(_warpStatus.State, _settings.Warp.RequestedConnected, _warpBootstrap.IsActive))
+            {
+                using var recoveryTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(55));
+                var recovery = await _warpService.RecoverOrdinaryRouteAsync(recoveryTimeout.Token);
+                await _warpBootstrap.StopAsync();
+                await AppendApplicationLogLineAsync(recovery.Succeeded
+                    ? "[INFO] WARP аварийно отключён перед выходом; обычный маршрут восстановлен."
+                    : $"[ERROR] WARP recovery on shutdown: {recovery.Detail}");
+            }
+            // Stop both independent winws processes, then remove the owned
+            // WinDivert driver. This is application shutdown, not a WARP toggle.
+            await _warpBootstrap.StopAsync();
             await _components.StopAllAsync();
             await _telegramProxy.StopAsync();
             await RestoreHostsCoreAsync();
@@ -1820,6 +2909,9 @@ public partial class MainWindow : Window
         {
             _components.Dispose();
             _telegramProxy.Dispose();
+            _warpPac.Dispose();
+            _warpService.Dispose();
+            _warpBootstrap.Dispose();
             _advisorHttp.Dispose();
             _allowClose = true;
             Close();

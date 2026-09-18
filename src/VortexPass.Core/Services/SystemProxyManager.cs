@@ -53,6 +53,10 @@ public sealed class SystemProxyManager
 
     private static void NotifyWindows()
     {
+        // Notify both WinINet and applications watching the newer proxy-change
+        // signal. Existing browser processes can then reload the versioned PAC
+        // without requiring a restart.
+        NativeMethods.InternetSetOption(IntPtr.Zero, 95, IntPtr.Zero, 0);
         NativeMethods.InternetSetOption(IntPtr.Zero, 39, IntPtr.Zero, 0);
         NativeMethods.InternetSetOption(IntPtr.Zero, 37, IntPtr.Zero, 0);
     }

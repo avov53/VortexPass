@@ -5,6 +5,10 @@ public sealed class AppSettings
     public bool StartWithWindows { get; set; }
     public bool StartProtectionOnStartup { get; set; }
     public string StartupStrategy { get; set; } = "auto";
+    public string LastSuccessfulStrategy { get; set; } = "medium";
+    public int LastSuccessfulTuning { get; set; }
+    public DateTimeOffset? LastSuccessfulStrategyUtc { get; set; }
+    public string LastSuccessfulNetworkKey { get; set; } = string.Empty;
     public string SelectedDnsProvider { get; set; } = "auto";
     public bool MinimizeToTray { get; set; } = true;
     public DateTimeOffset? LastUpdateCheckUtc { get; set; }
@@ -15,6 +19,7 @@ public sealed class AppSettings
     public List<AdvisorHistoryEntry> AdvisorHistory { get; set; } = [];
     public int ProfileSettingsVersion { get; set; }
     public GameFilterSettings GameFilter { get; set; } = new();
+    public WarpSettings Warp { get; set; } = new();
     public List<string> CustomBypassDomains { get; set; } = [];
     public List<string> ExcludedDomains { get; set; } = DefaultDomainLists.CreateExclusions();
 }
@@ -43,10 +48,62 @@ public sealed class BypassProfileSettings
     public bool YouTube { get; set; }
     public bool Discord { get; set; }
     public bool Telegram { get; set; }
+    public bool TelegramWeb { get; set; }
     public bool Web { get; set; }
     public bool GameFilter { get; set; }
 
-    public bool AnyEnabled => YouTube || Discord || Telegram || Web || GameFilter;
+    public bool AnyEnabled => YouTube || Discord || Telegram || TelegramWeb || Web || GameFilter;
+}
+
+public sealed class WarpSettings
+{
+    public bool Telegram { get; set; } = true;
+    public bool Games { get; set; }
+    public string RoutingMode { get; set; } = "smart";
+    public string ProtocolPreference { get; set; } = "auto";
+    public string MasquePreference { get; set; } = "h3-with-h2-fallback";
+    public string DnsMode { get; set; } = "auto";
+    public int ProxyPort { get; set; } = 41870;
+    public List<WarpRouteProfile> RouteProfiles { get; set; } = [];
+    public List<WarpNetworkOptimization> NetworkOptimizations { get; set; } = [];
+    public List<string> OwnedSplitTunnelHosts { get; set; } = [];
+    public List<string> OwnedSplitTunnelIps { get; set; } = [];
+    public WarpPerformanceBaseline? PerformanceBaseline { get; set; }
+    public bool RequestedConnected { get; set; }
+    public string DetectedCliPath { get; set; } = string.Empty;
+    public DateTimeOffset? LastCheckedUtc { get; set; }
+    public string LastError { get; set; } = string.Empty;
+}
+
+public sealed class WarpRouteProfile
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string Name { get; set; } = "Новый профиль";
+    public string Kind { get; set; } = "site";
+    public string BuiltInId { get; set; } = string.Empty;
+    public bool Enabled { get; set; }
+    public string Connection { get; set; } = "auto";
+    public List<string> Domains { get; set; } = [];
+    public List<string> IpRanges { get; set; } = [];
+    public string ExecutablePath { get; set; } = string.Empty;
+}
+
+public sealed class WarpNetworkOptimization
+{
+    public string NetworkKey { get; set; } = string.Empty;
+    public string SelectedProtocol { get; set; } = "MASQUE";
+    public string Reason { get; set; } = string.Empty;
+    public DateTimeOffset CheckedAt { get; set; }
+    public Dictionary<string, string> RouteDecisions { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, long> ProtocolMedianMs { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+}
+
+public sealed class WarpPerformanceBaseline
+{
+    public string NetworkKey { get; set; } = string.Empty;
+    public DateTimeOffset CheckedAt { get; set; }
+    public Dictionary<string, long> MedianLatencyMs { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, long> JitterMs { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
 public sealed class GameFilterSettings
@@ -180,6 +237,12 @@ blzddist1-a.akamaihd.net
 blznav.akamaized.net
 akamaized.net
 akamaihd.net
+api.cloudflareclient.com
+engage.cloudflareclient.com
+updates.cloudflareclient.com
+warp.cloudflare.com
+cloudflare-dns.com
+one.one.one.one
 """;
 
     public static List<string> CreateExclusions() => Exclusions
