@@ -11,6 +11,7 @@ public enum UpdateState
     Deferred,
     Installing,
     Downloading,
+    Unavailable,
     Failed
 }
 

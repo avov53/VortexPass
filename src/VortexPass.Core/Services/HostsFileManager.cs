@@ -15,7 +15,6 @@ public sealed class HostsFileManager
     public const string HostsAssetSha256 = "ca810989b7e9ac87fb1ddb5786f01a80d862a6ff8f3c1cc883bb09baeab1c34d";
     private static readonly HashSet<string> AllowedDynamicHosts = new(StringComparer.OrdinalIgnoreCase)
     {
-        RobloxThumbnailResolver.ThumbnailHost,
         "www.youtube.com",
         "youtube.com",
         "suggestqueries.google.com",
@@ -109,12 +108,34 @@ public sealed class HostsFileManager
     public Task<HostsFileStatus> ApplyAsync(CancellationToken cancellationToken = default) =>
         ApplyAsync(Array.Empty<HostsOverride>(), includeStaticFallbacks: false, cancellationToken);
 
+    public async Task<IReadOnlyList<HostsOverride>> ReadTelegramFallbackCandidatesAsync(CancellationToken cancellationToken = default)
+    {
+        if (!File.Exists(_assetPath)) return [];
+        if (!await HashVerifier.MatchesAsync(_assetPath, HostsAssetSha256, cancellationToken))
+            throw new InvalidDataException("SHA-256 hosts-набора Flowseal не совпадает с утверждённым значением.");
+        return (await File.ReadAllLinesAsync(_assetPath, cancellationToken))
+            .Select(line => TryParseEntry(line, out var address, out var host) && address is not null && host is not null
+                ? new HostsOverride(address, host)
+                : null)
+            .Where(entry => entry is not null && IsTelegramWebFallbackHost(entry.Host))
+            .Select(entry => entry!)
+            .Distinct()
+            .ToArray();
+    }
+
     public async Task<HostsFileStatus> ApplyAsync(IEnumerable<HostsOverride> overrides, CancellationToken cancellationToken = default)
         => await ApplyAsync(overrides, includeStaticFallbacks: false, cancellationToken);
 
     public async Task<HostsFileStatus> ApplyAsync(
         IEnumerable<HostsOverride> overrides,
         bool includeStaticFallbacks,
+        CancellationToken cancellationToken = default) =>
+        await ApplyAsync(overrides, includeStaticFallbacks, validateOverrides: true, cancellationToken);
+
+    public async Task<HostsFileStatus> ApplyAsync(
+        IEnumerable<HostsOverride> overrides,
+        bool includeStaticFallbacks,
+        bool validateOverrides,
         CancellationToken cancellationToken = default)
     {
         if (!File.Exists(_assetPath)) throw new FileNotFoundException("Не найден закреплённый hosts-набор Flowseal.", _assetPath);
@@ -143,6 +164,8 @@ public sealed class HostsFileManager
         var additionalEntries = overrides
             .Where(entry => IsAllowedHost(entry.Host))
             .Select(entry => (Address: entry.Address, Host: entry.Host.TrimEnd('.').ToLowerInvariant()))
+            .GroupBy(entry => entry.Host, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
             .ToArray();
         // The signed Flowseal entries are SNI-aware routes. A raw TCP probe to their IP
         // does not contain a hostname and can be blocked by the very DPI rules that winws
@@ -157,11 +180,22 @@ public sealed class HostsFileManager
                 .Distinct()
                 .ToArray()
             : Array.Empty<(IPAddress Address, string Host)>();
-        var candidateEntries = trustedEntries.Concat(additionalEntries).Distinct().ToArray();
+        // A measured route must win over the bundled emergency route. Windows
+        // hosts permits duplicate names but their selection order is not a safe
+        // failover mechanism; keeping both previously left web.telegram.org on
+        // the unreachable 149.154.167.220 even after a working address had been
+        // found. Keep exactly one address per hostname.
+        var candidateEntries = additionalEntries
+            .Concat(trustedEntries)
+            .GroupBy(entry => entry.Host, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToArray();
         var reachableAddresses = new HashSet<IPAddress>();
         var skippedAddresses = new List<IPAddress>();
-        var reachability = await Task.WhenAll(additionalEntries.Select(x => x.Address).Distinct().Select(async address =>
-            (Address: address, Reachable: await IsReachableAsync(address, cancellationToken))));
+        var reachability = validateOverrides
+            ? await Task.WhenAll(additionalEntries.Select(x => x.Address).Distinct().Select(async address =>
+                (Address: address, Reachable: await IsReachableAsync(address, cancellationToken))))
+            : additionalEntries.Select(x => x.Address).Distinct().Select(address => (Address: address, Reachable: true)).ToArray();
         foreach (var result in reachability)
         {
             if (result.Reachable)
@@ -264,7 +298,10 @@ public sealed class HostsFileManager
 
     private static bool IsAllowedHost(string host) =>
         host == "web.telegram.org" || host == "api.telegram.org" || host.EndsWith(".web.telegram.org", StringComparison.Ordinal) ||
-        host.EndsWith(".discord.media", StringComparison.Ordinal) || AllowedDynamicHosts.Contains(host);
+        host.EndsWith(".discord.media", StringComparison.Ordinal) ||
+        host.Equals("thumbnails.roblox.com", StringComparison.OrdinalIgnoreCase) ||
+        host.EndsWith(".rbxcdn.com", StringComparison.OrdinalIgnoreCase) ||
+        AllowedDynamicHosts.Contains(host);
 
     public static bool IsTelegramWebFallbackHost(string host) =>
         host.Equals("telegram.org", StringComparison.OrdinalIgnoreCase) ||
@@ -283,13 +320,10 @@ public sealed class HostsFileManager
     {
         if (!telegramWebEnabled || warpCompatibilityActive) return false;
 
-        // DNS resolution alone does not prove that the returned Telegram edge is
-        // reachable through the current provider. Keep the signed, SNI-aware
-        // Telegram Web block installed while the direct profile is active and use
-        // measured dynamic entries only as additional candidates. Previously a
-        // DNS answer such as 149.154.167.99 disabled this block before the later
-        // TCP probe rejected the address, leaving browsers with a single unrelated
-        // hosts entry and Telegram Web stuck at "Waiting for network".
+        // Keep the published v0.0.7 home behavior: the signed Telegram-only
+        // Flowseal block remains available together with independently resolved
+        // Web/CDN/WebSocket names. A DNS answer alone must not suppress the SNI-
+        // aware fallback on providers that block Telegram's update channel.
         _ = emergencyRequested;
         _ = dynamicOverrides;
         return true;

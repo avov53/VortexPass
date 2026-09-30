@@ -19,8 +19,10 @@ if ($pnpm) {
 Remove-Item -LiteralPath $publish -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path (Join-Path $publish 'bin') -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $publish 'updater') -Force | Out-Null
-dotnet publish (Join-Path $root 'src\VortexPass.App\VortexPass.App.csproj') -c Release -r win-x64 --self-contained true -p:Version=$Version -p:AssemblyInformationalVersion=$Version -o $publish
-dotnet publish (Join-Path $root 'src\VortexPass.Updater\VortexPass.Updater.csproj') -c Release -r win-x64 --self-contained true -o (Join-Path $publish 'updater')
+New-Item -ItemType Directory -Path (Join-Path $publish 'dns-guard') -Force | Out-Null
+dotnet publish (Join-Path $root 'src\VortexPass.App\VortexPass.App.csproj') -c Release -r win-x64 --self-contained true -p:NuGetAudit=false -p:Version=$Version -p:AssemblyInformationalVersion=$Version -o $publish
+dotnet publish (Join-Path $root 'src\VortexPass.Updater\VortexPass.Updater.csproj') -c Release -r win-x64 --self-contained true -p:NuGetAudit=false -o (Join-Path $publish 'updater')
+dotnet publish (Join-Path $root 'src\VortexPass.DnsGuard\VortexPass.DnsGuard.csproj') -c Release -r win-x64 --self-contained true -p:NuGetAudit=false -o (Join-Path $publish 'dns-guard')
 Copy-Item -Path (Join-Path $root 'components\zapret\*') -Destination (Join-Path $publish 'bin') -Recurse -Force
 
 & (Join-Path $root 'scripts\Test-ComponentManifest.ps1') -ManifestPath (Join-Path $publish 'assets\external-components.json') -ComponentsRoot (Join-Path $publish 'bin')

@@ -42,6 +42,7 @@ import {
   Play,
   SlidersHorizontal,
   Cloud,
+  Smartphone,
 } from "lucide-react";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -156,16 +157,16 @@ interface Metrics {
 }
 
 interface UpdateInfo {
-  state: "idle" | "checking" | "current" | "available" | "availablePrompt" | "preparing" | "deferred" | "installing" | "failed" | "downloading";
+  state: "idle" | "checking" | "current" | "available" | "availablePrompt" | "preparing" | "deferred" | "installing" | "unavailable" | "failed" | "downloading";
   currentVersion?: string;
   availableVersion?: string;
   checkedAt?: string;
   error?: string;
 }
 
-interface HealthItem { state: string; detail: string; latencyMs: number | null; stages?: Record<string, string | null> }
+interface HealthItem { state: string; detail: string; latencyMs: number | null; measurementType?: "routeprobe" | "voiceprobe" | "gamesession"; stages?: Record<string, string | null> }
 type HealthMap = Record<string, HealthItem>;
-interface HostsInfo { applied: boolean; entryCount: number; updatedAt?: string; detail: string; sourceCommit?: string }
+interface HostsInfo { applied: boolean; entryCount: number; updatedAt?: string; detail: string; sourceCommit?: string; telegramFallbackCount?: number; telegramDnsCount?: number; robloxCdnCount?: number }
 interface GameFilterInfo { selectedGames: string[]; protocol: "udp" | "tcp" | "all"; ipsetMode?: "any" | "loaded" | "none" }
 interface DomainListsInfo { bypass: string[]; exclusions: string[] }
 interface SettingsInfo {
@@ -176,8 +177,28 @@ interface SettingsInfo {
   startupStrategy?: "auto" | "light" | "moderate" | "medium" | "complex" | "aggressive";
   gameFilterIpsetMode?: "any" | "loaded" | "none";
 }
-interface FavoriteProfile { level: string; tuning: number }
-interface AdvisorCandidate { level: string; tuning: number; label: string; healthy: number; total: number; latencyMs: number | null; summary: string; score?: number; source?: string }
+interface FavoriteProfile { level: string; tuning: number; mode?: "standard" | "mobile" }
+interface CompatibilityInfo {
+  mode: "standard" | "mobile";
+  networkKey?: string;
+  remembered?: boolean;
+  youtubeTransport?: "auto" | "quic" | "http2";
+  discordVoiceMode?: "auto" | "direct" | "minimal" | "off";
+  discordVoiceApplied?: "direct" | "minimal" | "off";
+  providerName?: string;
+  telegramRouteCount?: number;
+  optimizeState?: "idle" | "cached" | "checking" | "confirmed" | "fallback" | "partial" | "manual";
+  optimizeDetail?: string;
+  dnsState?: "idle" | "starting" | "ready" | "restored" | "portBusy" | "dohUnavailable" | "error" | "restoreError";
+  dnsDetail?: string;
+  dnsResolver?: string;
+  dnsAdapter?: string;
+  winwsDomainCount?: number;
+  pinnedIpCount?: number;
+  pinnedIpDetail?: string;
+  routes?: Record<string, { strategy?: string; route?: string; state?: string; detail?: string; checkedAt?: string }>;
+}
+interface AdvisorCandidate { level: string; tuning: number; mode?: "standard" | "mobile"; label: string; healthy: number; total: number; latencyMs: number | null; summary: string; score?: number; source?: string }
 interface AdvisorInfo {
   state: "idle" | "detecting" | "testing" | "complete" | "failed";
   provider?: string;
@@ -206,24 +227,36 @@ const PROFILE_TUNINGS = [
   { id: 3, label: "Максимум +6", detail: "+6 повторов" },
 ] as const;
 
-const PROFILE_CATALOG = PROFILE_LEVELS.flatMap((level) =>
+const MOBILE_LEVEL_NAMES: Record<string, string> = {
+  light: "Мобильный быстрый",
+  moderate: "Мобильный связной",
+  medium: "Мобильный стабильный",
+  complex: "Мобильный усиленный",
+  aggressive: "Мобильный резервный",
+};
+
+function createProfileCatalog(mode: "standard" | "mobile") { return PROFILE_LEVELS.flatMap((level) =>
   PROFILE_TUNINGS.map((tuning) => ({
     level: level.id,
     tuning: tuning.id,
-    label: `${level.label} · ${tuning.label}`,
-    levelLabel: level.label,
+    mode,
+    label: `${mode === "mobile" ? MOBILE_LEVEL_NAMES[level.id] : level.label} · ${tuning.label}`,
+    levelLabel: mode === "mobile" ? MOBILE_LEVEL_NAMES[level.id] : level.label,
     tuningLabel: tuning.label,
-    short: level.short,
-    description: `${level.description} ${tuning.detail}.`,
+    short: mode === "mobile" ? "Узкий профиль мобильного оператора" : level.short,
+    description: mode === "mobile" ? `Отдельные правила Telegram WebSocket и Discord для мобильной сети. ${tuning.detail}.` : `${level.description} ${tuning.detail}.`,
   })),
-);
+); }
+
+const PROFILE_CATALOG = createProfileCatalog("standard");
 
 function profileKey(profile: FavoriteProfile) {
-  return `${profile.level}:${profile.tuning}`;
+  return `${profile.mode ?? "standard"}:${profile.level}:${profile.tuning}`;
 }
 
 function profileCatalogItem(profile: FavoriteProfile) {
-  return PROFILE_CATALOG.find((item) => item.level === profile.level && item.tuning === profile.tuning) ?? PROFILE_CATALOG[8];
+  const catalog = createProfileCatalog(profile.mode ?? "standard");
+  return catalog.find((item) => item.level === profile.level && item.tuning === profile.tuning) ?? catalog[8];
 }
 
 type BrandIconProps = SVGProps<SVGSVGElement> & { size?: number };
@@ -642,6 +675,7 @@ function Dashboard({
   gameFilterSelected,
   bypassLevel,
   bypassTuning,
+  compatibilityMode,
   favoriteProfiles,
   health,
   hosts,
@@ -670,6 +704,7 @@ function Dashboard({
   gameFilterSelected: boolean;
   bypassLevel: string;
   bypassTuning: number;
+  compatibilityMode: "standard" | "mobile";
   favoriteProfiles: FavoriteProfile[];
   health: HealthMap;
   hosts: HostsInfo;
@@ -690,9 +725,9 @@ function Dashboard({
       id: "yt",
       label: "YouTube",
       Icon: YouTubeIcon,
-      active: health.youtube?.state === "healthy",
+      active: ["healthy", "partial"].includes(health.youtube?.state ?? ""),
       iconColor: "#FF4D6D",
-      ping: health.youtube?.latencyMs != null ? `${health.youtube.latencyMs} ms` : "—",
+      ping: health.youtube?.latencyMs != null ? `Маршрут ${health.youtube.latencyMs} ms` : "—",
       sub: health.youtube?.detail ?? (ytActive ? "Проверяем сеть" : "Не выбран"),
       subColor: health.youtube?.state === "healthy" ? "#00D68F" : "#FFB340",
     },
@@ -700,21 +735,21 @@ function Dashboard({
       id: "dc",
       label: "Discord",
       Icon: DiscordIcon,
-      active: health.discord?.state === "healthy",
+      active: ["healthy", "partial"].includes(health.discord?.state ?? ""),
       iconColor: "#5865F2",
-      ping: health.discord?.latencyMs != null ? `${health.discord.latencyMs} ms` : "—",
+      ping: health.discord?.latencyMs != null ? `${health.discord.measurementType === "voiceprobe" ? "Voice" : health.discord.measurementType === "gamesession" ? "Игра" : "Маршрут"} ${health.discord.latencyMs} ms` : "—",
       sub: health.discord?.detail ?? (dcActive ? "Проверяем сеть" : "Не выбран"),
-      subColor: health.discord?.state === "healthy" ? "#00D68F" : "#FF4D6D",
+      subColor: health.discord?.state === "healthy" ? "#00D68F" : health.discord?.state === "partial" ? "#FFB340" : "#FF4D6D",
     },
     {
       id: "tg",
       label: "Telegram",
       Icon: TelegramIcon,
-      active: health.telegram?.state === "healthy",
+      active: ["healthy", "partial"].includes(health.telegram?.state ?? ""),
       iconColor: "#29B6F6",
-      ping: health.telegram?.latencyMs != null ? `${health.telegram.latencyMs} ms` : "—",
+      ping: health.telegram?.latencyMs != null ? `Маршрут ${health.telegram.latencyMs} ms` : "—",
       sub: health.telegram?.detail ?? (tgActive ? "Проверяем сеть" : "Не выбран"),
-      subColor: health.telegram?.state === "healthy" ? "#00D68F" : "#FF4D6D",
+      subColor: health.telegram?.state === "healthy" ? "#00D68F" : health.telegram?.state === "partial" ? "#FFB340" : "#FF4D6D",
     },
   ];
 
@@ -865,9 +900,11 @@ function Dashboard({
             <div>
               <div className="text-[13px] font-semibold text-[#EEEEF8]">Автоматический подбор профиля</div>
               <div className="text-[10px] leading-relaxed text-[#5A5A7A] mt-1 max-w-[650px]">
-                Определит провайдера и проверит 20 внутренних стратегий на выбранных сервисах. Пять понятных уровней на дашборде останутся без изменений.
+                {compatibilityMode === "mobile"
+                  ? "Быстро сравнит две отдельные мобильные стратегии для Telegram, Discord и YouTube и сразу оставит лучшую."
+                  : "Определит провайдера и проверит внутренние стратегии на выбранных сервисах. Пять понятных уровней на дашборде останутся без изменений."}
               </div>
-              <div className="text-[9px] font-mono text-[#3A3A5E] mt-1.5">Проверка может занять несколько минут. Выполняется один HTTPS-запрос к ipapi.co; публичный IP в VortexPass не сохраняется.</div>
+              <div className="text-[9px] font-mono text-[#3A3A5E] mt-1.5">{compatibilityMode === "mobile" ? "Обычно занимает до 10–12 секунд; вспомогательный тайм-аут не перезапускает защиту." : "Проверка может занять несколько минут. Выполняется один HTTPS-запрос к ipapi.co; публичный IP в VortexPass не сохраняется."}</div>
             </div>
           </div>
           {advisor.state === "detecting" || advisor.state === "testing" ? (
@@ -892,12 +929,12 @@ function Dashboard({
             <div className="flex justify-between text-[10px] font-mono mb-2">
               <span className="text-[#7777A8]">{advisor.message ?? "Проверяем сеть…"}</span>
               <span className="text-[#4A4A6A]">
-                {advisor.state === "testing" ? `${Math.min((advisor.progress ?? 0) + 1, advisor.total ?? 20)}/${advisor.total ?? 20}` : "DNS/provider"}
+                {advisor.state === "testing" ? `${Math.min((advisor.progress ?? 0) + 1, advisor.total ?? (compatibilityMode === "mobile" ? 2 : 20))}/${advisor.total ?? (compatibilityMode === "mobile" ? 2 : 20)}` : "DNS/provider"}
                 {advisor.provider ? ` · ${advisor.provider}` : ""}
               </span>
             </div>
             <div className="h-1.5 rounded-full overflow-hidden bg-white/[0.04]">
-              <motion.div className="h-full rounded-full" animate={{ width: `${advisor.state === "detecting" ? 5 : Math.max(5, (((advisor.progress ?? 0) + 1) / (advisor.total ?? 20)) * 100)}%` }}
+              <motion.div className="h-full rounded-full" animate={{ width: `${advisor.state === "detecting" ? 5 : Math.max(5, (((advisor.progress ?? 0) + 1) / (advisor.total ?? (compatibilityMode === "mobile" ? 2 : 20))) * 100)}%` }}
                 style={{ background: "linear-gradient(90deg, #6C5CE7, #0078D4)" }} />
             </div>
             {advisor.best && (
@@ -914,7 +951,7 @@ function Dashboard({
           <motion.div initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} className="relative mt-4">
             <div className="flex items-center justify-between mb-2">
               <span className="text-[10px] font-mono text-[#7474A0]">Лучшие варианты{advisor.provider ? ` · ${advisor.provider}` : ""}</span>
-              <span className="text-[9px] font-mono text-[#3A3A5E]">Применение только вручную</span>
+              <span className="text-[9px] font-mono text-[#3A3A5E]">{compatibilityMode === "mobile" ? "Лучший уже применён" : "Применение только вручную"}</span>
             </div>
             <div className="grid grid-cols-3 gap-2">
               {(advisor.candidates ?? []).map((candidate, index) => {
@@ -959,7 +996,7 @@ function Dashboard({
             <div className="min-w-0">
               <div className="text-[12px] font-semibold text-[#D8D8E8]">Системный hosts</div>
               <div className="text-[10px] font-mono text-[#4A4A6A] mt-1 truncate">
-                {hosts.applied ? `Применён · ${hosts.entryCount} записей · Flowseal ${hosts.sourceCommit?.slice(0, 7) ?? ""}` : hosts.detail || "Не применён"}
+                {hosts.applied ? `Telegram fallback: ${hosts.telegramFallbackCount ?? 0} · Telegram DNS: ${hosts.telegramDnsCount ?? 0} · Roblox CDN: ${hosts.robloxCdnCount ?? 0}` : hosts.detail || "Не применён"}
               </div>
               {hosts.updatedAt && <div className="text-[9px] font-mono text-[#2A2A44] mt-0.5">Обновлён: {new Date(hosts.updatedAt).toLocaleString("ru-RU")}</div>}
             </div>
@@ -990,7 +1027,7 @@ function Dashboard({
           <div className="grid grid-cols-5 gap-2">
             {favoriteProfiles.map((profile) => {
               const item = profileCatalogItem(profile);
-              const selected = bypassLevel === profile.level && bypassTuning === profile.tuning;
+              const selected = bypassLevel === profile.level && bypassTuning === profile.tuning && (profile.mode ?? "standard") === compatibilityMode;
               return (
                 <motion.div key={profileKey(profile)} whileHover={{ y: -2 }} className="group relative min-w-0 rounded-xl"
                   style={{ background: selected ? "rgba(108,92,231,0.18)" : "rgba(255,255,255,0.035)", border: `1px solid ${selected ? "rgba(108,92,231,0.45)" : "rgba(255,255,255,0.065)"}` }}>
@@ -1071,7 +1108,7 @@ function Dashboard({
         ))}
       </div>
 
-      {dcSelected && health.discord && health.discord.state !== "healthy" && (
+      {dcSelected && health.discord && !["healthy", "partial", "checking"].includes(health.discord.state) && (
         <div className="px-4 py-3 rounded-xl text-[10px] font-mono text-[#8A7080]"
           style={{ background: "rgba(255,77,109,0.055)", border: "1px solid rgba(255,77,109,0.12)" }}>
           Discord API или voice недоступен. После проверки профилей можно вручную очистить Cache/Code Cache Discord; VortexPass не удаляет их автоматически, чтобы не затронуть пользовательские данные.
@@ -1672,11 +1709,12 @@ function GameFilterTab({
 }) {
   const [open, setOpen] = useState(false);
   const games = [
-    { id: "phasmophobia", name: "Phasmophobia", subtitle: "Photon and Vivox · лобби, войс-чат (1024-65535)", color: "#F7B955" },
-    { id: "roblox", name: "Roblox", subtitle: "Изображения, аватары и CDN", color: "#6AA8FF" },
+    { id: "phasmophobia", name: "Phasmophobia", subtitle: "Gameplay — напрямую · Vivox voice — мягкая обработка", color: "#F7B955" },
+    { id: "roblox", name: "Roblox", subtitle: "Gameplay — напрямую · Web/CDN — обработка", color: "#6AA8FF" },
+    { id: "deadbydaylight", name: "Dead by Daylight", subtitle: "Gameplay UDP — напрямую · авторизация — обработка", color: "#E35B68" },
   ] as const;
   const selectedGames = games.filter((game) => info.selectedGames.includes(game.id));
-  const setGame = (id: "phasmophobia" | "roblox", value: boolean) => {
+  const setGame = (id: "phasmophobia" | "roblox" | "deadbydaylight", value: boolean) => {
     const next = new Set(info.selectedGames);
     if (value) next.add(id); else next.delete(id);
     onChange({ ...info, selectedGames: games.map((game) => game.id).filter((gameId) => next.has(gameId)) });
@@ -1700,7 +1738,7 @@ function GameFilterTab({
             <Dot on={active} pulse={active} />
           </div>
           <div className="text-[11px] font-mono text-[#3A3A5E] mt-1">
-            {active ? `Активен · ${info.protocol === "all" ? "UDP + TCP" : info.protocol.toUpperCase()} · Phasmophobia (Photon and Vivox)` : "Применяется только после главной кнопки запуска"}
+            {active ? `Активен · ${info.protocol === "all" ? "UDP + TCP" : info.protocol.toUpperCase()} · ${selectedGames.map((game) => game.name).join(", ") || "игры не выбраны"}` : "Применяется только после главной кнопки запуска"}
           </div>
         </div>
         <Toggle checked={selected} onChange={onToggle} disabled={pending} />
@@ -1730,7 +1768,7 @@ function GameFilterTab({
                   const checked = info.selectedGames.includes(game.id);
                   return <button key={game.id} type="button" onClick={() => setGame(game.id, !checked)} className="w-full flex items-center gap-3 px-3 py-3 rounded-lg text-left hover:bg-white/5">
                     <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ background: `${game.color}1A`, color: game.color }}>
-                      {game.id === "roblox" ? <span className="text-[13px] font-black leading-none">R</span> : <GameFilterIcon size={18} />}
+                      {game.id === "roblox" ? <span className="text-[13px] font-black leading-none">R</span> : game.id === "deadbydaylight" ? <span className="text-[11px] font-black leading-none">DBD</span> : <GameFilterIcon size={18} />}
                     </div>
                     <div className="flex-1"><div className="text-[13px] font-semibold text-white">{game.name}</div><div className="text-[10px] font-mono text-[#4A4A6A]">{game.subtitle}</div></div>
                     <span className="w-5 h-5 rounded-md flex items-center justify-center" style={{ background: checked ? "#6C5CE7" : "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)" }}>
@@ -1759,7 +1797,7 @@ function GameFilterTab({
             </button>
           ))}
         </div>
-        <p className="text-[10px] font-mono text-[#4A4A6A] mt-4">Изменения сохранены и будут применены при следующем запуске защиты. VortexPass перехватывает порты 1024-65535 для серверов матчей и войс-чата Vivox с обходом блокировок.</p>
+        <p className="text-[10px] font-mono text-[#4A4A6A] mt-4">Изменения сохраняются до следующего запуска защиты. Для каждой игры используются отдельные узкие правила; общий игровой трафик и чужие сессии не перехватываются.</p>
       </GlassCard>
     </div>
   );
@@ -1769,18 +1807,20 @@ function GameFilterTab({
 // TAB 5 — PROFILES
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function ProfilesTab({ favorites, currentLevel, currentTuning, pending, onSelect, onLaunch, onFavoriteToggle }: {
+function ProfilesTab({ favorites, currentLevel, currentTuning, compatibility, pending, onSelect, onLaunch, onFavoriteToggle, onCompatibility }: {
   favorites: FavoriteProfile[];
   currentLevel: string;
   currentTuning: number;
+  compatibility: CompatibilityInfo;
   pending: boolean;
   onSelect: (profile: FavoriteProfile) => void;
   onLaunch: (profile: FavoriteProfile) => void;
   onFavoriteToggle: (profile: FavoriteProfile, favorite: boolean) => void;
+  onCompatibility: (mode: "standard" | "mobile", launch: boolean) => void;
 }) {
   const [query, setQuery] = useState("");
   const normalizedQuery = query.trim().toLocaleLowerCase("ru-RU");
-  const profiles = PROFILE_CATALOG.filter((profile) =>
+  const profiles = createProfileCatalog(compatibility.mode).filter((profile) =>
     !normalizedQuery || [profile.label, profile.short, profile.description, profile.level]
       .some((value) => value.toLocaleLowerCase("ru-RU").includes(normalizedQuery)),
   );
@@ -1789,8 +1829,88 @@ function ProfilesTab({ favorites, currentLevel, currentTuning, pending, onSelect
     <div className="flex flex-col gap-5">
       <div>
         <h1 className="text-[23px] font-bold text-white" style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}>Профили</h1>
-        <p className="text-[12px] text-[#67678B] mt-1">Все 20 стратегий обхода, быстрый запуск и избранное для дашборда</p>
+        <p className="text-[12px] text-[#67678B] mt-1">Стратегии подключения, профиль текущей сети и избранное для дашборда</p>
       </div>
+
+      <GlassCard className="p-5 overflow-hidden relative">
+        <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(circle at 100% 0%,rgba(69,197,245,0.10),transparent 45%)" }} />
+        <div className="relative flex items-center justify-between gap-4 mb-4">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-10 h-10 rounded-xl flex items-center justify-center text-[#45C5F5] flex-shrink-0"
+              style={{ background: "rgba(69,197,245,0.09)", border: "1px solid rgba(69,197,245,0.22)" }}>
+              <Smartphone size={18} />
+            </div>
+            <div className="min-w-0">
+              <div className="text-[13px] font-semibold text-[#E2E2EF]">Профиль текущей сети</div>
+              <div className="text-[9px] font-mono text-[#55557A] mt-1 truncate">
+                Настройка запоминается отдельно для этого подключения
+              </div>
+            </div>
+          </div>
+          {compatibility.remembered && <span className="text-[8px] font-mono text-[#00D68F]">ЗАПОМНЕН</span>}
+        </div>
+        <div className="relative grid grid-cols-2 gap-3">
+          {([
+            { id: "standard", title: "Обычная сеть", detail: "Текущие полные правила для домашнего провайдера" },
+            { id: "mobile", title: "Мобильная совместимость", detail: "Узкие правила без широкого Game Filter и Telegram IP-закрепления" },
+          ] as const).map((item) => {
+            const selected = compatibility.mode === item.id;
+            return (
+              <div key={item.id} className="relative rounded-xl p-3 pr-12"
+                style={{ background: selected ? "rgba(69,197,245,0.11)" : "rgba(255,255,255,0.03)", border: `1px solid ${selected ? "rgba(69,197,245,0.34)" : "rgba(255,255,255,0.06)"}` }}>
+                <button type="button" disabled={pending} onClick={() => onCompatibility(item.id, false)} className="w-full text-left disabled:opacity-45">
+                  <div className="text-[11px] font-semibold" style={{ color: selected ? "#BDEBFF" : "#8585A5" }}>{item.title}</div>
+                  <div className="text-[9px] font-mono text-[#4A4A6A] mt-1 leading-relaxed">{item.detail}</div>
+                  {item.id === "mobile" && selected && (
+                    <div className="text-[8px] font-mono text-[#6C9CB5] mt-2">
+                      YouTube: {compatibility.youtubeTransport === "quic" ? "QUIC подтверждён" : compatibility.youtubeTransport === "http2" ? "TCP/HTTP2 fallback" : "автовыбор"}
+                    </div>
+                  )}
+                </button>
+                <motion.button type="button" whileTap={{ scale: 0.88 }} disabled={pending}
+                  onClick={() => onCompatibility(item.id, true)} title="Выбрать и запустить защиту"
+                  className="absolute right-3 top-3 w-8 h-8 rounded-lg flex items-center justify-center disabled:opacity-35"
+                  style={{ color: selected ? "#BDEBFF" : "#74779A", background: selected ? "rgba(69,197,245,0.14)" : "rgba(255,255,255,0.035)", border: "1px solid rgba(255,255,255,0.08)" }}>
+                  <Play size={13} fill="currentColor" />
+                </motion.button>
+              </div>
+            );
+          })}
+        </div>
+        {compatibility.mode === "mobile" && (
+          <div className="relative mt-3 rounded-xl px-3 py-2.5 text-[9px] font-mono text-[#6C9CB5]"
+            style={{ background: "rgba(69,197,245,0.045)", border: "1px solid rgba(69,197,245,0.12)" }}>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span>{compatibility.providerName || "Оператор определяется"}</span>
+              <span>· Мобильный профиль</span>
+              <span>· Telegram: {compatibility.optimizeState === "confirmed" ? "маршрут подтверждён" : compatibility.optimizeState === "cached" ? "сохранённый маршрут" : compatibility.optimizeState === "fallback" ? "резервный маршрут" : compatibility.optimizeState === "partial" ? "частичный маршрут" : compatibility.optimizeState === "manual" ? "нужна проверка" : "подбор маршрута"}</span>
+              <span>· Discord: {compatibility.discordVoiceApplied === "minimal" ? "минимальный voice" : compatibility.discordVoiceApplied ?? "авто"}</span>
+              <span>· YouTube: {compatibility.youtubeTransport === "quic" ? "QUIC" : compatibility.youtubeTransport === "http2" ? "HTTP/2" : "авто"}</span>
+              <span>· DNS: {compatibility.dnsState === "ready" ? `защищён${compatibility.dnsResolver ? ` (${compatibility.dnsResolver})` : ""}` : compatibility.dnsState === "portBusy" ? "порт 53 занят" : compatibility.dnsState === "dohUnavailable" ? "DoH недоступен" : compatibility.dnsState === "restored" ? "восстановлен" : "подготовка"}</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1 text-[#7897A8]">
+              <span>Домены winws: {compatibility.winwsDomainCount ?? "—"}</span>
+              <span>{compatibility.pinnedIpDetail ?? "Закреплённые IP: нет — безопасный DNS-маршрут"}</span>
+            </div>
+            {compatibility.routes && <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 mt-2">
+              {["youtube", "discord", "telegram"].map((id) => {
+                const route = compatibility.routes?.[id];
+                if (!route) return null;
+                const label = id === "youtube" ? "YouTube" : id === "discord" ? "Discord Web" : "Telegram Web";
+                const routeLabel = route.route === "warpProxy" ? "WARP-прокси" : route.route === "http2+winws" ? "HTTP/2 + winws" : "winws";
+                return <div key={id} className="rounded-lg px-2 py-1.5 bg-black/15" title={route.detail}>
+                  <span className={route.state === "confirmed" ? "text-[#63D9A6]" : route.state === "manual" ? "text-[#FFB340]" : "text-[#8297A5]"}>{label} — {routeLabel}</span>
+                </div>;
+              })}
+            </div>}
+            {(compatibility.dnsDetail || compatibility.optimizeDetail) && <div className="mt-1 text-[#536D80] truncate" title={compatibility.dnsDetail || compatibility.optimizeDetail}>{compatibility.dnsDetail || compatibility.optimizeDetail}</div>}
+            <button type="button" disabled={pending} onClick={() => postNativePayload({ type: "compatibility.route.refresh" })}
+              className="mt-2 px-2.5 py-1.5 rounded-lg text-[9px] text-[#9CC9DD] bg-[#45C5F50B] border border-[#45C5F526] disabled:opacity-40">
+              Перепроверить маршруты
+            </button>
+          </div>
+        )}
+      </GlassCard>
 
       <GlassCard className="p-5 overflow-hidden relative">
         <div className="absolute inset-0 pointer-events-none" style={{ background: "radial-gradient(circle at 8% 0%,rgba(177,36,57,0.09),transparent 38%),radial-gradient(circle at 92% 0%,rgba(108,92,231,0.11),transparent 42%)" }} />
@@ -2206,6 +2326,7 @@ function SettingsTab({
     preparing: { label: "Подготовка обновления…", color: "#B5AEFC", bg: "rgba(108,92,231,0.15)", border: "rgba(108,92,231,0.3)" },
     deferred: { label: "Обновление установится при следующем запуске", color: "#00D68F", bg: "rgba(0,214,143,0.1)", border: "rgba(0,214,143,0.3)" },
     installing: { label: "Запуск updater…", color: "#B5AEFC", bg: "rgba(108,92,231,0.15)", border: "rgba(108,92,231,0.3)" },
+    unavailable: { label: "Повторить проверку GitHub", color: "#FFB340", bg: "rgba(255,179,64,0.1)", border: "rgba(255,179,64,0.3)" },
     failed: { label: "Повторить проверку", color: "#FF6B6B", bg: "rgba(255,107,107,0.1)", border: "rgba(255,107,107,0.3)" },
     downloading: { label: `Скачивание v${update.availableVersion ?? ""}…`, color: "#B5AEFC", bg: "rgba(108,92,231,0.15)", border: "rgba(108,92,231,0.3)" },
   };
@@ -2518,9 +2639,31 @@ export default function App() {
   }));
   const [bypassLevel, setBypassLevel] = useState(String((window as NativeWindow).__vortexRuntime?.bypassLevel ?? "medium"));
   const [bypassTuning, setBypassTuning] = useState(Number((window as NativeWindow).__vortexRuntime?.bypassTuning ?? 0));
+  const [compatibility, setCompatibility] = useState<CompatibilityInfo>(() => ({
+    mode: (window as NativeWindow).__vortexRuntime?.compatibility?.mode === "mobile" ? "mobile" : "standard",
+    networkKey: (window as NativeWindow).__vortexRuntime?.compatibility?.networkKey,
+    remembered: Boolean((window as NativeWindow).__vortexRuntime?.compatibility?.remembered),
+    youtubeTransport: (window as NativeWindow).__vortexRuntime?.compatibility?.youtubeTransport ?? "auto",
+    discordVoiceMode: (window as NativeWindow).__vortexRuntime?.compatibility?.discordVoiceMode ?? "auto",
+    discordVoiceApplied: (window as NativeWindow).__vortexRuntime?.compatibility?.discordVoiceApplied ?? "minimal",
+    providerName: (window as NativeWindow).__vortexRuntime?.compatibility?.providerName,
+    telegramRouteCount: Number((window as NativeWindow).__vortexRuntime?.compatibility?.telegramRouteCount ?? 0),
+    optimizeState: (window as NativeWindow).__vortexRuntime?.compatibility?.optimizeState ?? "idle",
+    optimizeDetail: (window as NativeWindow).__vortexRuntime?.compatibility?.optimizeDetail ?? "",
+    dnsState: (window as NativeWindow).__vortexRuntime?.compatibility?.dnsState ?? "idle",
+    dnsDetail: (window as NativeWindow).__vortexRuntime?.compatibility?.dnsDetail ?? "",
+    dnsResolver: (window as NativeWindow).__vortexRuntime?.compatibility?.dnsResolver ?? "",
+    dnsAdapter: (window as NativeWindow).__vortexRuntime?.compatibility?.dnsAdapter ?? "",
+    winwsDomainCount: Number((window as NativeWindow).__vortexRuntime?.compatibility?.winwsDomainCount ?? 0),
+    pinnedIpCount: Number((window as NativeWindow).__vortexRuntime?.compatibility?.pinnedIpCount ?? 0),
+    pinnedIpDetail: (window as NativeWindow).__vortexRuntime?.compatibility?.pinnedIpDetail,
+    routes: (window as NativeWindow).__vortexRuntime?.compatibility?.routes,
+  }));
   const [favoriteProfiles, setFavoriteProfiles] = useState<FavoriteProfile[]>(() => {
     const profiles = (window as NativeWindow).__vortexRuntime?.favoriteProfiles;
-    return Array.isArray(profiles) ? profiles.slice(0, 5).map((profile) => ({ level: String(profile.level), tuning: Number(profile.tuning ?? 0) })) : [];
+    return Array.isArray(profiles) ? profiles.slice(0, 5).map((profile) => ({
+      level: String(profile.level), tuning: Number(profile.tuning ?? 0), mode: profile.mode === "mobile" ? "mobile" as const : "standard" as const,
+    })) : [];
   });
   const [health, setHealth] = useState<HealthMap>({});
   const [hosts, setHosts] = useState<HostsInfo>({ applied: false, entryCount: 0, detail: "hosts не применён" });
@@ -2565,11 +2708,15 @@ export default function App() {
     if (message.type === "profile.status") {
       setBypassLevel(String(message.level ?? "medium"));
       setBypassTuning(Number(message.tuning ?? 0));
+      if (message.compatibility) setCompatibility(message.compatibility as CompatibilityInfo);
       if (Array.isArray(message.favoriteProfiles)) {
-        setFavoriteProfiles(message.favoriteProfiles.slice(0, 5).map((profile: any) => ({ level: String(profile.level), tuning: Number(profile.tuning ?? 0) })));
+        setFavoriteProfiles(message.favoriteProfiles.slice(0, 5).map((profile: any) => ({
+          level: String(profile.level), tuning: Number(profile.tuning ?? 0), mode: profile.mode === "mobile" ? "mobile" : "standard",
+        })));
       }
     }
     if (message.type === "health.status") setHealth((message.services ?? {}) as HealthMap);
+    if (message.type === "compatibility.optimize.status" || message.type === "compatibility.dns.status" || message.type === "compatibility.route.status") setCompatibility((current) => ({ ...current, ...(message as Partial<CompatibilityInfo>) }));
     if (message.type === "hosts.status") setHosts(message as HostsInfo);
     if (message.type === "settings.status") {
       setSettings((current) => ({
@@ -2623,12 +2770,13 @@ export default function App() {
     if (controlsBusy) return;
     setBypassLevel(profile.level);
     setBypassTuning(profile.tuning);
-    postNativePayload({ type: "profile.set", level: profile.level, tuning: profile.tuning });
+    if (profile.mode) setCompatibility((current) => ({ ...current, mode: profile.mode! }));
+    postNativePayload({ type: "profile.set", level: profile.level, tuning: profile.tuning, mode: profile.mode ?? compatibility.mode });
   };
 
   const handleFavoriteToggle = (profile: FavoriteProfile, favorite: boolean) => {
     if (favorite && favoriteProfiles.length >= 5) return;
-    postNativePayload({ type: "profile.favorite.set", level: profile.level, tuning: profile.tuning, favorite });
+    postNativePayload({ type: "profile.favorite.set", level: profile.level, tuning: profile.tuning, mode: profile.mode ?? compatibility.mode, favorite });
   };
 
   const handleProfileLaunch = (profile: FavoriteProfile) => {
@@ -2636,7 +2784,8 @@ export default function App() {
     setBypassLevel(profile.level);
     setBypassTuning(profile.tuning);
     setProtectionPending(true);
-    postNativePayload({ type: "profile.launch", level: profile.level, tuning: profile.tuning });
+    if (profile.mode) setCompatibility((current) => ({ ...current, mode: profile.mode! }));
+    postNativePayload({ type: "profile.launch", level: profile.level, tuning: profile.tuning, mode: profile.mode ?? compatibility.mode });
   };
 
   const content: Record<Tab, React.ReactNode> = {
@@ -2655,6 +2804,7 @@ export default function App() {
         gameFilterSelected={gameFilterSelected}
         bypassLevel={bypassLevel}
         bypassTuning={bypassTuning}
+        compatibilityMode={compatibility.mode}
         favoriteProfiles={favoriteProfiles}
         health={health}
         hosts={hosts}
@@ -2687,10 +2837,16 @@ export default function App() {
         favorites={favoriteProfiles}
         currentLevel={bypassLevel}
         currentTuning={bypassTuning}
+        compatibility={compatibility}
         pending={controlsBusy}
         onSelect={handleProfileSelected}
         onLaunch={handleProfileLaunch}
         onFavoriteToggle={handleFavoriteToggle}
+        onCompatibility={(mode, launch) => {
+          if (controlsBusy) return;
+          setCompatibility((current) => ({ ...current, mode, remembered: true }));
+          postNativePayload({ type: "compatibility.set", mode, launch });
+        }}
       />
     ),
     youtube: (

@@ -18,6 +18,8 @@ public sealed class AppSettings
     public List<FavoriteProfileSettings> FavoriteProfiles { get; set; } = [];
     public List<AdvisorHistoryEntry> AdvisorHistory { get; set; } = [];
     public int ProfileSettingsVersion { get; set; }
+    public string CompatibilityMode { get; set; } = "standard";
+    public List<NetworkCompatibilitySettings> NetworkCompatibilityProfiles { get; set; } = [];
     public GameFilterSettings GameFilter { get; set; } = new();
     public WarpSettings Warp { get; set; } = new();
     public List<string> CustomBypassDomains { get; set; } = [];
@@ -28,6 +30,7 @@ public sealed class FavoriteProfileSettings
 {
     public string Level { get; set; } = "medium";
     public int Tuning { get; set; }
+    public string Mode { get; set; } = "standard";
 }
 
 public sealed class AdvisorHistoryEntry
@@ -53,6 +56,51 @@ public sealed class BypassProfileSettings
     public bool GameFilter { get; set; }
 
     public bool AnyEnabled => YouTube || Discord || Telegram || TelegramWeb || Web || GameFilter;
+}
+
+public sealed class NetworkCompatibilitySettings
+{
+    public string NetworkKey { get; set; } = string.Empty;
+    public string Mode { get; set; } = "standard";
+    public string ProviderKey { get; set; } = string.Empty;
+    public string ProviderName { get; set; } = string.Empty;
+    public string YouTubeTransport { get; set; } = "auto";
+    public int YouTubeHttp3Successes { get; set; }
+    public int YouTubeHttp3Failures { get; set; }
+    public string DiscordVoiceMode { get; set; } = "auto";
+    public string DiscordVoiceResolvedMode { get; set; } = "direct";
+    public string TelegramStrategy { get; set; } = "strong";
+    public Dictionary<string, MobileServiceRouteState> ServiceRoutes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public bool MobileWarpFallbackOwned { get; set; }
+    public bool MobileWarpWasConnected { get; set; }
+    public Dictionary<string, string> TelegramRoutes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public MobileDnsState MobileDns { get; set; } = new();
+    public string OptimizationState { get; set; } = "idle";
+    public string OptimizationDetail { get; set; } = string.Empty;
+    public DateTimeOffset? LastSuccessfulOptimizationUtc { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+}
+
+public sealed class MobileServiceRouteState
+{
+    public string ServiceId { get; set; } = string.Empty;
+    public string Strategy { get; set; } = "primary";
+    public string LastSuccessfulStrategy { get; set; } = string.Empty;
+    public string AppliedRoute { get; set; } = "winws";
+    public string State { get; set; } = "idle";
+    public string Detail { get; set; } = string.Empty;
+    public int ConsecutiveFailures { get; set; }
+    public DateTimeOffset? LastConfirmedUtc { get; set; }
+    public DateTimeOffset? LastCheckedUtc { get; set; }
+}
+
+public sealed class MobileDnsState
+{
+    public string NetworkKey { get; set; } = string.Empty;
+    public string Resolver { get; set; } = string.Empty;
+    public string State { get; set; } = "idle";
+    public string Detail { get; set; } = string.Empty;
+    public DateTimeOffset? LastCheckedUtc { get; set; }
 }
 
 public sealed class WarpSettings

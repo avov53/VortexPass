@@ -10,9 +10,18 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Telegram ping ignores slow page loading", Sync(TestTelegramReportedLatency)),
     ("Discord voice is isolated and stable", Sync(TestDiscordVoice)),
     ("Discord CDN uses a bounded fast route", Sync(TestDiscordCdnRoute)),
+    ("Mobile DNS bootstrap hosts stay narrow", Sync(TestMobileDnsBootstrapHosts)),
+    ("Mobile DNS lifecycle policy is fail-safe", Sync(TestMobileDnsLifecyclePolicy)),
+    ("Mobile compatibility stays narrow and reversible", Sync(TestMobileCompatibilityProfile)),
+    ("Phasmophobia voice has a home-only stable route", Sync(TestPhasmophobiaVoiceRoute)),
+    ("Dead by Daylight uses a narrow game route", Sync(TestDeadByDaylightRoute)),
+    ("Mobile Telegram route starts strong and falls back narrowly", Sync(TestMobileTelegramStrategies)),
+    ("Mobile partial health states are honest", Sync(TestMobilePartialHealthStates)),
     ("DNS chooses the lowest latency success", Sync(TestDnsSelection)),
     ("Quad9 DNS wire messages are valid", Sync(TestDnsWireFormat)),
+    ("DNS resolver ignores transient empty winners", Sync(TestDnsResponsePolicy)),
     ("Startup scheduler arguments are safe", Sync(TestStartupArguments)),
+    ("Update transport failures stay non-blocking", Sync(TestUpdateTransportFailure)),
     ("WARP status and installer source are safe", Sync(TestWarpIntegration)),
     ("WARP transport is excluded from DPI", Sync(TestWarpDpiExclusions)),
     ("WARP bootstrap is narrow and restorable", Sync(TestWarpBootstrap)),
@@ -30,7 +39,11 @@ var tests = new (string Name, Func<Task> Run)[]
     ("WARP Telegram fallback selects a reachable route", Sync(TestWarpMeasuredRouteSelection)),
     ("WARP PAC is selective and reversible", Sync(TestWarpPacGeneration)),
     ("WARP PAC URL refreshes for browsers", TestWarpPacRefresh),
-    ("WARP auto protocol picks lowest median", Sync(TestWarpProtocolSelection))
+    ("WARP auto protocol picks lowest median", Sync(TestWarpProtocolSelection)),
+    ("Mobile service strategies are independent", Sync(TestMobileServiceStrategies)),
+    ("Mobile WARP fallback preserves direct services", Sync(TestMobileWarpFallbackScope)),
+    ("Mobile route health requires real content", Sync(TestMobileRouteHealthPolicy)),
+    ("Mobile route cache avoids transient restarts", Sync(TestMobileRouteCachePolicy))
 };
 
 var failures = new List<string>();
@@ -106,9 +119,9 @@ static void TestTelegramReportedLatency()
         "Telegram page-load time was reported as network ping");
     Require(ServiceHealthCheckService.SelectTelegramReportedLatency(null, 220) is null,
         "Telegram page-load time was reported as ping without a transport measurement");
-    Require(ServiceHealthCheckService.ClassifyTelegramWebState(true, false) == ServiceHealthState.Healthy,
+    Require(ServiceHealthCheckService.ClassifyTelegramWebState(true, false) == ServiceHealthState.Partial,
         "Confirmed Telegram Web HTTP was overridden by optional probe timeouts");
-    Require(ServiceHealthCheckService.ClassifyTelegramWebState(false, true) == ServiceHealthState.Healthy,
+    Require(ServiceHealthCheckService.ClassifyTelegramWebState(false, true) == ServiceHealthState.Partial,
         "Working Telegram auxiliary routes were ignored after a primary timeout");
     Require(ServiceHealthCheckService.ClassifyTelegramWebState(false, false) == ServiceHealthState.HttpUnavailable,
         "Telegram was reported healthy without any confirmed Web route");
@@ -138,6 +151,196 @@ static void TestDiscordCdnRoute()
         "Discord CDN QUIC route is not bounded");
 }
 
+static void TestMobileDnsBootstrapHosts()
+{
+    Require(HostsFileManager.IsAllowedDynamicHostForTests("www.youtube.com"),
+        "Existing non-mobile YouTube DNS support unexpectedly changed");
+    foreach (var host in new[] { "discord.com", "discord.gg", "gateway.discord.gg" })
+        Require(!HostsFileManager.IsAllowedDynamicHostForTests(host), $"Mobile hosts still permit dangerous pinning for {host}");
+    Require(!HostsFileManager.IsAllowedDynamicHostForTests("rr1---sn.example.googlevideo.com"),
+        "Mobile DNS bootstrap pinned a YouTube video CDN");
+    Require(!HostsFileManager.IsAllowedDynamicHostForTests("cdn.discordapp.com"),
+        "Mobile DNS bootstrap pinned Discord CDN media");
+    Require(HostsFileManager.IsAllowedDynamicHostForTests("tr.rbxcdn.com") &&
+            HostsFileManager.IsAllowedDynamicHostForTests("thumbnails.roblox.com"),
+        "Independently validated Roblox CDN routes are rejected");
+
+    var command = WinwsProfileComposer.Compose(new BypassProfileSettings { YouTube = true }, "medium", new(), null, "user-exclusions.txt", 0,
+        mobileCompatibilityMode: true);
+    var firstRule = command[..command.IndexOf(" --new", StringComparison.Ordinal)];
+    Require(firstRule.Contains("list-doh.txt", StringComparison.Ordinal) && !firstRule.Contains("hostlist-exclude", StringComparison.Ordinal),
+        "Dedicated DoH rule is still disabled by the general exclusion list");
+}
+
+static void TestMobileDnsLifecyclePolicy()
+{
+    Require(MobileDnsPolicy.ShouldRun(true, "mobile", false), "Mobile protection did not start its DNS guard");
+    Require(!MobileDnsPolicy.ShouldRun(false, "mobile", false), "DNS guard runs with protection disabled");
+    Require(MobileDnsPolicy.ShouldRun(true, "standard", false), "Home protection did not start its DNS guard");
+    Require(!MobileDnsPolicy.ShouldRun(true, "mobile", true), "DNS guard conflicts with WARP-owned DNS");
+    Require(!MobileDnsPolicy.ShouldRun(true, "standard", true), "Home DNS guard conflicts with WARP-owned DNS");
+    Require(MobileDnsPolicy.WarpOwnsSystemDns(true, "proxy") &&
+            MobileDnsPolicy.WarpOwnsSystemDns(true, "smart") &&
+            MobileDnsPolicy.WarpOwnsSystemDns(true, "full") &&
+            MobileDnsPolicy.WarpOwnsSystemDns(true, "dnsOnly") &&
+            !MobileDnsPolicy.WarpOwnsSystemDns(false, "full"),
+        "Connected WARP mode did not suppress the competing local DNS guard");
+    Require(MobileDnsPolicy.CanPinEmergencyHost("web.telegram.org"), "Telegram emergency host was rejected");
+    Require(!MobileDnsPolicy.CanPinEmergencyHost("www.youtube.com") && !MobileDnsPolicy.CanPinEmergencyHost("discord.com"),
+        "YouTube or Discord can still be pinned by the mobile emergency route");
+    Require(MobileDnsPolicy.MustDiscardLegacyRoutes(6) && !MobileDnsPolicy.MustDiscardLegacyRoutes(7),
+        "Legacy seven-host cache migration boundary is incorrect");
+}
+
+static void TestMobileCompatibilityProfile()
+{
+    var profiles = new BypassProfileSettings
+    {
+        YouTube = true,
+        Discord = true,
+        Telegram = true,
+        TelegramWeb = true,
+        GameFilter = true
+    };
+    var games = new GameFilterSettings { SelectedGames = ["roblox"], Protocol = "all" };
+    var mobile = WinwsProfileComposer.Compose(profiles, "aggressive", games, null, null, 3,
+        mobileCompatibilityMode: true, youtubeTransport: "auto", discordMobileStrategy: "fallback");
+    Require(!mobile.Contains("--filter-tcp=1024-65535", StringComparison.Ordinal),
+        "Mobile profile captured every high TCP port");
+    Require(!mobile.Contains("1024-1700,1702-2407,2409-4499,4501-65535", StringComparison.Ordinal),
+        "Mobile profile captured almost every UDP port");
+    Require(!mobile.Contains("list-telegram-ipset.txt", StringComparison.Ordinal),
+        "Mobile profile pinned Telegram to raw DC ranges");
+    Require(mobile.Contains("--hostlist=files\\list-telegram.txt", StringComparison.Ordinal),
+        "Mobile profile lost the narrow Telegram hostname route");
+    var websocketRule = "--hostlist-domains=kws.web.telegram.org,zws.web.telegram.org";
+    Require(mobile.Contains(websocketRule, StringComparison.Ordinal) &&
+            mobile.IndexOf(websocketRule, StringComparison.Ordinal) < mobile.IndexOf("--hostlist=files\\list-telegram.txt", StringComparison.Ordinal),
+        "Mobile Telegram WebSocket rule does not precede the general Telegram rule");
+    Require(mobile.Contains("--hostlist=files\\list-discord.txt --dpi-desync=fake,multidisorder", StringComparison.Ordinal) &&
+            mobile.Contains("--dpi-desync-fooling=badseq", StringComparison.Ordinal),
+        "Mobile Discord does not use its dedicated TCP strategy");
+    Require(!mobile.Contains("ACTIVE_DISCORD_UDP.bin", StringComparison.Ordinal),
+        "Composer auto mode unexpectedly guessed a voice route");
+    Require(mobile.Contains("--filter-tcp=443 --hostlist=files\\list-roblox.txt --dpi-desync=fake,fakedsplit --dpi-desync-repeats=4", StringComparison.Ordinal) &&
+            mobile.Contains("--filter-udp=443 --hostlist=files\\list-roblox.txt --filter-l7=quic --dpi-desync=fake --dpi-desync-repeats=2", StringComparison.Ordinal),
+        "Mobile Roblox retained the slow high-repeat image/CDN route");
+
+    var minimalVoice = WinwsProfileComposer.Compose(profiles, "aggressive", games, null, null, 3,
+        mobileCompatibilityMode: true, youtubeTransport: "auto", discordVoiceMode: "minimal");
+    Require(minimalVoice.Contains("--filter-udp=19294-19344,50000-50100", StringComparison.Ordinal) &&
+            minimalVoice.Contains("--dpi-desync-repeats=2", StringComparison.Ordinal),
+        "Mobile minimal voice lost its narrow UDP rule");
+    var directVoice = WinwsProfileComposer.Compose(profiles, "aggressive", games, null, null, 3,
+        mobileCompatibilityMode: true, discordVoiceMode: "direct");
+    Require(!directVoice.Contains("ACTIVE_DISCORD_UDP.bin", StringComparison.Ordinal),
+        "Direct Discord voice unexpectedly applies desync");
+
+    var http2 = WinwsProfileComposer.Compose(new BypassProfileSettings { YouTube = true }, "aggressive", new(), null, null, 3,
+        mobileCompatibilityMode: true, youtubeTransport: "http2");
+    Require(!http2.Contains("--filter-udp=443 --hostlist=files\\list-youtube.txt", StringComparison.Ordinal) &&
+            !http2.Contains("--filter-udp=443 --ipset=files\\list-youtube-ipset.txt", StringComparison.Ordinal),
+        "HTTP/2 fallback still applies YouTube QUIC rules");
+
+    var ordinary = WinwsProfileComposer.Compose(profiles, "aggressive", games, null, null, 3);
+    Require(!ordinary.Contains("--filter-tcp=1024-65535", StringComparison.Ordinal) &&
+            !ordinary.Contains("1024-1700,1702-2407,2409-4499,4501-65535", StringComparison.Ordinal) &&
+            ordinary.Contains("list-roblox.txt", StringComparison.Ordinal) &&
+            ordinary.Contains("list-telegram-ipset.txt", StringComparison.Ordinal),
+        "Ordinary Roblox profile is not narrow or lost its service routes");
+    Require(ordinary.Contains("--filter-tcp=443 --hostlist-domains=rbxcdn.com", StringComparison.Ordinal),
+        "Roblox CDN did not receive its bounded fast route");
+    var homeWebSocketStart = ordinary.IndexOf(websocketRule, StringComparison.Ordinal);
+    var homeTelegramStart = ordinary.IndexOf("--hostlist=files\\list-telegram.txt", StringComparison.Ordinal);
+    Require(homeWebSocketStart < 0,
+        "Home Telegram profile shadows its proven general hostlist with a duplicate WebSocket rule");
+    Require(homeTelegramStart >= 0,
+        "Home Telegram general hostlist rule is missing");
+    Require(WinwsProfileComposer.NormalizeCompatibilityMode("MOBILE") == "mobile" &&
+            WinwsProfileComposer.NormalizeCompatibilityMode("unknown") == "standard",
+        "Compatibility mode normalization is unsafe");
+}
+
+static void TestPhasmophobiaVoiceRoute()
+{
+    var profiles = new BypassProfileSettings { GameFilter = true };
+    var games = new GameFilterSettings { SelectedGames = ["phasmophobia"], Protocol = "tcp" };
+    var home = WinwsProfileComposer.Compose(profiles, "medium", games, null, null, 0);
+    const string voicePorts = "5055-5058,27000-27002,12000-65000";
+    Require(home.Contains($"--filter-udp={voicePorts} --dpi-desync=fake --dpi-desync-repeats=2", StringComparison.Ordinal),
+        "Phasmophobia voice did not receive its stable UDP route");
+    Require(home.Contains($"--wf-udp=443,{voicePorts}", StringComparison.Ordinal),
+        "Phasmophobia voice UDP is not captured when the game UI is set to TCP");
+
+    var mobile = WinwsProfileComposer.Compose(profiles, "medium", games, null, null, 0, mobileCompatibilityMode: true);
+    Require(!mobile.Contains(voicePorts, StringComparison.Ordinal),
+        "Mobile compatibility unexpectedly enabled the wide Vivox voice range");
+}
+
+static void TestDeadByDaylightRoute()
+{
+    var profiles = new BypassProfileSettings { GameFilter = true };
+    var games = new GameFilterSettings { SelectedGames = ["deadbydaylight"], Protocol = "all" };
+    var home = WinwsProfileComposer.Compose(profiles, "medium", games, null, null, 0);
+    Require(home.Contains("--hostlist=files\\list-deadbydaylight.txt", StringComparison.Ordinal),
+        "Dead by Daylight hostlist is missing");
+    Require(home.Contains("--filter-tcp=80", StringComparison.Ordinal) &&
+            home.Contains("--filter-tcp=443", StringComparison.Ordinal) &&
+            home.Contains("--filter-udp=443", StringComparison.Ordinal),
+        "Dead by Daylight web/matchmaking route is incomplete");
+    Require(!home.Contains("--filter-udp=27000-27031", StringComparison.Ordinal) &&
+            !home.Contains("--filter-udp=1024-65535", StringComparison.Ordinal),
+        "Dead by Daylight captured broad Steam or game UDP traffic");
+
+    var mobile = WinwsProfileComposer.Compose(profiles, "aggressive", games, null, null, 3,
+        mobileCompatibilityMode: true);
+    Require(mobile.Contains("--hostlist=files\\list-deadbydaylight.txt --dpi-desync=fake,fakedsplit --dpi-desync-repeats=4", StringComparison.Ordinal) &&
+            mobile.Contains("--filter-udp=443 --hostlist=files\\list-deadbydaylight.txt --filter-l7=quic --dpi-desync=fake --dpi-desync-repeats=2", StringComparison.Ordinal),
+        "Mobile Dead by Daylight route is not bounded");
+}
+
+static void TestMobileTelegramStrategies()
+{
+    var profiles = new BypassProfileSettings { TelegramWeb = true };
+    var strong = WinwsProfileComposer.Compose(profiles, "moderate", new(), null, null, 0,
+        mobileCompatibilityMode: true, telegramStrategy: "strong");
+    Require(strong.Contains("--dpi-desync=fake,multidisorder", StringComparison.Ordinal) &&
+            strong.Contains("--dpi-desync-fooling=badseq", StringComparison.Ordinal) &&
+            strong.Contains("--dpi-desync-repeats=6", StringComparison.Ordinal) &&
+            strong.Contains("--dpi-desync-cutoff=n3", StringComparison.Ordinal),
+        "Strong mobile Telegram strategy is incomplete");
+    Require(!strong.Contains("list-telegram-ipset.txt", StringComparison.Ordinal),
+        "Strong mobile Telegram strategy captured raw Telegram IP ranges");
+
+    var balanced = WinwsProfileComposer.Compose(profiles, "moderate", new(), null, null, 0,
+        mobileCompatibilityMode: true, telegramStrategy: "balanced");
+    Require(balanced.Contains("--dpi-desync=fake,fakedsplit", StringComparison.Ordinal),
+        "Fallback Telegram strategy is not the narrow balanced variant");
+    Require(WinwsProfileComposer.NormalizeTelegramStrategy("unknown") == "strong" &&
+            WinwsProfileComposer.NormalizeTelegramStrategy("BALANCED") == "balanced",
+        "Telegram strategy normalization is unsafe");
+}
+
+static void TestMobilePartialHealthStates()
+{
+    Require(ServiceHealthCheckService.ClassifyYouTubeState(true, true, true, false, true) == ServiceHealthState.Partial,
+        "Missing YouTube previews were reported as a full outage");
+    Require(ServiceHealthCheckService.ClassifyYouTubeState(true, true, true, true, false) == ServiceHealthState.Healthy,
+        "Working HTTP/2 fallback was not accepted as healthy YouTube");
+    Require(ServiceHealthCheckService.ClassifyYouTubeState(true, true, true, true, true) == ServiceHealthState.Healthy,
+        "Fully confirmed YouTube was not healthy");
+    Require(ServiceHealthCheckService.ClassifyYouTubeState(false, false, false, false, false) == ServiceHealthState.HttpUnavailable,
+        "Unavailable YouTube shell was not reported as unavailable");
+
+    var flowseal = File.ReadAllLines(Path.Combine(Directory.GetCurrentDirectory(), "components", "zapret", "files", "flowseal-hosts.txt"));
+    var telegramEntries = flowseal.Select(line => line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+        .Where(parts => parts.Length == 2 && HostsFileManager.IsTelegramWebFallbackHost(parts[1]))
+        .ToArray();
+    Require(telegramEntries.Length > 1, "Mobile Telegram fallback contains only one hosts entry");
+    Require(telegramEntries.All(parts => !parts[1].EndsWith(".discord.media", StringComparison.OrdinalIgnoreCase)),
+        "Discord media leaked into the Telegram fallback block");
+}
+
 static void TestDnsSelection()
 {
     var failed = new DnsOverrideResult("example.test", null, "failed", "failure");
@@ -160,6 +363,24 @@ static void TestDnsWireFormat()
     response.AddRange(new byte[] { 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4 });
     var addresses = DnsOverrideService.ParseDnsWireAddresses(response.ToArray());
     Require(addresses.Count == 1 && addresses[0].Equals(IPAddress.Parse("1.2.3.4")), "DoH A response was not parsed");
+}
+
+static void TestDnsResponsePolicy()
+{
+    var usable = new byte[12];
+    usable[2] = 0x81;
+    usable[3] = 0x80;
+    usable[7] = 1;
+    var empty = usable.ToArray();
+    empty[7] = 0;
+    var servfail = usable.ToArray();
+    servfail[3] = 0x82;
+
+    Require(DnsResponsePolicy.HasUsableAnswer(usable), "DNS answer with one record was rejected");
+    Require(!DnsResponsePolicy.HasUsableAnswer(empty), "Empty DNS response can still win the resolver race");
+    Require(!DnsResponsePolicy.HasUsableAnswer(servfail), "SERVFAIL can still win the resolver race");
+    Require(DnsResponsePolicy.IsNegative(empty) && DnsResponsePolicy.IsNegative(servfail),
+        "Negative DNS responses are not classified for short fallback caching");
 }
 
 static void TestStartupArguments()
@@ -199,7 +420,7 @@ static void TestWarpDpiExclusions()
         null,
         0);
     Require(!game.Contains("--filter-udp=1024-65535", StringComparison.Ordinal), "Broad game rule still captures WARP transport");
-    Require(game.Contains("1702-2407,2409-4499,4501-65535", StringComparison.Ordinal), "WARP transport ports are not left direct");
+    Require(!game.Contains("1702-2407,2409-4499,4501-65535", StringComparison.Ordinal), "Known game profile still captures unrelated UDP traffic");
 }
 
 static void TestWarpBootstrap()
@@ -317,18 +538,20 @@ static void TestTelegramHostsFallbackScope()
 
 static void TestTelegramFallbackWithOtherProfiles()
 {
-    var robloxOverrides = new[]
+    var unrelatedOverrides = new[]
     {
-        new HostsOverride(IPAddress.Parse("23.214.96.143"), RobloxThumbnailResolver.ThumbnailHost)
+        new HostsOverride(IPAddress.Parse("23.214.96.143"), "assets.example.test")
     };
-    Require(HostsFileManager.ShouldUseTelegramStaticFallback(true, false, false, robloxOverrides),
-        "Roblox DNS entries suppressed the Telegram static fallback");
+    Require(HostsFileManager.ShouldUseTelegramStaticFallback(true, false, false, unrelatedOverrides),
+        "Published home Telegram fallback was not applied");
+    Require(HostsFileManager.ShouldUseTelegramStaticFallback(true, false, true, unrelatedOverrides),
+        "Emergency Telegram fallback was not enabled when no measured route existed");
 
-    var telegramOverrides = robloxOverrides.Append(
-        new HostsOverride(IPAddress.Parse("149.154.167.220"), "web.telegram.org"));
-    Require(HostsFileManager.ShouldUseTelegramStaticFallback(true, false, false, telegramOverrides),
-        "A DNS-only Telegram route suppressed the signed browser fallback before reachability validation");
-    Require(!HostsFileManager.ShouldUseTelegramStaticFallback(true, true, true, robloxOverrides),
+    var telegramOverrides = unrelatedOverrides.Append(
+        new HostsOverride(IPAddress.Parse("149.154.167.233"), "web.telegram.org"));
+    Require(HostsFileManager.ShouldUseTelegramStaticFallback(true, false, true, telegramOverrides),
+        "Measured DNS route incorrectly suppressed the signed Telegram fallback");
+    Require(!HostsFileManager.ShouldUseTelegramStaticFallback(true, true, true, unrelatedOverrides),
         "Telegram hosts fallback remained active inside WARP compatibility mode");
 }
 
@@ -439,6 +662,80 @@ static void TestWarpProtocolSelection()
 {
     var selected = WarpService.SelectFastestProtocol(new Dictionary<string, long> { ["MASQUE"] = 273, ["WireGuard"] = 88 });
     Require(selected == "WireGuard", "Auto mode did not choose the lowest measured protocol");
+}
+
+static void TestMobileServiceStrategies()
+{
+    var profiles = new BypassProfileSettings { YouTube = true, Discord = true, TelegramWeb = true };
+    var primary = WinwsProfileComposer.Compose(profiles, "moderate", new(), null, null, mobileCompatibilityMode: true,
+        youtubeMobileStrategy: "primary", discordMobileStrategy: "primary", telegramStrategy: "strong");
+    var discordFallback = WinwsProfileComposer.Compose(profiles, "moderate", new(), null, null, mobileCompatibilityMode: true,
+        youtubeMobileStrategy: "primary", discordMobileStrategy: "fallback", telegramStrategy: "strong");
+    Require(primary.Contains("--ip-id=zero", StringComparison.Ordinal), "Primary YouTube strategy is missing");
+    Require(discordFallback.Contains("--hostlist=files\\list-discord.txt --dpi-desync=fake,multidisorder", StringComparison.Ordinal),
+        "Discord did not switch to its own fallback strategy");
+    Require(discordFallback.Contains("--hostlist-domains=googlevideo.com,video.google.com,redirector.googlevideo.com --ip-id=zero", StringComparison.Ordinal),
+        "Changing Discord unexpectedly changed YouTube");
+    Require(MobileRoutePolicy.AlternateStrategy("fallback") == "primary" &&
+            MobileRoutePolicy.AlternateStrategy("primary") == "fallback",
+        "Mobile advisor repeats the same saved strategy instead of testing the alternate");
+}
+
+static void TestMobileWarpFallbackScope()
+{
+    var domains = MobileRoutePolicy.DomainsForFallback(["youtube", "discord", "telegram"]);
+    Require(domains.Contains("discord.com") && domains.Contains("web.telegram.org"), "Web fallback domains are incomplete");
+    Require(!domains.Any(value => value.Contains("youtube", StringComparison.OrdinalIgnoreCase) || value.Contains("googlevideo", StringComparison.OrdinalIgnoreCase)),
+        "YouTube was sent through automatic mobile WARP fallback");
+    Require(!domains.Any(value => value.Contains("voice", StringComparison.OrdinalIgnoreCase)), "Discord voice was sent through SOCKS5");
+    Require(MobileRoutePolicy.SystemWarpDirectDomains.Contains("youtube.com") &&
+            MobileRoutePolicy.SystemWarpDirectDomains.Contains("rbxcdn.com") &&
+            !MobileRoutePolicy.SystemWarpDirectDomains.Any(value => value.Contains("discord", StringComparison.OrdinalIgnoreCase) || value.Contains("telegram", StringComparison.OrdinalIgnoreCase)),
+        "System WARP fallback does not preserve direct YouTube/Roblox routes or excludes its target services");
+}
+
+static void TestMobileRouteHealthPolicy()
+{
+    var tlsOnly = new ServiceHealthResult("youtube", ServiceHealthState.HttpUnavailable, "TLS OK; HTTP timed out");
+    var workingH2 = new ServiceHealthResult("youtube", ServiceHealthState.Healthy, "video and previews returned bytes");
+    var discordWebWithoutVoice = new ServiceHealthResult("discord", ServiceHealthState.Partial, "API, Gateway and CDN available; voice unconfirmed");
+    Require(!MobileRoutePolicy.AcceptsDirectRoute(tlsOnly), "TLS-only YouTube was accepted");
+    Require(MobileRoutePolicy.AcceptsDirectRoute(workingH2), "Working HTTP/2 YouTube was rejected");
+    Require(MobileRoutePolicy.AcceptsDirectRoute(discordWebWithoutVoice), "Discord web route was tied to voice confirmation");
+}
+
+static void TestMobileRouteCachePolicy()
+{
+    var now = DateTimeOffset.UtcNow;
+    var route = new MobileServiceRouteState
+    {
+        ServiceId = "discord",
+        Strategy = "fallback",
+        LastSuccessfulStrategy = "primary",
+        State = "confirmed",
+        AppliedRoute = "winws",
+        LastConfirmedUtc = now.AddMinutes(-10)
+    };
+    Require(MobileRoutePolicy.PreferredStrategy(route) == "primary",
+        "Last confirmed mobile strategy is not preferred at startup");
+    Require(MobileRoutePolicy.HasFreshSuccessfulStrategy(route, now, TimeSpan.FromHours(6)),
+        "Fresh direct strategy cache was rejected");
+    Require(!MobileRoutePolicy.ShouldTryAlternate(1) && MobileRoutePolicy.ShouldTryAlternate(2),
+        "A single transient failure can still restart mobile protection");
+    Require(MobileRoutePolicy.IsT2Provider("as12958", "T2 Mobile LLC") &&
+            MobileRoutePolicy.IsT2Provider("tele2", "operator") &&
+            !MobileRoutePolicy.IsT2Provider("other", "Home ISP"),
+        "T2 provider template detection is unsafe");
+}
+
+static void TestUpdateTransportFailure()
+{
+    var offline = new HttpRequestException("host unknown");
+    var serverError = new HttpRequestException("server error", null, HttpStatusCode.ServiceUnavailable);
+    Require(GitHubUpdateService.ClassifyTransportFailure(offline) == UpdateState.Unavailable,
+        "A DNS/network outage still opens the update failure modal");
+    Require(GitHubUpdateService.ClassifyTransportFailure(serverError) == UpdateState.Failed,
+        "A real GitHub HTTP error was hidden as an offline state");
 }
 
 static Func<Task> Sync(Action action) => () =>

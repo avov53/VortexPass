@@ -7,7 +7,9 @@ namespace VortexPass.Core.Services;
 
 public sealed class ExternalComponentService : IDisposable
 {
+    private sealed record VerifiedFile(long Length, DateTime LastWriteUtc, string Sha256);
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+    private static readonly ConcurrentDictionary<string, VerifiedFile> VerificationCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _baseDirectory;
     private readonly WinDivertDriverService _winDivertDriver;
     private readonly Dictionary<string, Process> _processes = new(StringComparer.OrdinalIgnoreCase);
@@ -86,12 +88,19 @@ public sealed class ExternalComponentService : IDisposable
                 PublishError(component, $"Для файла не указан утверждённый SHA-256: {required.Path}");
                 return;
             }
-            if (!await HashVerifier.MatchesAsync(requiredPath, required.Sha256, cancellationToken))
+            var info = new FileInfo(requiredPath);
+            var cacheKey = Path.GetFullPath(requiredPath);
+            var verified = VerificationCache.TryGetValue(cacheKey, out var cached) &&
+                           cached.Length == info.Length &&
+                           cached.LastWriteUtc == info.LastWriteTimeUtc &&
+                           cached.Sha256.Equals(required.Sha256, StringComparison.OrdinalIgnoreCase);
+            if (!verified && !await HashVerifier.MatchesAsync(requiredPath, required.Sha256, cancellationToken))
             {
                 PublishError(component, $"Не пройдена SHA-256 проверка: {required.Path}");
                 return;
             }
-            PublishDiagnostic($"[{component.DisplayName}] SHA-256 OK: {required.Path}");
+            VerificationCache[cacheKey] = new(info.Length, info.LastWriteTimeUtc, required.Sha256);
+            PublishDiagnostic($"[{component.DisplayName}] SHA-256 OK{(verified ? " (кэш)" : string.Empty)}: {required.Path}");
         }
 
         var executable = Path.Combine(_baseDirectory, component.Executable);

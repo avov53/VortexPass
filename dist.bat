@@ -53,12 +53,16 @@ if exist "%STAGING%" (
 )
 mkdir "%STAGING%" || goto :error
 mkdir "%STAGING%\updater" || goto :error
+mkdir "%STAGING%\dns-guard" || goto :error
 mkdir "%STAGING%\bin" || goto :error
 
-dotnet publish "%ROOT%src\VortexPass.App\VortexPass.App.csproj" -c Release -r win-x64 --self-contained true -p:Version=%VERSION% -p:AssemblyInformationalVersion=%VERSION% -o "%STAGING%"
+dotnet publish "%ROOT%src\VortexPass.App\VortexPass.App.csproj" -c Release -r win-x64 --self-contained true -p:NuGetAudit=false -p:Version=%VERSION% -p:AssemblyInformationalVersion=%VERSION% -o "%STAGING%"
 if errorlevel 1 goto :error
 
-dotnet publish "%ROOT%src\VortexPass.Updater\VortexPass.Updater.csproj" -c Release -r win-x64 --self-contained true -o "%STAGING%\updater"
+dotnet publish "%ROOT%src\VortexPass.Updater\VortexPass.Updater.csproj" -c Release -r win-x64 --self-contained true -p:NuGetAudit=false -o "%STAGING%\updater"
+if errorlevel 1 goto :error
+
+dotnet publish "%ROOT%src\VortexPass.DnsGuard\VortexPass.DnsGuard.csproj" -c Release -r win-x64 --self-contained true -p:NuGetAudit=false -o "%STAGING%\dns-guard"
 if errorlevel 1 goto :error
 
 xcopy "%ROOT%components\zapret\*" "%STAGING%\bin\" /E /I /Y >nul
@@ -76,6 +80,10 @@ if not exist "%STAGING%\VortexPass.exe" (
 )
 if not exist "%STAGING%\updater\VortexPass.Updater.exe" (
   echo ERROR: VortexPass.Updater.exe was not created.
+  goto :error
+)
+if not exist "%STAGING%\dns-guard\VortexPass.DnsGuard.exe" (
+  echo ERROR: VortexPass.DnsGuard.exe was not created.
   goto :error
 )
 if not exist "%STAGING%\assets\external-components.json" (

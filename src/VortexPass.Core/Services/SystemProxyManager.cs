@@ -61,6 +61,13 @@ public sealed class SystemProxyManager
         NativeMethods.InternetSetOption(IntPtr.Zero, 37, IntPtr.Zero, 0);
     }
 
+    public bool IsOwnedPacApplied()
+    {
+        if (string.IsNullOrWhiteSpace(_ownedPacUrl)) return false;
+        using var key = Registry.CurrentUser.OpenSubKey(InternetSettings, writable: false);
+        return string.Equals(key?.GetValue("AutoConfigURL") as string, _ownedPacUrl, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static class NativeMethods
     {
         [System.Runtime.InteropServices.DllImport("wininet.dll", SetLastError = true)]

@@ -22,6 +22,7 @@
         { "path": "bin\\files\\list-telegram-ipset.txt", "sha256": "d8b083218327c5f4a5a25aefae408306aa5a5bddbc8ad8627d0a8f1d88308750" },
         { "path": "bin\\files\\list-roblox.txt", "sha256": "82b4d060a8368b5782f9e5453faaab9d3323783d9cfd62cc67f2f6a6401f7df7" },
         { "path": "bin\\files\\list-phasmophobia.txt", "sha256": "6852147c8bd4dd36194e21aadc57583f66e8795299bc52ac0497bf902b089ca5" },
+        { "path": "bin\\files\\list-deadbydaylight.txt", "sha256": "8fca32c661f74e3557a805c419707b42dd2afd25173a36eca237cc1acc175cff" },
         { "path": "bin\\files\\list-doh.txt", "sha256": "a413a2f41f6e3945e73883b169f725d8fd46cb9089e6252405794d6679fc29d0" },
         { "path": "bin\\files\\list-doh-ipset.txt", "sha256": "4d40c2177493e564c9691a4e6f5b1adea5888ef3417676d5ea4fd96b0d2a3755" },
         { "path": "bin\\files\\list-warp.txt", "sha256": "8d439e0056fa2b8ac81425dcab90c518ab4aa283acc83425102634f9376a23a9" },

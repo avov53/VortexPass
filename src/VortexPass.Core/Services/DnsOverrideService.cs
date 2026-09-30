@@ -96,6 +96,46 @@ public sealed class DnsOverrideService
         return failed;
     }
 
+    public async Task<IReadOnlyList<DnsOverrideResult>> ResolveCandidatesAsync(
+        string host,
+        bool verifyTls = true,
+        string? httpProbeUrl = null,
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        var normalizedHost = host.Trim().TrimEnd('.').ToLowerInvariant();
+        var timeoutValue = timeout ?? TimeSpan.FromSeconds(2);
+        var attempts = new List<Task<DnsOverrideResult>>
+        {
+            TrySystemDnsAsync(normalizedHost, verifyTls, httpProbeUrl, timeoutValue, cancellationToken)
+        };
+        attempts.AddRange(Providers.Select(provider =>
+            TryProviderAsync(provider, normalizedHost, verifyTls, httpProbeUrl, timeoutValue, cancellationToken)));
+        var results = await Task.WhenAll(attempts);
+        return results
+            .Where(result => result.Succeeded && result.Address is not null)
+            .GroupBy(result => result.Address!)
+            .Select(group => group.OrderBy(result => result.LatencyMs ?? long.MaxValue).First())
+            .OrderBy(result => result.LatencyMs ?? long.MaxValue)
+            .ToArray();
+    }
+
+    public Task<DnsOverrideResult> ValidateCandidateAsync(
+        string host,
+        IPAddress address,
+        string source,
+        string? httpProbeUrl = null,
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default) =>
+        ValidateAddressesAsync(
+            host.Trim().TrimEnd('.').ToLowerInvariant(),
+            [address],
+            source,
+            verifyTls: true,
+            httpProbeUrl,
+            timeout ?? TimeSpan.FromSeconds(2),
+            cancellationToken);
+
     private static async Task<DnsOverrideResult> TrySystemDnsAsync(
         string host,
         bool verifyTls,
