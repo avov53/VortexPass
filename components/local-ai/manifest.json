@@ -1,0 +1,57 @@
+{
+  "name": "Qwen2.5-0.5B-Instruct Q4_K_M",
+  "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+  "runtime": "llama.cpp b5046 CPU (no AVX required)",
+  "files": [
+    {
+      "path": "ggml-base.dll",
+      "sha256": "0ca3fdc6d10c2aad8edab891ad9da30f5b1e10648675c931720dffb73bce372f",
+      "size": 489472
+    },
+    {
+      "path": "ggml-cpu.dll",
+      "sha256": "d06704448b028314fbdd9e132a50fbe0b5760932a4dbf65ed19dc592d513b7ea",
+      "size": 428032
+    },
+    {
+      "path": "ggml-rpc.dll",
+      "sha256": "becad218b9f3673dd3a46b4b4c8c3c247e1da5bd1d75e156160cbb4c87bb6e21",
+      "size": 94208
+    },
+    {
+      "path": "ggml.dll",
+      "sha256": "a74c695701250d9870b416ca751b87cee9030c2c24204a076a49e2aa67f1fa11",
+      "size": 69120
+    },
+    {
+      "path": "llama-cli.exe",
+      "sha256": "7ae2c5aab59480b9628007d71a8c42b5ef4a7a28969fee3b8b7e022ebeedc829",
+      "size": 1218560
+    },
+    {
+      "path": "LLAMA-LICENSE.txt",
+      "sha256": "e562a2ddfaf8280537795ac5ecd34e3012b6582a147ef69ba6a6a5c08c84757d",
+      "size": 1078
+    },
+    {
+      "path": "llama.dll",
+      "sha256": "2743a6d8043f0f7411e8c05253b7372a63a7fc4b2767a57e4dd60d9c37d410db",
+      "size": 1224704
+    },
+    {
+      "path": "llava_shared.dll",
+      "sha256": "bbd90d7b3f78caf88355f11817cfa357479ebf19f8357e26fd3f65d44802c4aa",
+      "size": 278528
+    },
+    {
+      "path": "QWEN-LICENSE.txt",
+      "sha256": "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e",
+      "size": 11343
+    },
+    {
+      "path": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
+      "size": 491400032
+    }
+  ]
+}

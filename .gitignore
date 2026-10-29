@@ -9,6 +9,13 @@ artifacts/
 
 # Temporary component downloads and packaging output
 components-temp/
+# Local AI binaries/weights are reconstructed from pinned official sources by
+# scripts/Prepare-LocalAiBundle.ps1 and included in the portable distribution.
+components/local-ai/*.gguf
+components/local-ai/*.dll
+components/local-ai/*.exe
+components/local-ai/*.download
+components/local-ai/download-*/
 dist/
 dist.next/
 dist.build.*/
@@ -28,3 +35,32 @@ release/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Private state, backups and credentials (never source/release input)
+.vortexpass-local-backup/
+dist.backup*/
+**/.env
+**/.env.*
+**/*.pfx
+**/*.p12
+**/*.key
+**/settings.json
+**/update-state.json
+**/app.log
+**/crash.log
+**/updater.log
+**/private-backups/
+# Downloaded installer is included in the portable ZIP, reconstructed by script.
+components/warp-installer/*.msi
+# Prototype build output; sources remain available.
+design/**/dist/
+design/**/standalone.html
+design/ПЕРЕНОС*
+src/**/web-dist/
+# Local visual QA and UI reference screenshots are not release/source inputs.
+design/qa/
+design/halloween/qa/
+design/assets/reference/
+# Compiled Telegram runtime and generated MSI transform stay in release assets.
+components/zapret/TgWsProxyHeadless/
+components/warp-installer/*.mst

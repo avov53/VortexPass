@@ -1,0 +1,8 @@
+Model: Qwen/Qwen2.5-0.5B-Instruct-GGUF, Apache-2.0
+https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/tree/9217f5db79a29953eb74d5343926648285ec7e67
+qwen2.5-0.5b-instruct-q4_k_m.gguf
+SHA256: 74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db
+Runtime: llama.cpp b5046, MIT, Windows x64 CPU without AVX requirement
+https://github.com/ggml-org/llama.cpp/releases/tag/b5046
+Archive SHA256: 61d252296c93c9e3f95b9f209b1f5b5effca849b62fdd6c6423d6e69638007c3
+See QWEN-LICENSE.txt and LLAMA-LICENSE.txt. No cloud inference or runtime model downloads.

@@ -3,4 +3,8 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <AssemblyName>VortexPass.Core</AssemblyName>
   </PropertyGroup>
+  <ItemGroup><EmbeddedResource Include="..\..\components\warp-installer\suppress-gui.mst" LogicalName="VortexPass.WarpGuiTransform" /></ItemGroup>
+  <Target Name="BuildWarpGuiTransform" BeforeTargets="PrepareForBuild" Inputs="$(MSBuildProjectDirectory)\..\..\components\warp-installer\Cloudflare_WARP_Release-x64.msi;$(MSBuildProjectDirectory)\..\..\scripts\Build-WarpGuiTransform.ps1" Outputs="$(MSBuildProjectDirectory)\..\..\components\warp-installer\suppress-gui.mst">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\..\..\scripts\Build-WarpGuiTransform.ps1&quot; -InstallerPath &quot;$(MSBuildProjectDirectory)\..\..\components\warp-installer\Cloudflare_WARP_Release-x64.msi&quot; -OutputPath &quot;$(MSBuildProjectDirectory)\..\..\components\warp-installer\suppress-gui.mst&quot;" />
+  </Target>
 </Project>

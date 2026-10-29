@@ -16,6 +16,7 @@ public sealed class WarpBootstrapService : IDisposable
     public WarpBootstrapService(string? baseDirectory = null) => _baseDirectory = baseDirectory;
 
     public bool IsActive => _snapshot is not null;
+    public int? ProcessId => _process is { HasExited: false } process ? process.Id : null;
     public WarpBootstrapSnapshot? Snapshot => _snapshot;
 
     public void Begin(bool protectionWasRunning)
@@ -83,7 +84,13 @@ public sealed class WarpBootstrapService : IDisposable
         if (!process.Start()) throw new InvalidOperationException("Windows не запустила отдельный WARP bootstrap.");
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
-        await Task.Delay(400, cancellationToken);
+        try { await Task.Delay(400, cancellationToken); }
+        catch
+        {
+            if (!process.HasExited) { process.Kill(entireProcessTree: true); await process.WaitForExitAsync(CancellationToken.None); }
+            process.Dispose();
+            throw;
+        }
         if (process.HasExited)
         {
             var detail = diagnostics.IsEmpty ? string.Empty : $" Вывод: {string.Join(" | ", diagnostics)}";

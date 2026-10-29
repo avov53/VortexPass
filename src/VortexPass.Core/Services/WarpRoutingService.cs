@@ -18,7 +18,7 @@ public static class WarpRoutingPlanner
     {
         ["youtube"] = ["youtube.com", "youtu.be", "googlevideo.com", "ytimg.com", "ggpht.com", "googleusercontent.com", "youtubei.googleapis.com"],
         ["discord"] = ["discord.com", "discord.gg", "discordapp.com", "discordapp.net", "discord.media"],
-        ["telegram"] = ["telegram.org", "web.telegram.org", "telesco.pe", "telegram-cdn.org", "telegramusercontent.com"],
+        ["telegram"] = TelegramWebPolicy.Domains,
         ["games"] = []
     };
 
@@ -39,8 +39,7 @@ public static class WarpRoutingPlanner
         }
         settings.ProxyPort = settings.ProxyPort is >= 1024 and <= 65535 ? settings.ProxyPort : 41870;
         settings.RoutingMode = NormalizeRoutingMode(settings.RoutingMode);
-        settings.ProtocolPreference = NormalizeProtocol(settings.ProtocolPreference);
-        settings.MasquePreference = NormalizeMasque(settings.MasquePreference);
+        WarpTransportPolicy.Migrate(settings);
         settings.DnsMode = NormalizeDnsMode(settings.DnsMode);
         settings.NetworkOptimizations ??= [];
     }
@@ -145,17 +144,24 @@ public static class WarpRoutingPlanner
 
 public sealed class WarpPacService : IDisposable
 {
+    private readonly WarpHttpProxy _httpProxy=new();
+    public bool DiagnosticsEnabled {get=>_httpProxy.DiagnosticsEnabled;set=>_httpProxy.DiagnosticsEnabled=value;}
+    public WarpProxyMetrics ProxyMetrics=>_httpProxy.Metrics;
     private TcpListener? _listener;
     private CancellationTokenSource? _lifetime;
     private Task? _loop;
     private string _content = string.Empty;
     public Uri? PacUri { get; private set; }
+    public Uri? HttpProxyUri {get;private set;}
 
     public async Task<Uri> StartAsync(IEnumerable<string> domains, int socksPort, int preferredPort, CancellationToken cancellationToken = default)
     {
         await StopAsync();
-        _content = GeneratePac(domains, socksPort);
-        _listener = new TcpListener(IPAddress.Loopback, preferredPort);
+        var selected=domains.ToArray();
+        var httpPort=await _httpProxy.StartAsync(selected,socksPort,cancellationToken);
+        HttpProxyUri=new Uri($"http://127.0.0.1:{httpPort}");
+        _content = GeneratePac(selected, httpPort);
+        _listener = new TcpListener(IPAddress.Loopback, preferredPort is >=1024 and <=65535?preferredPort:0);
         try { _listener.Start(); }
         catch (SocketException)
         {
@@ -166,7 +172,7 @@ public sealed class WarpPacService : IDisposable
         // A changing URL forces browsers (notably Firefox in system-proxy
         // mode) to discard a cached PAC after the WARP route changes.
         PacUri = new Uri($"http://127.0.0.1:{port}/vortexpass.pac?v={Guid.NewGuid():N}");
-        _lifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _lifetime = new CancellationTokenSource();
         _loop = ServeAsync(_lifetime.Token);
         return PacUri;
     }
@@ -177,6 +183,8 @@ public sealed class WarpPacService : IDisposable
         _listener?.Stop();
         if (_loop is not null) try { await _loop; } catch (OperationCanceledException) { } catch (SocketException) { }
         _loop = null; _listener = null; _lifetime?.Dispose(); _lifetime = null; PacUri = null;
+        await _httpProxy.StopAsync();
+        HttpProxyUri=null;
     }
 
     private async Task ServeAsync(CancellationToken cancellationToken)
@@ -206,8 +214,8 @@ public sealed class WarpPacService : IDisposable
     {
         var values = domains.Select(WarpRoutingPlanner.NormalizeDomain).Where(value => value is not null).Distinct(StringComparer.OrdinalIgnoreCase).Order().ToArray();
         var json = System.Text.Json.JsonSerializer.Serialize(values);
-        return $"function FindProxyForURL(url, host) {{ var d={json}; host=host.toLowerCase(); for(var i=0;i<d.length;i++){{if(host===d[i]||dnsDomainIs(host,'.'+d[i]))return 'SOCKS5 127.0.0.1:{socksPort}; DIRECT';}} return 'DIRECT'; }}";
+        return $"function FindProxyForURL(url, host) {{ var d={json}; host=host.toLowerCase(); for(var i=0;i<d.length;i++){{if(host===d[i]||dnsDomainIs(host,'.'+d[i]))return 'PROXY 127.0.0.1:{socksPort}';}} return 'DIRECT'; }}";
     }
 
-    public void Dispose() => StopAsync().GetAwaiter().GetResult();
+    public void Dispose() { _lifetime?.Cancel();_listener?.Stop();_ = _httpProxy.StopAsync(); }
 }

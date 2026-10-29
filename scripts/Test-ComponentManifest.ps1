@@ -76,6 +76,27 @@ foreach ($component in $manifest.components) {
     }
 }
 
+$proxyRoot = Join-Path $componentsFullPath 'TgWsProxyHeadless'
+$proxyManifest = Join-Path $proxyRoot 'runtime-manifest.json'
+if (-not (Test-Path -LiteralPath $proxyManifest -PathType Leaf)) {
+    $failures.Add('Missing Telegram proxy runtime manifest')
+} elseif ((Get-Sha256Hex -Path $proxyManifest) -ne '97302511ab74596d7d707ee60ad262a36f7d35a09b2a49046a1c04c89b3a8624') {
+    $failures.Add('Telegram proxy runtime manifest SHA-256 mismatch')
+} else {
+    $proxyBundle = Get-Content -LiteralPath $proxyManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+    $proxyPrefix = [IO.Path]::GetFullPath($proxyRoot).TrimEnd('\') + '\'
+    foreach ($file in $proxyBundle.files) {
+        $path = [IO.Path]::GetFullPath((Join-Path $proxyRoot $file.path))
+        if (-not $path.StartsWith($proxyPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+            -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            $failures.Add("Missing or invalid Telegram runtime path: $($file.path)")
+        } elseif ((Get-Sha256Hex -Path $path) -ne $file.sha256) {
+            $failures.Add("Telegram runtime SHA-256 mismatch: $($file.path)")
+        }
+        $checked++
+    }
+}
+
 if ($failures.Count -gt 0) {
     foreach ($failure in $failures) {
         Write-Error $failure

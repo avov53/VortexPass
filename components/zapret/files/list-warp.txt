@@ -1,5 +1,12 @@
 api.cloudflareclient.com
+api.devices.cloudflare.com
+zero-trust-client.cloudflareclient.com
+notifications.cloudflareclient.com
 engage.cloudflareclient.com
+consumer-masque-proxy.cloudflareclient.com
 warp.cloudflare.com
 cloudflare-dns.com
 one.one.one.one
+1111-releases.cloudflareclient.com
+www.cloudflare.com
+downloads.cloudflareclient.com

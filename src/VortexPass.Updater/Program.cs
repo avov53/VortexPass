@@ -22,6 +22,9 @@ internal static class Program
 
     public static async Task<int> Main(string[] args)
     {
+        using var window=new UpdateWindow(args.Contains("--light"),!args.Contains("--standard"));
+        if(args.Length>=2&&args[0]=="--render-preview")
+        {window.Stage("Проверяем комплект обновления…\nНастройки и подключения остаются без изменений.");await window.SavePreview(Path.GetFullPath(args[1]));return 0;}
         Arguments? input = null;
         try
         {
@@ -29,20 +32,24 @@ internal static class Program
             Log("Updater started.");
             input = ParseArguments(args);
 
+            window.Stage("Проверяем целостность скачанного обновления…");
             if (!string.IsNullOrWhiteSpace(input.Sha256) && !await HashVerifier.MatchesAsync(input.ZipPath, input.Sha256))
                 throw new InvalidDataException("SHA-256 скачанного ZIP не совпадает с ожидаемым значением.");
 
+            window.Stage("Ожидаем завершения VortexPass…");
             await WaitForProcessExitAsync(input.ProcessId, TimeSpan.FromSeconds(45));
             EnsureTargetIsWritable(input.TargetPath);
 
             var staging = Path.Combine(Path.GetTempPath(), "VortexPass-install", Guid.NewGuid().ToString("N"));
             try
             {
+                window.Stage("Распаковываем и проверяем комплект…");
                 ExtractSafely(input.ZipPath, staging);
                 if (!File.Exists(Path.Combine(staging, "VortexPass.exe")))
                     throw new InvalidDataException("В ZIP нет VortexPass.exe в корневой папке.");
 
                 PreflightInstall(staging, input.TargetPath);
+                window.Stage("Устанавливаем файлы. Не выключайте компьютер…");
                 InstallWithRollback(staging, input.TargetPath);
             }
             finally
@@ -51,6 +58,7 @@ internal static class Program
             }
 
             await MarkCompletedAsync(input);
+            window.Stage("Обновление установлено. Открываем приложение…");
             StartUpdatedApp(input);
             Log("Updater completed.");
             return 0;
@@ -59,7 +67,7 @@ internal static class Program
         {
             Log($"ERROR: {ex}");
             if (input is not null) await MarkFailedAsync(input, ex.Message);
-            System.Windows.Forms.MessageBox.Show($"VortexPass не удалось обновить:\n{ex.Message}\n\nПодробности: {LogPath}", "VortexPass", System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Error);
+            await window.Failure($"{ex.Message}\n\nПодробности сохранены в updater.log.");
             return 1;
         }
     }
@@ -164,55 +172,8 @@ internal static class Program
         Log("Preflight write access check completed.");
     }
 
-    private static void InstallWithRollback(string staging, string target)
-    {
-        var backup = Path.Combine(Path.GetTempPath(), "VortexPass-backup", Guid.NewGuid().ToString("N"));
-        var installed = new List<(string Destination, bool Existed)>();
-        try
-        {
-            foreach (var source in Directory.GetFiles(staging, "*", SearchOption.AllDirectories))
-            {
-                var relative = Path.GetRelativePath(staging, source);
-                var destination = Path.Combine(target, relative);
-                var existed = File.Exists(destination);
-                if (existed)
-                {
-                    var backupFile = Path.Combine(backup, relative);
-                    Directory.CreateDirectory(Path.GetDirectoryName(backupFile)!);
-                    Retry($"резервная копия {destination}", () => File.Copy(destination, backupFile, overwrite: true));
-                }
-
-                Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-                Retry($"замена {destination}", () => File.Copy(source, destination, overwrite: true));
-                installed.Add((destination, existed));
-                Log($"Installed: {relative}");
-            }
-        }
-        catch
-        {
-            Log("Install failed. Rolling back.");
-            foreach (var (destination, existed) in installed.AsEnumerable().Reverse())
-            {
-                var relative = Path.GetRelativePath(target, destination);
-                var backupFile = Path.Combine(backup, relative);
-                try
-                {
-                    if (existed && File.Exists(backupFile)) Retry($"rollback {destination}", () => File.Copy(backupFile, destination, overwrite: true));
-                    else if (!existed && File.Exists(destination)) Retry($"rollback delete {destination}", () => File.Delete(destination));
-                }
-                catch (Exception rollbackEx)
-                {
-                    Log($"ROLLBACK ERROR for {destination}: {rollbackEx.Message}");
-                }
-            }
-            throw;
-        }
-        finally
-        {
-            TryDeleteDirectory(backup);
-        }
-    }
-
+    private static void InstallWithRollback(string staging,string target)=>
+        UpdateFileInstaller.Install(staging,target,Log,(source,destination)=>Retry("замена файла",()=>File.Copy(source,destination,true)));
     private static void Retry(string action, Action work)
     {
         Exception? last = null;
@@ -313,3 +274,5 @@ internal static class Program
         catch { }
     }
 }
+
+

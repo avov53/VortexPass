@@ -2,13 +2,15 @@ using System.Diagnostics;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
+using System.Text.Json;
 
 namespace VortexPass.Core.Services;
 
 public sealed class TelegramDesktopProxyService : IDisposable
 {
-    public const string Version = "1.9.0-headless";
-    public const string ExpectedSha256 = "76ea79f932861614a433eedf2227b3abfd6e79bacfea0fb65bc3ac58978341f5";
+    public const string Version = "1.11.2-headless";
+    public const string ExpectedSha256 = "fd2dac969c77bc7f944c8a2a7b94d3637c3ecf6023398faaa4e2af9373fbdefa";
+    public const string ManifestSha256 = "97302511ab74596d7d707ee60ad262a36f7d35a09b2a49046a1c04c89b3a8624";
     public const int Port = 1443;
 
     private readonly string _sourcePath;
@@ -69,7 +71,7 @@ public sealed class TelegramDesktopProxyService : IDisposable
         startInfo.ArgumentList.Add("--buf-kb");
         startInfo.ArgumentList.Add("256");
         startInfo.ArgumentList.Add("--pool-size");
-        startInfo.ArgumentList.Add("4");
+        startInfo.ArgumentList.Add("8");
         startInfo.ArgumentList.Add("--verbose");
 
         // Do not let activity from an earlier protection session produce a false
@@ -174,9 +176,17 @@ public sealed class TelegramDesktopProxyService : IDisposable
         Directory.CreateDirectory(_runtimeDirectory);
         var sourceDirectory = Path.GetDirectoryName(_sourcePath)
             ?? throw new InvalidOperationException("Не удалось определить папку Telegram WS Proxy.");
+        await VerifyBundleAsync(sourceDirectory, cancellationToken);
+        var runtimeManifest = Path.Combine(_runtimeDirectory, "runtime-manifest.json");
+        if (!File.Exists(runtimeManifest) || !await HashVerifier.MatchesAsync(runtimeManifest, ManifestSha256, cancellationToken))
+        {
+            // Replace only the owned interpreter bundle. Keep proxy secret,
+            // configuration marker and logs in the parent runtime directory.
+            var interpreter = Path.Combine(_runtimeDirectory, "_internal");
+            if (Directory.Exists(interpreter)) Directory.Delete(interpreter, true);
+        }
         MirrorDirectory(sourceDirectory, _runtimeDirectory);
-        if (!await HashVerifier.MatchesAsync(_runtimeExecutable, ExpectedSha256, cancellationToken))
-            throw new InvalidDataException("Runtime-копия Telegram WS Proxy не прошла проверку SHA-256.");
+        await VerifyBundleAsync(_runtimeDirectory, cancellationToken);
 
         var storedSecret = LoadSecret();
         _secret = storedSecret ?? RandomNumberGenerator.GetHexString(32).ToLowerInvariant();
@@ -186,6 +196,22 @@ public sealed class TelegramDesktopProxyService : IDisposable
         // Offer Telegram configuration again after replacing that legacy secret.
         if (storedSecret is null && File.Exists(_configurationOfferedPath))
             File.Delete(_configurationOfferedPath);
+    }
+
+    public static async Task VerifyBundleAsync(string directory, CancellationToken cancellationToken = default)
+    {
+        var manifest = Path.Combine(directory, "runtime-manifest.json");
+        if (!await HashVerifier.MatchesAsync(manifest, ManifestSha256, cancellationToken))
+            throw new InvalidDataException("Telegram WS Proxy: манифест не прошёл проверку SHA-256.");
+        using var document = JsonDocument.Parse(await File.ReadAllTextAsync(manifest, cancellationToken));
+        var root = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        foreach (var file in document.RootElement.GetProperty("files").EnumerateArray())
+        {
+            var path = Path.GetFullPath(Path.Combine(root, file.GetProperty("path").GetString()!));
+            if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase) ||
+                !await HashVerifier.MatchesAsync(path, file.GetProperty("sha256").GetString()!, cancellationToken))
+                throw new InvalidDataException("Telegram WS Proxy: файл runtime не прошёл проверку SHA-256.");
+        }
     }
 
     private string EnsureSecret()
@@ -322,7 +348,7 @@ public sealed class TelegramDesktopProxyService : IDisposable
         return path.Equals(_runtimeExecutable, StringComparison.OrdinalIgnoreCase)
             || path.Equals(_sourcePath, StringComparison.OrdinalIgnoreCase)
             || path.Equals(_legacySourcePath, StringComparison.OrdinalIgnoreCase)
-            || path.StartsWith(_runtimeDirectory, StringComparison.OrdinalIgnoreCase);
+            || path.StartsWith(_runtimeDirectory.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 
     private void StopProcess()

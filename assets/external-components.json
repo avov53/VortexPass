@@ -1,7 +1,8 @@
 {
   "source": {
     "repository": "https://github.com/Flowseal/zapret-discord-youtube",
-    "commit": "61d7596c7ce82b6f320e5c79ff4598856f4ae7d3",
+    "commit": "865da4f4c3659523bf79bc6edf0446e7d7969614",
+    "version": "1.10.3",
     "license": "MIT"
   },
   "components": [
@@ -15,16 +16,17 @@
         { "path": "bin\\WinDivert.dll", "sha256": "c1e060ee19444a259b2162f8af0f3fe8c4428a1c6f694dce20de194ac8d7d9a2" },
         { "path": "bin\\WinDivert64.sys", "sha256": "8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2" },
         { "path": "bin\\cygwin1.dll", "sha256": "103104a52e5293ce418944725df19e2bf81ad9269b9a120d71d39028e821499b" },
-        { "path": "bin\\files\\list-youtube.txt", "sha256": "f824758c19de95b7a4ba5fe031410818e4ead4be71fe496b00cc78303b11b85e" },
+        { "path": "bin\\files\\list-youtube.txt", "sha256": "b42b760eca1de4e10d3dd41b7c0f616efc1ea19c7abeec282eda8dffee2bd1d6" },
         { "path": "bin\\files\\list-youtube-ipset.txt", "sha256": "390ecb9db5b7de9c25cfdba1212be8f0a9597ba8370afe859d78fd7a55b93af5" },
         { "path": "bin\\files\\list-discord.txt", "sha256": "3ce0e70906453bdfe52d7be4c822398ac8130c55e43e86126e5da5e1d2385bce" },
         { "path": "bin\\files\\list-telegram.txt", "sha256": "d968d3c9d7f44637027d18ff070bb2ee19d9234252c4bfa9f97cbd8a128a29db" },
         { "path": "bin\\files\\list-telegram-ipset.txt", "sha256": "d8b083218327c5f4a5a25aefae408306aa5a5bddbc8ad8627d0a8f1d88308750" },
         { "path": "bin\\files\\list-roblox.txt", "sha256": "82b4d060a8368b5782f9e5453faaab9d3323783d9cfd62cc67f2f6a6401f7df7" },
         { "path": "bin\\files\\list-phasmophobia.txt", "sha256": "6852147c8bd4dd36194e21aadc57583f66e8795299bc52ac0497bf902b089ca5" },
+        { "path": "bin\\files\\list-deadbydaylight.txt", "sha256": "8fca32c661f74e3557a805c419707b42dd2afd25173a36eca237cc1acc175cff" },
         { "path": "bin\\files\\list-doh.txt", "sha256": "a413a2f41f6e3945e73883b169f725d8fd46cb9089e6252405794d6679fc29d0" },
         { "path": "bin\\files\\list-doh-ipset.txt", "sha256": "4d40c2177493e564c9691a4e6f5b1adea5888ef3417676d5ea4fd96b0d2a3755" },
-        { "path": "bin\\files\\list-warp.txt", "sha256": "8d439e0056fa2b8ac81425dcab90c518ab4aa283acc83425102634f9376a23a9" },
+        { "path": "bin\\files\\list-warp.txt", "sha256": "c3c4796101b60ebd41560801e82196e15fd4638b63d7b164b84754ab26395e29" },
         { "path": "bin\\files\\flowseal-hosts.txt", "sha256": "ca810989b7e9ac87fb1ddb5786f01a80d862a6ff8f3c1cc883bb09baeab1c34d" },
         { "path": "bin\\files\\ACTIVE_DISCORD_UDP.bin", "sha256": "2fe18b3bd20807d36704d0b072092ee49ae84edca907a4420ab9a0f0f28fddcf" },
         { "path": "bin\\files\\ACTIVE_GAME_UDP.bin", "sha256": "e065870cb0d13152e6132807bbf42218a9e7cd8d96f5602b61674cc540f3a56e" },

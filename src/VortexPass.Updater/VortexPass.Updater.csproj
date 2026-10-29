@@ -2,12 +2,14 @@
   <PropertyGroup>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
-    <OutputType>Exe</OutputType>
+    <OutputType>WinExe</OutputType>
     <AssemblyName>VortexPass.Updater</AssemblyName>
     <RootNamespace>VortexPass.Updater</RootNamespace>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
   </PropertyGroup>
   <ItemGroup>
+    <Content Include="..\VortexPass.App\Assets\*-logo.png" Link="Assets\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <ProjectReference Include="..\VortexPass.Core\VortexPass.Core.csproj" />
   </ItemGroup>
 </Project>
+

@@ -46,7 +46,11 @@ public sealed class GitHubUpdateService
         }
         catch (HttpRequestException ex)
         {
-            return new(UpdateState.Failed, Error: $"Не удалось связаться с GitHub: {ex.Message}");
+            var state = ClassifyTransportFailure(ex);
+            var error = state == UpdateState.Unavailable
+                ? "Проверка обновлений временно недоступна: DNS или соединение с GitHub ещё не готовы. VortexPass повторит проверку после запуска защищённого DNS."
+                : $"GitHub вернул ошибку при проверке обновлений: {ex.Message}";
+            return new(state, Error: error);
         }
         catch (TaskCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -57,6 +61,9 @@ public sealed class GitHubUpdateService
             return new(UpdateState.Failed, Error: ex.Message);
         }
     }
+
+    public static UpdateState ClassifyTransportFailure(HttpRequestException exception) =>
+        exception.StatusCode.HasValue ? UpdateState.Failed : UpdateState.Unavailable;
 
     public async Task<DownloadedRelease> DownloadAsync(ReleaseInfo release, IProgress<double>? progress = null, CancellationToken cancellationToken = default)
     {

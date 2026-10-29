@@ -1,26 +1,43 @@
+using VortexPass.Core.Services;
 namespace VortexPass.Core.Models;
 
 public sealed class AppSettings
 {
     public bool StartWithWindows { get; set; }
     public bool StartProtectionOnStartup { get; set; }
+    public string StartupConnectionId { get; set; } = string.Empty;
+    public bool StartupProfileChoiceRequired { get; set; }
     public string StartupStrategy { get; set; } = "auto";
     public string LastSuccessfulStrategy { get; set; } = "medium";
     public int LastSuccessfulTuning { get; set; }
     public DateTimeOffset? LastSuccessfulStrategyUtc { get; set; }
     public string LastSuccessfulNetworkKey { get; set; } = string.Empty;
     public string SelectedDnsProvider { get; set; } = "auto";
+    public string DnsMode { get; set; } = "google-udp";
+    public bool NetworkDiagnosticDetails {get;set;}
+    public string GoogleDnsAddress { get; set; } = "auto";
     public bool MinimizeToTray { get; set; } = true;
+    public string Theme { get; set; } = "dark";
+    public bool ReduceMotion { get; set; }
     public DateTimeOffset? LastUpdateCheckUtc { get; set; }
     public BypassProfileSettings Profiles { get; set; } = new();
     public string BypassLevel { get; set; } = "medium";
     public int BypassTuning { get; set; }
     public List<FavoriteProfileSettings> FavoriteProfiles { get; set; } = [];
+    public List<SavedConnectionProfile> SavedConnections { get; set; } = [];
+    public string SelectedConnectionId { get; set; } = string.Empty;
+    public int ConnectionsMigrationVersion { get; set; }
     public List<AdvisorHistoryEntry> AdvisorHistory { get; set; } = [];
+    public LocalAdvisorSettings LocalAdvisor { get; set; } = new();
     public int ProfileSettingsVersion { get; set; }
+    public string CompatibilityMode { get; set; } = "standard";
+    public List<NetworkCompatibilitySettings> NetworkCompatibilityProfiles { get; set; } = [];
     public GameFilterSettings GameFilter { get; set; } = new();
     public WarpSettings Warp { get; set; } = new();
     public List<string> CustomBypassDomains { get; set; } = [];
+    public List<SiteRule> CurrentSiteRules {get;set;}=[];
+    public string TelegramWebRoute {get;set;}="direct";
+    public ConnectionWarpSnapshot? PendingConnectionWarpRestore {get;set;}
     public List<string> ExcludedDomains { get; set; } = DefaultDomainLists.CreateExclusions();
 }
 
@@ -28,6 +45,7 @@ public sealed class FavoriteProfileSettings
 {
     public string Level { get; set; } = "medium";
     public int Tuning { get; set; }
+    public string Mode { get; set; } = "standard";
 }
 
 public sealed class AdvisorHistoryEntry
@@ -45,6 +63,7 @@ public sealed class AdvisorHistoryEntry
 
 public sealed class BypassProfileSettings
 {
+    public bool Custom { get; set; }
     public bool YouTube { get; set; }
     public bool Discord { get; set; }
     public bool Telegram { get; set; }
@@ -52,11 +71,64 @@ public sealed class BypassProfileSettings
     public bool Web { get; set; }
     public bool GameFilter { get; set; }
 
-    public bool AnyEnabled => YouTube || Discord || Telegram || TelegramWeb || Web || GameFilter;
+    public bool AnyEnabled => YouTube || Discord || Telegram || TelegramWeb || Web || GameFilter || Custom;
+}
+
+public sealed class NetworkCompatibilitySettings
+{
+    public string NetworkKey { get; set; } = string.Empty;
+    public string Mode { get; set; } = "standard";
+    public string ProviderKey { get; set; } = string.Empty;
+    public string ProviderName { get; set; } = string.Empty;
+    public string YouTubeTransport { get; set; } = "auto";
+    public int YouTubeHttp3Successes { get; set; }
+    public int YouTubeHttp3Failures { get; set; }
+    public string DiscordVoiceMode { get; set; } = "auto";
+    public string DiscordVoiceResolvedMode { get; set; } = "direct";
+    public string TelegramStrategy { get; set; } = "strong";
+    public Dictionary<string, MobileServiceRouteState> ServiceRoutes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public bool MobileWarpFallbackOwned { get; set; }
+    public bool MobileWarpWasConnected { get; set; }
+    public Dictionary<string, string> TelegramRoutes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public MobileDnsState MobileDns { get; set; } = new();
+    public string OptimizationState { get; set; } = "idle";
+    public string OptimizationDetail { get; set; } = string.Empty;
+    public DateTimeOffset? LastSuccessfulOptimizationUtc { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+}
+
+public sealed class MobileServiceRouteState
+{
+    public string ServiceId { get; set; } = string.Empty;
+    public string Strategy { get; set; } = "primary";
+    public string LastSuccessfulStrategy { get; set; } = string.Empty;
+    public string AppliedRoute { get; set; } = "winws";
+    public string State { get; set; } = "idle";
+    public string Detail { get; set; } = string.Empty;
+    public int ConsecutiveFailures { get; set; }
+    public DateTimeOffset? LastConfirmedUtc { get; set; }
+    public DateTimeOffset? LastCheckedUtc { get; set; }
+}
+
+public sealed class MobileDnsState
+{
+    public string NetworkKey { get; set; } = string.Empty;
+    public string Resolver { get; set; } = string.Empty;
+    public string State { get; set; } = "idle";
+    public string Detail { get; set; } = string.Empty;
+    public DateTimeOffset? LastCheckedUtc { get; set; }
 }
 
 public sealed class WarpSettings
 {
+    public string? TransportSelection { get; set; }
+    public string TransportSelectionSource { get; set; } = "default";
+    public WarpLegacyTransportBackup? LegacyTransportBackup { get; set; }
+    public DateTimeOffset? PreparationCompletedUtc { get; set; }
+    public bool SuppressGui { get; set; } = true;
+    public bool AutomaticTransport { get; set; } = true;
+    public List<WarpGuiStartupEntry> GuiStartupBackup { get; set; } = [];
+    public List<WarpVerifiedVariant> VerifiedVariants { get; set; } = [];
     public bool Telegram { get; set; } = true;
     public bool Games { get; set; }
     public string RoutingMode { get; set; } = "smart";
@@ -108,6 +180,7 @@ public sealed class WarpPerformanceBaseline
 
 public sealed class GameFilterSettings
 {
+    public string RobloxAssetsMode { get; set; } = "standard";
     public List<string> SelectedGames { get; set; } = [];
     public string Protocol { get; set; } = "all";
     public string IpsetMode { get; set; } = "any";
@@ -239,6 +312,7 @@ akamaized.net
 akamaihd.net
 api.cloudflareclient.com
 engage.cloudflareclient.com
+consumer-masque-proxy.cloudflareclient.com
 updates.cloudflareclient.com
 warp.cloudflare.com
 cloudflare-dns.com
@@ -266,3 +340,4 @@ one.one.one.one
         return added;
     }
 }
+

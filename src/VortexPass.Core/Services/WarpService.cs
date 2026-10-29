@@ -102,6 +102,8 @@ public sealed record WarpClientConfiguration(
     string DnsMode,
     int ProxyPort = 41870);
 public sealed record WarpOwnedExclusions(IReadOnlyList<string> Hosts, IReadOnlyList<string> Ips);
+public sealed record WarpNativeConfiguration(string Protocol,string Masque,string Mode,int ProxyPort);
+public sealed class WarpRegistrationException(string message) : IOException(message);
 
 public sealed class WarpService : IDisposable
 {
@@ -109,6 +111,7 @@ public sealed class WarpService : IDisposable
     private const string ExpectedPublisher = "Cloudflare, Inc.";
     private static readonly Guid WinTrustActionGenericVerifyV2 = new("00AAC56B-CD44-11d0-8CC2-00C04FC295EE");
     private readonly HttpClient _http;
+    private readonly HttpClient _installerHttp;
     private readonly Func<Uri, CancellationToken, Task<WarpEndpointDiagnostic>> _endpointProbe;
     private readonly CloudflarePopDirectoryService _popDirectory;
     private readonly string _cacheDirectory;
@@ -121,6 +124,9 @@ public sealed class WarpService : IDisposable
     {
         _cacheDirectory = Path.Combine(appDataDirectory, "warp-cache");
         _http = httpClient ?? new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
+        _installerHttp = httpClient ?? new HttpClient(new SocketsHttpHandler
+        { UseProxy = false, AllowAutoRedirect = false, ConnectTimeout = TimeSpan.FromSeconds(15) })
+        { Timeout = TimeSpan.FromMinutes(5) };
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("VortexPass-WARP/1.0");
         _endpointProbe = endpointProbe ?? ProbeEndpointAsync;
         _popDirectory = new CloudflarePopDirectoryService(_cacheDirectory, _http);
@@ -196,6 +202,8 @@ public sealed class WarpService : IDisposable
                 });
             });
             var listenerTask = listener is null ? Task.CompletedTask : ObserveListenerAsync(listener, listenerCancellation.Token);
+            try
+            {
             var result = await RunCliAsync(current.CliPath, [action], TimeSpan.FromSeconds(20), cancellationToken);
             if (result.ExitCode != 0)
             {
@@ -207,10 +215,13 @@ public sealed class WarpService : IDisposable
 
             var wait = connected ? TimeSpan.FromSeconds(90) : TimeSpan.FromSeconds(30);
             var deadline = DateTimeOffset.UtcNow + wait;
+            var connectingObserved=false;
+            var connectingWatch=Stopwatch.StartNew();
             while (DateTimeOffset.UtcNow < deadline)
             {
                 await Task.Delay(750, cancellationToken);
                 var probe = await ReadConnectionStateAsync(current.CliPath, cancellationToken);
+                connectingObserved|=probe.State==WarpConnectionState.Connecting;
                 if (connected && probe.State == WarpConnectionState.Connected)
                 {
                     listenerCancellation.Cancel();
@@ -223,7 +234,8 @@ public sealed class WarpService : IDisposable
                     await IgnoreCancellationAsync(listenerTask);
                     return await GetStatusAsync(cancellationToken);
                 }
-                if (IsTerminalError(latestStage)) break;
+                if(connected&&ShouldStopConnectionAttempt(probe.State,probe.Detail,connectingObserved,connectingWatch.Elapsed))
+                {latestStage=probe.Detail;break;}
             }
             listenerCancellation.Cancel();
             await IgnoreCancellationAsync(listenerTask);
@@ -231,6 +243,8 @@ public sealed class WarpService : IDisposable
                 ? $"WARP не изменил состояние за {(int)wait.TotalSeconds} секунд"
                 : $"WARP не подключился. Последняя стадия: {latestStage}";
             return current with { State = WarpConnectionState.Error, Detail = detail, Error = detail, Stage = latestStage, CheckedAt = DateTimeOffset.UtcNow };
+            }
+            finally{listenerCancellation.Cancel();await IgnoreCancellationAsync(listenerTask);}
         }
         finally
         {
@@ -244,7 +258,10 @@ public sealed class WarpService : IDisposable
         if (found.CliPath is null) return found;
         var existing = await ReadClientInfoAsync(found.CliPath, cancellationToken);
         if (existing.Registered) return await GetStatusAsync(cancellationToken);
-        var result = await RunCliAsync(found.CliPath, ["--accept-tos", "registration", "new"], TimeSpan.FromSeconds(45), cancellationToken);
+        (int ExitCode,string Output) result;
+        try { result = await RunCliAsync(found.CliPath, ["--accept-tos", "registration", "new"], TimeSpan.FromSeconds(45), cancellationToken); }
+        catch(OperationCanceledException) when(!cancellationToken.IsCancellationRequested)
+        {return found with {State=WarpConnectionState.Error,Detail="Сервер регистрации WARP не ответил за 45 секунд",Error="Тайм-аут регистрации WARP (45 секунд)",ServiceRunning=existing.ServiceRunning};}
         if (result.ExitCode != 0)
         {
             var error = Sanitize(result.Output);
@@ -253,7 +270,12 @@ public sealed class WarpService : IDisposable
         return await GetStatusAsync(cancellationToken);
     }
 
-    public async Task<WarpStatus> ApplyConfigurationAsync(WarpClientConfiguration configuration, bool reconnect, CancellationToken cancellationToken = default)
+    public static bool RequiresNativeOnboarding(string? error) => error is not null &&
+        (error.Contains("onboarding", StringComparison.OrdinalIgnoreCase) ||
+         error.Contains("complete setup in the GUI", StringComparison.OrdinalIgnoreCase) ||
+         error.Contains("unrecognized subcommand 'registration'", StringComparison.OrdinalIgnoreCase));
+
+    public async Task<WarpStatus> ApplyConfigurationAsync(WarpClientConfiguration configuration, bool reconnect, CancellationToken cancellationToken = default, bool rollbackOnError = true)
     {
         await _operationGate.WaitAsync(cancellationToken);
         try
@@ -288,6 +310,7 @@ public sealed class WarpService : IDisposable
             }
             catch
             {
+                if(!rollbackOnError)throw;
                 try
                 {
                     await RunCliAsync(found.CliPath, ["disconnect"], TimeSpan.FromSeconds(12), CancellationToken.None);
@@ -477,7 +500,7 @@ public sealed class WarpService : IDisposable
 
         Directory.CreateDirectory(_cacheDirectory);
         var path = Path.Combine(_cacheDirectory, "Cloudflare_WARP_Release-x64.msi");
-        using var response = await _http.GetAsync(source, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        using var response = await GetInstallerResponseAsync(source, cancellationToken);
         response.EnsureSuccessStatusCode();
         var total = response.Content.Headers.ContentLength;
         await using (var input = await response.Content.ReadAsStreamAsync(cancellationToken))
@@ -501,22 +524,44 @@ public sealed class WarpService : IDisposable
         return path;
     }
 
-    public async Task<int> InstallAsync(string installerPath, CancellationToken cancellationToken = default)
+    public async Task<int> InstallAsync(string installerPath, CancellationToken cancellationToken = default, bool silent = false)
     {
         if (!IsTrustedInstaller(installerPath, out var signer))
             throw new InvalidDataException($"Установщик WARP не подписан Cloudflare ({signer}).");
+        var transform=silent?await WarpInstallerBundle.VerifyTransformAsync(installerPath,cancellationToken):null;
         using var process = new Process
         {
             StartInfo = new ProcessStartInfo("msiexec.exe")
             {
                 UseShellExecute = true,
                 Verb = "runas",
-                Arguments = $"/i \"{Path.GetFullPath(installerPath)}\""
+                Arguments = $"/i \"{Path.GetFullPath(installerPath)}\""+(silent?$" /qn /norestart TRANSFORMS=\"{transform}\"":"")
             }
         };
         if (!process.Start()) throw new InvalidOperationException("Windows не запустила установщик Cloudflare WARP.");
         await process.WaitForExitAsync(cancellationToken);
         return process.ExitCode;
+    }
+    public async Task EnsureConsumerAsync(CancellationToken token)
+    {
+        var found=Detect();if(found.CliPath is null)throw new InvalidOperationException("WARP не установлен");
+        var registration=await RunCliAsync(found.CliPath,["registration","show"],TimeSpan.FromSeconds(8),token);
+        if(IsManagedRegistration(registration.Output))throw new InvalidOperationException("Обнаружена корпоративная регистрация WARP; VortexPass её не изменяет.");
+        var status=await GetStatusAsync(token);
+        if(status.State==WarpConnectionState.Connected)throw new InvalidOperationException("WARP уже подключён. Отключите прежнее подключение перед подготовкой.");
+        if(!status.Registered)
+        {
+            var registered=await RegisterConsumerAsync(token);
+            if(!registered.Registered)throw new WarpRegistrationException("Не удалось зарегистрировать устройство WARP через временный обход. "+(registered.Error??registered.Detail));
+        }
+        await ApplyConfigurationAsync(new("proxy","masque","h3-with-h2-fallback","system",41870),false,token);
+    }
+    public static bool IsManagedRegistration(string output)=>output.Contains("Organization",StringComparison.OrdinalIgnoreCase)||output.Contains("Zero Trust",StringComparison.OrdinalIgnoreCase)||output.Contains("Account type: Team",StringComparison.OrdinalIgnoreCase);
+    public async Task ValidateConsumerAsync(CancellationToken token)
+    {
+        var found=Detect();if(found.CliPath is null)return;
+        var result=await RunCliAsync(found.CliPath,["registration","show"],TimeSpan.FromSeconds(8),token);
+        if(IsManagedRegistration(result.Output))throw new InvalidOperationException("Корпоративная регистрация WARP не изменяется VortexPass.");
     }
 
     public void OpenClient()
@@ -524,6 +569,39 @@ public sealed class WarpService : IDisposable
         var status = Detect();
         if (status.AppPath is null) throw new FileNotFoundException("Приложение Cloudflare WARP не найдено.");
         Process.Start(new ProcessStartInfo(status.AppPath) { UseShellExecute = true });
+    }
+
+    public async Task<WarpNativeConfiguration> CaptureNativeConfigurationAsync(CancellationToken token)
+    {
+        var cli=Detect().CliPath??throw new IOException("WARP не установлен");
+        var result=await RunCliAsync(cli,["settings","list"],TimeSpan.FromSeconds(8),token);
+        if(result.ExitCode!=0)throw new IOException("Не удалось сохранить исходную конфигурацию WARP: "+Sanitize(result.Output));
+        var match=Regex.Match(result.Output,@"(?im)^.*proxy.*port[^\d]*(\d{4,5})");
+        return new(result.Output.Contains("WireGuard",StringComparison.OrdinalIgnoreCase)?"WireGuard":"MASQUE",
+            result.Output.Contains("HTTP/2 only",StringComparison.OrdinalIgnoreCase)?"h2-only":result.Output.Contains("HTTP/3 only",StringComparison.OrdinalIgnoreCase)?"h3-only":"h3-with-h2-fallback",
+            ParseMode(result.Output),match.Success&&int.TryParse(match.Groups[1].Value,out var port)?port:41870);
+    }
+    public async Task RestoreNativeConfigurationAsync(WarpNativeConfiguration configuration,bool connected,CancellationToken token)
+    {
+        var cli=Detect().CliPath??throw new IOException("WARP не установлен");
+        await RunCliCheckedAsync(cli,["disconnect"],token);
+        await RunCliCheckedAsync(cli,["tunnel","protocol","set",configuration.Protocol],token);
+        if(configuration.Protocol=="MASQUE")await RunCliCheckedAsync(cli,["tunnel","masque-options","set",configuration.Masque],token);
+        await RunCliCheckedAsync(cli,["mode",configuration.Mode],token);
+        if(configuration.Mode=="proxy")await RunCliCheckedAsync(cli,["proxy","port",configuration.ProxyPort.ToString()],token);
+        if(connected){await RunCliCheckedAsync(cli,["connect"],token);await WaitForStateAsync(cli,WarpConnectionState.Connected,TimeSpan.FromSeconds(12),token);}
+    }
+    public async Task<bool> ConfirmProxyRouteAsync(int port,CancellationToken token)
+    {
+        using var client=CreateProxyClient(new Uri($"socks5://127.0.0.1:{port}"));
+        client.Timeout=Timeout.InfiniteTimeSpan;
+        using var response=await client.GetAsync("https://www.cloudflare.com/cdn-cgi/trace",HttpCompletionOption.ResponseHeadersRead,token);
+        response.EnsureSuccessStatusCode();
+        await using var body=await response.Content.ReadAsStreamAsync(token);
+        var buffer=new byte[16385];var length=0;
+        while(length<buffer.Length){var read=await body.ReadAsync(buffer.AsMemory(length),token);if(read==0)break;length+=read;}
+        if(length>16384)return false;
+        return ParseTrace(Encoding.UTF8.GetString(buffer,0,length)).TryGetValue("warp",out var warp)&&warp=="on";
     }
 
     public async Task<WarpDiagnostics> DiagnoseAsync(
@@ -740,9 +818,45 @@ public sealed class WarpService : IDisposable
     }
 
     public static bool IsOfficialInstallerUri(Uri uri) =>
-        uri.Scheme == Uri.UriSchemeHttps &&
-        uri.Host.Equals("1111-releases.cloudflareclient.com", StringComparison.OrdinalIgnoreCase) &&
-        uri.AbsolutePath.EndsWith(".msi", StringComparison.OrdinalIgnoreCase);
+        uri.Scheme == Uri.UriSchemeHttps && uri.IsDefaultPort && string.IsNullOrEmpty(uri.UserInfo) &&
+        ((uri.Host.Equals("1111-releases.cloudflareclient.com", StringComparison.OrdinalIgnoreCase) &&
+          uri.AbsolutePath.Equals("/windows/Cloudflare_WARP_Release-x64.msi", StringComparison.Ordinal)) ||
+         (uri.Host.Equals("downloads.cloudflareclient.com", StringComparison.OrdinalIgnoreCase) &&
+          (uri.AbsolutePath == "/v1/download/windows/ga" ||
+           Regex.IsMatch(uri.AbsolutePath,@"^/v1/download/windows/version/\d+\.\d+\.\d+\.\d+$"))));
+
+    private async Task<HttpResponseMessage> GetInstallerResponseAsync(Uri source, CancellationToken token)
+    {
+        for(var redirects=0; redirects<5; redirects++)
+        {
+            if(!IsOfficialInstallerUri(source))throw new InvalidDataException("Недоверенное перенаправление установщика WARP; загрузка остановлена.");
+            HttpResponseMessage response;
+            try { response=await _installerHttp.GetAsync(source,HttpCompletionOption.ResponseHeadersRead,token); }
+            catch(HttpRequestException ex)
+            { throw new IOException($"Загрузка установщика WARP, HTTPS {source.Host}",ex); }
+            if(response.RequestMessage?.RequestUri is Uri final && !IsOfficialInstallerUri(final))
+            { response.Dispose();throw new InvalidDataException("Установщик WARP получен с недоверенного адреса."); }
+            if((int)response.StatusCode is 301 or 302 or 303 or 307 or 308)
+            {
+                var location=response.Headers.Location;response.Dispose();
+                if(location is null)throw new InvalidDataException("Cloudflare вернул перенаправление без адреса.");
+                source=new Uri(source,location);continue;
+            }
+            return response;
+        }
+        throw new IOException("Слишком много перенаправлений при загрузке WARP.");
+    }
+
+    public static string DescribePreparationError(Exception exception)
+    {
+        var parts=new List<string>();
+        for(Exception? current=exception;current is not null && parts.Count<5;current=current.InnerException)
+        {
+            var message=Sanitize(Regex.Replace(current.Message,@"(https?://[^\s?]+)\?[^\s]+","$1?[скрыто]"));
+            if(!parts.Contains(message))parts.Add(message);
+        }
+        return string.Join(" → ",parts);
+    }
 
     public static string? SelectInstalledPath(IEnumerable<string> candidates, Func<string, bool> exists) =>
         candidates.FirstOrDefault(path => !string.IsNullOrWhiteSpace(path) && exists(path));
@@ -762,6 +876,13 @@ public sealed class WarpService : IDisposable
             signer = ex.Message;
             return false;
         }
+    }
+
+    public static bool IsTrustedCloudflareExecutable(string path)
+    {
+        if(!File.Exists(path)||!path.EndsWith(".exe",StringComparison.OrdinalIgnoreCase)||!VerifyEmbeddedSignature(path))return false;
+        try{using var certificate=new X509Certificate2(X509Certificate.CreateFromSignedFile(path));return certificate.GetNameInfo(X509NameType.SimpleName,false).Equals(ExpectedPublisher,StringComparison.OrdinalIgnoreCase);}
+        catch(System.Security.Cryptography.CryptographicException){return false;}
     }
 
     private static IEnumerable<string> CandidateCliPaths()
@@ -1188,11 +1309,17 @@ public sealed class WarpService : IDisposable
         return result.ExitCode == 0 ? Short(result.Output) : null;
     }
 
-    private static async Task<(bool Registered, bool ServiceRunning, string? Protocol)> ReadClientInfoAsync(string cliPath, CancellationToken cancellationToken)
+    public static bool IsServiceProcessRunning()
     {
         var serviceProcesses = Process.GetProcessesByName("warp-svc");
         var serviceRunning = serviceProcesses.Length > 0;
         foreach (var process in serviceProcesses) process.Dispose();
+        return serviceRunning;
+    }
+
+    private static async Task<(bool Registered, bool ServiceRunning, string? Protocol)> ReadClientInfoAsync(string cliPath, CancellationToken cancellationToken)
+    {
+        var serviceRunning = IsServiceProcessRunning();
         var registration = await RunCliAsync(cliPath, ["registration", "show"], TimeSpan.FromSeconds(8), cancellationToken);
         // Registration output contains identifiers and keys. Deliberately inspect
         // only success markers and never return or log the raw text.
@@ -1338,9 +1465,13 @@ public sealed class WarpService : IDisposable
         (value.Contains("error", StringComparison.OrdinalIgnoreCase) ||
          value.Contains("failed", StringComparison.OrdinalIgnoreCase) ||
          value.Contains("unable", StringComparison.OrdinalIgnoreCase));
+    public static bool ShouldStopConnectionAttempt(WarpConnectionState state,string? detail,bool connectingObserved,TimeSpan elapsed)=>
+        state is WarpConnectionState.Error or WarpConnectionState.Disconnected && IsTerminalError(detail)&&
+        (connectingObserved||elapsed>=TimeSpan.FromSeconds(5));
 
     private static async Task<(int ExitCode, string Output)> RunCliAsync(string cliPath, IReadOnlyList<string> arguments, TimeSpan timeout, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutSource.CancelAfter(timeout);
         using var process = new Process
@@ -1357,8 +1488,18 @@ public sealed class WarpService : IDisposable
         if (!process.Start()) throw new InvalidOperationException("Windows не запустила warp-cli.");
         var stdout = process.StandardOutput.ReadToEndAsync(timeoutSource.Token);
         var stderr = process.StandardError.ReadToEndAsync(timeoutSource.Token);
-        await process.WaitForExitAsync(timeoutSource.Token);
-        return (process.ExitCode, $"{await stdout} {await stderr}".Trim());
+        try
+        {
+            await process.WaitForExitAsync(timeoutSource.Token);
+            return (process.ExitCode, $"{await stdout} {await stderr}".Trim());
+        }
+        catch(OperationCanceledException)
+        {
+            try{if(!process.HasExited)process.Kill(entireProcessTree:true);await process.WaitForExitAsync(CancellationToken.None);}
+            catch(InvalidOperationException){}
+            try{await Task.WhenAll(stdout,stderr);}catch(OperationCanceledException){}
+            throw;
+        }
     }
 
     private static string Short(string? value)
@@ -1434,5 +1575,6 @@ public sealed class WarpService : IDisposable
     {
         _operationGate.Dispose();
         _http.Dispose();
+        if(!ReferenceEquals(_http,_installerHttp))_installerHttp.Dispose();
     }
 }

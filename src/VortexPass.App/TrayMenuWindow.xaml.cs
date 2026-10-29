@@ -10,6 +10,17 @@ public partial class TrayMenuWindow : Window
     private readonly Func<Task> _toggleProtection;
     private readonly Func<Task> _toggleWarp;
     private readonly Func<Task> _exit;
+    private bool _reduceMotion;
+
+    public void SetAppearance(bool light, bool reduceMotion)
+    {
+        _reduceMotion = reduceMotion || !SystemParameters.ClientAreaAnimation;
+        Resources["Surface"] = Brush(light ? "#FFFFFF" : "#242424");
+        Resources["Text"] = Brush(light ? "#202020" : "#F3F3F3");
+        Resources["Muted"] = Brush(light ? "#666666" : "#999999");
+        Resources["Line"] = Brush(light ? "#DDDDDD" : "#404040");
+        Resources["Hover"] = Brush(light ? "#EEEEEE" : "#353535");
+    }
 
     public TrayMenuWindow(Action open, Func<Task> toggleProtection, Func<Task> toggleWarp, Func<Task> exit)
     {
@@ -25,17 +36,16 @@ public partial class TrayMenuWindow : Window
         var healthy = protectionEnabled && !needsCheck && !hasError;
         var accent = hasError ? "#FF6B6B" : needsCheck ? "#FFB340" : healthy ? "#00D68F" : "#FF706A86";
         StatusDot.Fill = Brush(accent);
-        StatusPanel.Background = Brush(healthy ? "#1522A878" : "#151F1630");
-        StatusPanel.BorderBrush = Brush(healthy ? "#4652DEAC" : "#353C3A57");
-        StatusText.Foreground = Brush(healthy ? "#64F3D2" : accent);
+        StatusPanel.Background = System.Windows.Media.Brushes.Transparent;
+        StatusText.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "Text");
         StatusText.Text = transitionInProgress ? "Запуск защиты…" : hasError ? "Ошибка защиты" : needsCheck ? "Нужна проверка маршрута" : protectionEnabled ? "Защита активна" : "Защита выключена";
         StatusHint.Text = transitionInProgress ? "Starting" : hasError ? "Error" : needsCheck ? "Check" : protectionEnabled ? "Live" : "Idle";
         StatusHint.Foreground = Brush(accent);
         ProtectionButton.IsEnabled = !transitionInProgress || protectionEnabled;
-        ProtectionGlyph.Foreground = Brush(protectionEnabled ? "#00D68F" : "#FFC5BFFF");
+        ProtectionGlyph.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "Text");
         ProtectionText.Text = transitionInProgress && !protectionEnabled ? "Подождите…" : protectionEnabled ? "Остановить защиту" : "Запустить защиту";
         WarpButton.IsEnabled = !warpPending;
-        WarpGlyph.Foreground = Brush(warpConnected ? "#00D68F" : "#FF62AFFF");
+        WarpGlyph.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "Text");
         WarpText.Text = warpPending ? "WARP: подождите…" : warpConnected ? "Выключить WARP" : "Включить WARP";
     }
 
@@ -46,13 +56,13 @@ public partial class TrayMenuWindow : Window
     {
         var menuWidth = Width;
         var menuHeight = Height;
-        Left = Math.Clamp(cursor.X - menuWidth + 20, workArea.Left + 4, workArea.Right - menuWidth - 4);
-        Top = Math.Clamp(cursor.Y - menuHeight + 12, workArea.Top + 4, workArea.Bottom - menuHeight - 4);
+        Left = Math.Clamp(cursor.X - menuWidth + 20, workArea.Left + 4, Math.Max(workArea.Left + 4, workArea.Right - menuWidth - 4));
+        Top = Math.Clamp(cursor.Y - menuHeight + 12, workArea.Top + 4, Math.Max(workArea.Top + 4, workArea.Bottom - menuHeight - 4));
         if (!IsVisible)
         {
-            Opacity = 0;
+            Opacity = _reduceMotion ? 1 : 0;
             Show();
-            BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(150))
+            if (!_reduceMotion) BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(150))
             {
                 EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut }
             });

@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>VortexPass.DnsGuard</AssemblyName>
+    <RootNamespace>VortexPass.DnsGuard</RootNamespace>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\VortexPass.Core\VortexPass.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,5 +1,9 @@
 packages:
   - '.'
+overrides:
+  vite: 6.3.5
+  '@types/react': 19.0.0
+  '@types/react-dom': 19.0.0
 allowBuilds:
   '@tailwindcss/oxide': true
   esbuild: true

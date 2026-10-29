@@ -5,10 +5,13 @@ set "ROOT=%~dp0"
 set "DIST=%ROOT%dist"
 set "STAGING=%ROOT%dist.next"
 set "VERSION=%~1"
-if "%VERSION%"=="" set "VERSION=0.6.0"
+if "%VERSION%"=="" set /p VERSION=<"%ROOT%VERSION"
 
 echo.
 echo === VortexPass %VERSION% ^| win-x64 Release build ===
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\Test-LocalAiBundle.ps1" -BundleRoot "%ROOT%components\local-ai"
+if errorlevel 1 goto :error
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\Test-ComponentManifest.ps1" -ManifestPath "%ROOT%assets\external-components.json" -ComponentsRoot "%ROOT%components\zapret"
 if errorlevel 1 (
@@ -53,15 +56,22 @@ if exist "%STAGING%" (
 )
 mkdir "%STAGING%" || goto :error
 mkdir "%STAGING%\updater" || goto :error
+mkdir "%STAGING%\dns-guard" || goto :error
 mkdir "%STAGING%\bin" || goto :error
 
-dotnet publish "%ROOT%src\VortexPass.App\VortexPass.App.csproj" -c Release -r win-x64 --self-contained true -p:Version=%VERSION% -p:AssemblyInformationalVersion=%VERSION% -o "%STAGING%"
+dotnet publish "%ROOT%src\VortexPass.App\VortexPass.App.csproj" -c Release -r win-x64 --self-contained true -p:NuGetAudit=false -p:Version=%VERSION% -p:AssemblyInformationalVersion=%VERSION% -o "%STAGING%"
 if errorlevel 1 goto :error
 
-dotnet publish "%ROOT%src\VortexPass.Updater\VortexPass.Updater.csproj" -c Release -r win-x64 --self-contained true -o "%STAGING%\updater"
+dotnet publish "%ROOT%src\VortexPass.Updater\VortexPass.Updater.csproj" -c Release -r win-x64 --self-contained true -p:NuGetAudit=false -o "%STAGING%\updater"
+if errorlevel 1 goto :error
+
+dotnet publish "%ROOT%src\VortexPass.DnsGuard\VortexPass.DnsGuard.csproj" -c Release -r win-x64 --self-contained true -p:NuGetAudit=false -o "%STAGING%\dns-guard"
 if errorlevel 1 goto :error
 
 xcopy "%ROOT%components\zapret\*" "%STAGING%\bin\" /E /I /Y >nul
+if errorlevel 1 goto :error
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\Test-LocalAiBundle.ps1" -BundleRoot "%STAGING%\local-ai"
 if errorlevel 1 goto :error
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\Test-ComponentManifest.ps1" -ManifestPath "%STAGING%\assets\external-components.json" -ComponentsRoot "%STAGING%\bin"
@@ -76,6 +86,10 @@ if not exist "%STAGING%\VortexPass.exe" (
 )
 if not exist "%STAGING%\updater\VortexPass.Updater.exe" (
   echo ERROR: VortexPass.Updater.exe was not created.
+  goto :error
+)
+if not exist "%STAGING%\dns-guard\VortexPass.DnsGuard.exe" (
+  echo ERROR: VortexPass.DnsGuard.exe was not created.
   goto :error
 )
 if not exist "%STAGING%\assets\external-components.json" (
@@ -127,3 +141,4 @@ echo.
 echo dist could not be replaced because one of its files is still open.
 echo The new build is ready in %STAGING%
 exit /b 1
+

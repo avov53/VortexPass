@@ -6,6 +6,19 @@ namespace VortexPass.App;
 
 public partial class App : System.Windows.Application
 {
+    private System.Threading.Mutex? _instance;
+    protected override void OnStartup(StartupEventArgs e)
+    {
+        var user=System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value??Environment.UserName;
+        _instance=new System.Threading.Mutex(true,"Local\\VortexPass-"+user,out var created);
+        if(!created){Shutdown();return;}
+        base.OnStartup(e);
+    }
+    protected override void OnExit(ExitEventArgs e)
+    {
+        try{_instance?.ReleaseMutex();}catch(ApplicationException){}
+        _instance?.Dispose();base.OnExit(e);
+    }
     public App()
     {
         DispatcherUnhandledException += OnDispatcherUnhandledException;

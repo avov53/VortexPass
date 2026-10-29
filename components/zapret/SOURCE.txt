@@ -1,18 +1,24 @@
 VortexPass network component source
 
 Flowseal/zapret-discord-youtube
-Commit: 61d7596c7ce82b6f320e5c79ff4598856f4ae7d3
+Release: 1.10.3
+Commit: 865da4f4c3659523bf79bc6edf0446e7d7969614
+Official release ZIP SHA-256: 244314ae1c24538a0d751601da8e0c925c843371eec4456eb15f14c4fd6b7058
 Repository: https://github.com/Flowseal/zapret-discord-youtube
 License: MIT (see FLOWSEAL-LICENSE.txt)
 
 VortexPass invokes winws.exe directly. No batch or command scripts are included or executed.
 The VortexPass-maintained files/list-warp.txt is a narrow allowlist used only while the official Cloudflare WARP client is connecting or connected.
+The release binaries match the previously pinned hashes. Service-scoped lists are maintained by VortexPass; the verified Flowseal hosts candidate asset retains its original hash/source commit 61d7596. Upstream global GameFilter/IPSet lists are not enabled automatically.
 
 Telegram Desktop fallback component
 
-Flowseal/tg-ws-proxy v1.9.0
-Commit: 21aaeb3aba97ad3b0ae39c6540a7b1afd12a3f7e
+Flowseal/tg-ws-proxy v1.11.2
+Release tag: v1.11.2 (307a384)
+Source archive SHA-256: 1623427a1b5c523df79c38c88c1600bfa7d6c44550469858046f1cc3c4c766f1
 Repository: https://github.com/Flowseal/tg-ws-proxy
 License: MIT (see TG-WS-PROXY-LICENSE.txt)
 
-VortexPass starts a headless console build from the pinned source tree, without the upstream tray UI, and verifies TgWsProxyHeadless.exe SHA-256 before launch.
+VortexPass starts a headless console build from the pinned source tree, without the upstream tray UI, and verifies TgWsProxyHeadless.exe, a pinned runtime manifest and every bundled runtime file by SHA-256 before launch.
+Entry point: scripts/tg_ws_headless.py. Build instructions: scripts/Build-TelegramProxy.ps1.
+The old 1.9.0 bundle is replaced; runtime upgrades remove the old owned _internal folder while preserving the secret and configuration marker.

@@ -20,6 +20,7 @@ public sealed class SystemProxyManager
 
     public void ApplyPac(Uri pacUrl)
     {
+        EnsureCanApply();
         using var key = Registry.CurrentUser.CreateSubKey(InternetSettings, writable: true);
         var existing = key.GetValue("AutoConfigURL") as string;
         if (!string.Equals(existing, _ownedPacUrl, StringComparison.OrdinalIgnoreCase))
@@ -28,6 +29,14 @@ public sealed class SystemProxyManager
         File.WriteAllText(_ownerPath, _ownedPacUrl);
         key.SetValue("AutoConfigURL", _ownedPacUrl, RegistryValueKind.String);
         NotifyWindows();
+    }
+    public void EnsureCanApply()
+    {
+        using var key=Registry.CurrentUser.OpenSubKey(InternetSettings);
+        var pac=key?.GetValue("AutoConfigURL") as string;
+        var manual=Convert.ToInt32(key?.GetValue("ProxyEnable")??0)==1;
+        if(manual||!string.IsNullOrWhiteSpace(pac)&&!string.Equals(pac,_ownedPacUrl,StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Уже настроен другой системный прокси/PAC. VortexPass не заменяет его автоматически. Отключите конфликтующий прокси и повторите подключение.");
     }
 
     public void RestoreIfOwned()
@@ -59,6 +68,13 @@ public sealed class SystemProxyManager
         NativeMethods.InternetSetOption(IntPtr.Zero, 95, IntPtr.Zero, 0);
         NativeMethods.InternetSetOption(IntPtr.Zero, 39, IntPtr.Zero, 0);
         NativeMethods.InternetSetOption(IntPtr.Zero, 37, IntPtr.Zero, 0);
+    }
+
+    public bool IsOwnedPacApplied()
+    {
+        if (string.IsNullOrWhiteSpace(_ownedPacUrl)) return false;
+        using var key = Registry.CurrentUser.OpenSubKey(InternetSettings, writable: false);
+        return string.Equals(key?.GetValue("AutoConfigURL") as string, _ownedPacUrl, StringComparison.OrdinalIgnoreCase);
     }
 
     private static class NativeMethods

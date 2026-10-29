@@ -1,0 +1,17 @@
+import ts from 'typescript';
+import fs from 'node:fs/promises';
+import assert from 'node:assert/strict';
+const source=await fs.readFile(new URL('../src/app/YoutubeAdvisorState.ts',import.meta.url),'utf8');
+const js=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;
+const {mergeYoutubeStatus}=await import('data:text/javascript;base64,'+Buffer.from(js).toString('base64'));
+const initial={runId:'current',state:'testing',revision:1,candidates:[{id:'measured'}]};
+assert.equal(mergeYoutubeStatus(initial,{runId:'old',state:'complete',revision:100}),initial);
+assert.equal(mergeYoutubeStatus(initial,{runId:'current',state:'restoring',revision:0}),initial);
+const failed=mergeYoutubeStatus(initial,{runId:'current',revision:2,state:'applyFailed',error:'storage failed'});
+assert.equal(failed.candidates[0].id,'measured');assert.equal(failed.error,'storage failed');
+const blocked=mergeYoutubeStatus(failed,{runId:'current',revision:3,state:'readiness',readiness:'blocked',blockedReason:'network changed'});
+assert.equal(blocked.state,'applyFailed');assert.equal(blocked.error,'storage failed');assert.equal(blocked.blockedReason,'network changed');
+const retry=mergeYoutubeStatus(failed,{runId:'current',revision:3,state:'applying'});
+assert.equal(retry.error,undefined);assert.equal(retry.candidates[0].id,'measured');
+assert.equal(mergeYoutubeStatus(retry,{state:'complete',revision:20}),retry);
+console.log('PASS YouTube run identity, monotonic revisions, persistent errors and retained measured candidates');

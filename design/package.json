@@ -1,0 +1,27 @@
+{
+  "name": "vortexpass-design",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build && node make-standalone.mjs",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "@openai/apps-sdk-ui": "0.2.2",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.55.1",
+    "@tailwindcss/vite": "4.1.12",
+    "@types/react": "18.3.24",
+    "@types/react-dom": "18.3.7",
+    "@vitejs/plugin-react": "4.7.0",
+    "tailwindcss": "4.1.12",
+    "typescript": "5.9.2",
+    "vite": "6.3.5",
+    "vite-plugin-singlefile": "2.3.3"
+  }
+}

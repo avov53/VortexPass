@@ -37,3 +37,4 @@ youtubei.googleapis.com
 youtube-pa.googleapis.com
 yt-video-upload.l.google.com
 play.google.com
+fonts.googleapis.com

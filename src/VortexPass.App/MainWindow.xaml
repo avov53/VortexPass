@@ -3,14 +3,10 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
         Title="VortexPass" Width="1280" Height="800" MinWidth="1040" MinHeight="680"
-        WindowStyle="None" ResizeMode="CanResize" Background="#09090F"
+        WindowStyle="SingleBorderWindow" ResizeMode="CanResize" Background="#181818"
         ShowInTaskbar="True" UseLayoutRounding="True" SnapsToDevicePixels="True"
         Icon="Assets/VortexPass.ico" Loaded="Window_Loaded" Closing="Window_Closing">
-  <WindowChrome.WindowChrome>
-    <WindowChrome CaptionHeight="0" ResizeBorderThickness="6" CornerRadius="0"
-                  GlassFrameThickness="0" UseAeroCaptionButtons="False" />
-  </WindowChrome.WindowChrome>
   <Grid>
-    <wv2:WebView2 x:Name="DesignView" DefaultBackgroundColor="#09090F" />
+    <wv2:WebView2 x:Name="DesignView" DefaultBackgroundColor="#181818" />
   </Grid>
 </Window>
