@@ -57,7 +57,7 @@ public static class RobloxContentProbeService
             return new(uri.Host,"resource","unconfirmed","Слишком много переадресаций");
         }
         catch(OperationCanceledException){token.ThrowIfCancellationRequested();return new(uri.Host,"resource","routeUnavailable","Тайм-аут ресурса");}
-        catch(Exception ex)when(ex is HttpRequestException or IOException){return new(uri.Host,"resource","routeUnavailable",ex.GetType().Name);}
+        catch(Exception ex)when(ex is HttpRequestException or IOException){return new(uri.Host,"resource","routeUnavailable",uri.Host+": "+(ex is HttpRequestException http?http.HttpRequestError+": ":"")+YoutubeRouteProbe.Error(ex));}
         finally{if(entered)Gate.Release();}
     }
 
@@ -79,56 +79,64 @@ public static class RobloxContentProbeService
 
     public static async Task<(bool Confirmed,ServiceRouteGroup[] Groups,long? Latency)> CheckAsync(CancellationToken token)
     {
-        async Task<(ServiceRouteGroup Group,long? Latency)> Images()
+        // Each strategy trial needs new connections; pooled TLS sessions from
+        // the preceding winws strategy cannot validate the current candidate.
+        using var client=new HttpClient(new SocketsHttpHandler {UseProxy=false,UseCookies=false,AllowAutoRedirect=false,ConnectTimeout=TimeSpan.FromSeconds(3)});
+        var dnsReady=true;
+        foreach(var host in new[]{"thumbnails.roblox.com","tr.rbxcdn.com"})
+        try { using var dns=CancellationTokenSource.CreateLinkedTokenSource(token);dns.CancelAfter(TimeSpan.FromSeconds(2));if((await Dns.GetHostAddressesAsync(host,dns.Token)).Length==0)dnsReady=false; }
+        catch(Exception ex)when(ex is System.Net.Sockets.SocketException or OperationCanceledException){token.ThrowIfCancellationRequested();dnsReady=false;}
+        async Task<(ServiceRouteGroup Group,long? Latency)> Images(string group="images",string? endpoint=null)
         {
             try
             {
                 using var timeout=CancellationTokenSource.CreateLinkedTokenSource(token);timeout.CancelAfter(TimeSpan.FromSeconds(8));
-                using var reply=await Client.GetAsync("https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=1&size=48x48&format=Png&isCircular=false",HttpCompletionOption.ResponseHeadersRead,timeout.Token);
-                if(reply.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)return(new("images","authorizationRequired","API требует доступ; это не доказательство блокировки"),null);
+                using var reply=await client.GetAsync(endpoint??"https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=1&size=48x48&format=Png&isCircular=false",HttpCompletionOption.ResponseHeadersRead,timeout.Token);
+                if(reply.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)return(new(group,"authorizationRequired","API требует доступ; это не доказательство блокировки"),null);
                 reply.EnsureSuccessStatusCode();await using var stream=await reply.Content.ReadAsStreamAsync(timeout.Token);
                 var bytes=new byte[64*1024];var count=0;while(count<bytes.Length){var n=await stream.ReadAsync(bytes.AsMemory(count),timeout.Token);if(n==0)break;count+=n;}
                 using var json=JsonDocument.Parse(bytes.AsMemory(0,count));var data=json.RootElement.GetProperty("data")[0];
-                if(data.TryGetProperty("state",out var state)&&state.GetString()!="Completed")return(new("images","unconfirmed","Thumbnail ещё не готов; это не сетевой отказ"),null);
+                if(data.TryGetProperty("state",out var state)&&state.GetString()!="Completed")return(new(group,"unconfirmed","Thumbnail ещё не готов; это не сетевой отказ"),null);
                 if(data.TryGetProperty("imageUrl",out var url)&&Uri.TryCreate(url.GetString(),UriKind.Absolute,out var uri)&&Allowed(uri))
-                {var image=await ResourceAsync(uri,timeout.Token);return(new("images",image.State,image.Detail),image.LatencyMs);}
-                return(new("images","unconfirmed","API не вернул публичную картинку"),null);
+                {var image=await ResourceAsync(uri,timeout.Token,client);return(new(group,image.State,image.Detail),image.LatencyMs);}
+                return(new(group,"unconfirmed","API не вернул публичную картинку"),null);
             }
-            catch(OperationCanceledException){token.ThrowIfCancellationRequested();return(new("images","routeUnavailable","Тайм-аут thumbnail API"),null);}
-            catch(Exception ex)when(ex is HttpRequestException or IOException or JsonException or KeyNotFoundException or IndexOutOfRangeException or InvalidOperationException){return(new("images","routeUnavailable",ex.GetType().Name),null);}
+            catch(OperationCanceledException){token.ThrowIfCancellationRequested();return(new(group,"routeUnavailable","Тайм-аут thumbnail API"),null);}
+            catch(Exception ex)when(ex is HttpRequestException or IOException or JsonException or KeyNotFoundException or IndexOutOfRangeException or InvalidOperationException){return(new(group,"routeUnavailable","thumbnails.roblox.com: "+YoutubeRouteProbe.Error(ex)),null);}
         }
         async Task<ServiceRouteGroup> Delivery()
         {
             try
             {
                 using var timeout=CancellationTokenSource.CreateLinkedTokenSource(token);timeout.CancelAfter(TimeSpan.FromSeconds(8));
-                using var response=await Client.GetAsync("https://assetdelivery.roblox.com/v2/asset?id=1",HttpCompletionOption.ResponseHeadersRead,timeout.Token);
+                using var response=await client.GetAsync("https://assetdelivery.roblox.com/v2/asset?id=1",HttpCompletionOption.ResponseHeadersRead,timeout.Token);
                 return new("assetDelivery",(int)response.StatusCode<500?"confirmed":"routeUnavailable",$"Asset Delivery: HTTP {(int)response.StatusCode}; ответ API подтверждает транспорт, не доступ к модели");
             }
             catch(OperationCanceledException){token.ThrowIfCancellationRequested();return new("assetDelivery","routeUnavailable","Тайм-аут Asset Delivery");}
             catch(HttpRequestException){return new("assetDelivery","routeUnavailable","DNS/TLS/HTTP Asset Delivery не подтверждён");}
         }
-        var imageTask=Images();var deliveryTask=Delivery();
-        var resourcesTask=Task.WhenAll((_resourcesCheckedAt>DateTimeOffset.UtcNow.AddMinutes(-15)?_resources:[]).Take(3).Select(u=>ResourceAsync(u,token)));
-        await Task.WhenAll(imageTask,deliveryTask,resourcesTask);
+        var imageTask=Images();var gameImageTask=Images("gameImages","https://thumbnails.roblox.com/v1/games/icons?universeIds=1537690962&size=150x150&format=Png&isCircular=false");var deliveryTask=Delivery();
+        var resourcesTask=Task.WhenAll((_resourcesCheckedAt>DateTimeOffset.UtcNow.AddMinutes(-15)?_resources:[]).Take(3).Select(u=>ResourceAsync(u,token,client)));
+        await Task.WhenAll(imageTask,gameImageTask,deliveryTask,resourcesTask);
         var resources=resourcesTask.Result;
-        ServiceRouteGroup[] groups=[imageTask.Result.Group,deliveryTask.Result,
+        ServiceRouteGroup[] groups=[new("dns",dnsReady?"confirmed":"routeUnavailable","Windows DNS: thumbnails.roblox.com и tr.rbxcdn.com"),imageTask.Result.Group,gameImageTask.Result.Group,deliveryTask.Result,
             new("models",resources.Any(r=>r.Kind=="model"&&r.State=="confirmed")?"confirmed":"sessionRequired","Модели "+(resources.Any(r=>r.Kind=="model"&&r.State=="confirmed")?"подтверждены: получены байты CDN":"не подтверждены; нужна диагностика свежего журнала Player")),
             new("playerResources",resources.Length==0?"sessionRequired":resources.Any(r=>r.State is "routeUnavailable" or "invalidContent")?"routeUnavailable":resources.All(r=>r.State=="confirmed")?"confirmed":"unconfirmed",resources.Length==0?"Нет проверенных ссылок из журнала Player; модели не подтверждены":"Ресурсы Player: "+string.Join("; ",resources.Select(r=>r.Detail))),
             new("textures",resources.Any(r=>r.Kind=="image"&&r.State=="confirmed")?"confirmed":"sessionRequired","Текстуры игры проверяются по ссылкам из журнала Player"),
             new("gameSession","sessionRequired","Игровая UDP-сессия проверяется клиентом; маршрут не изменяется")];
-        return(groups.Where(g=>g.Id is "images" or "assetDelivery" or "models" or "textures" or "playerResources").All(g=>g.State=="confirmed"),groups,imageTask.Result.Latency);
+        return(groups.Where(g=>g.Id is "images" or "gameImages" or "assetDelivery" or "models" or "textures" or "playerResources").All(g=>g.State=="confirmed"),groups,imageTask.Result.Latency);
     }
 
 }
 
 public static class RobloxSelectionPolicy
 {
+    public static bool HasConfirmedContent(IEnumerable<ServiceRouteGroup>? groups)=>groups?.Any(g=>g.Id is "images" or "models" or "textures" or "playerResources"&&g.State=="confirmed")==true;
     public static bool Preserves(IEnumerable<ServiceRouteGroup>? baseline,IEnumerable<ServiceRouteGroup>? candidate)
     {
         var required=(baseline??[]).Where(g=>g.State=="confirmed").Select(g=>g.Id).ToArray();
         return required.All(id=>candidate?.Any(g=>g.Id==id&&g.State=="confirmed")==true);
     }
-    public static bool NeedsEnhancement(IEnumerable<ServiceRouteGroup>? groups)=>groups?.Any(g=>g.Id is "images" or "assetDelivery" or "models" or "textures" or "playerResources" && g.State is "routeUnavailable" or "invalidContent")==true;
-    public static int Score(IEnumerable<ServiceRouteGroup>? groups)=>groups?.Count(g=>g.Id is "images" or "assetDelivery" or "models" or "textures" or "playerResources" && g.State=="confirmed")??0;
+    public static bool NeedsEnhancement(IEnumerable<ServiceRouteGroup>? groups)=>groups?.Any(g=>g.Id is "images" or "gameImages" or "assetDelivery" or "models" or "textures" or "playerResources" && g.State is "routeUnavailable" or "invalidContent")==true;
+    public static int Score(IEnumerable<ServiceRouteGroup>? groups)=>groups?.Count(g=>g.Id is "images" or "gameImages" or "assetDelivery" or "models" or "textures" or "playerResources" && g.State=="confirmed")??0;
 }

@@ -165,6 +165,8 @@ if (args is ["--smoke-ai", var modelDirectory])
 
 var tests = new (string Name, Func<Task> Run)[]
 {
+    ("Roblox negative DNS recovery affects only Roblox A records",RobloxDnsRecoveryTests.Run),
+    ("Browser PAC delivery, Telegram domains, isolated CDN TLS and channel avatars",MediaRoutingRegressionTests.Run),
     ("DNS recovery, Roblox scope, bounded resources and portable modes",NetworkRecoveryTests.Run),
     ("WARP transport migration, canonical selection and transactional retry",WarpTransportTests.Run),
     ("WARP half-close, large response, owned shutdown, stream limits, stable DNS and persisted route",WarpStreamingTests.Run),
@@ -250,8 +252,9 @@ static void TestYoutubeQuic()
     Require(command.IndexOf(imageDomains, StringComparison.Ordinal) < command.IndexOf("--hostlist=files\\list-youtube.txt", StringComparison.Ordinal) &&
             command.IndexOf(videoDomains, StringComparison.Ordinal) < command.IndexOf("--hostlist=files\\list-youtube.txt", StringComparison.Ordinal),
         "Broad YouTube strategy wins before media routes");
-    Require(command.Split("--dpi-desync=fake,multidisorder --dpi-desync-fake-tls-mod=sni=www.google.com", StringSplitOptions.None).Length - 1 >= 3,
-        "YouTube image/video/IP TCP routes do not use the current Google strategy");
+    Require(command.Split("--dpi-desync=fake,multidisorder --dpi-desync-fake-tls-mod=sni=www.google.com", StringSplitOptions.None).Length - 1 >= 2 &&
+            command.Contains(imageDomains+" --dpi-desync=multisplit --dpi-desync-split-pos=1,midsld --dpi-desync-cutoff=n3"),
+        "YouTube changed video/IP routes or lost the image TLS segmentation");
     Require(command.Contains("--filter-tcp=443 --ipset=files\\list-youtube-ipset.txt", StringComparison.Ordinal) &&
             command.Contains("--filter-udp=443 --ipset=files\\list-youtube-ipset.txt", StringComparison.Ordinal),
         "YouTube has no IP fallback for ECH or dynamic video shards");

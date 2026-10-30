@@ -114,6 +114,7 @@ public sealed class LocalStrategyAdvisor(ILocalStrategyModel model,TimeSpan? sea
     public static IReadOnlyList<AdvisorRecommendation> Rank(IEnumerable<AdvisorRecommendation> results) => results
         .OrderByDescending(r => r.FullyConfirmed).ThenByDescending(r => r.Confirmed)
         .ThenByDescending(r=>YoutubePagePassed(r.Services.FirstOrDefault(s=>s.Service=="youtube")))
+        .ThenByDescending(r=>r.Services.FirstOrDefault(s=>s.Service=="youtube")?.Groups?.Count(g=>g.Id is "images" or "avatars"&&g.State=="confirmed")??0)
         .ThenByDescending(r => r.Services.Count(s => s.State is "healthy" or "partial"))
         .ThenByDescending(r=>RobloxSelectionPolicy.Score(r.Services.FirstOrDefault(s=>s.Service=="roblox")?.Groups))
         .ThenBy(r => r.JitterMs ?? long.MaxValue).ThenBy(r=>r.Services.FirstOrDefault(s=>s.Service=="youtube")?.Groups?.FirstOrDefault(g=>g.Id=="page")?.DurationMs??long.MaxValue).ThenBy(r => r.MedianLatencyMs ?? long.MaxValue)

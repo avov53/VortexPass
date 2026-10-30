@@ -106,7 +106,7 @@ public partial class MainWindow
         if(_advisorRunning||_protectionTransitioning||!_protectionRequested||!_settings.GameFilter.SelectedGames.Contains("roblox")||_settings.GameFilter.RobloxAssetsMode=="standard"&&!forceCheck)return;
         _advisorRunning=true;_advisorStopProtectionRequested=false;_advisorCts=CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         _advisorCts.CancelAfter(TimeSpan.FromSeconds(120));
-        var token=_advisorCts.Token;var original=_components.GetArguments("dpi");var winner=original;var network=CurrentNetworkKey();
+        var token=_advisorCts.Token;var original=_components.GetArguments("dpi");var winner=original;var network=CurrentNetworkKey();string? winnerBlock=null;
         try
         {
             await SendServiceSnapshotAsync();
@@ -120,6 +120,8 @@ public partial class MainWindow
             }
             await LogToUiAsync("info","Roblox: проверяем текущий маршрут контента; игровые UDP-правила сохраняются.");
             var baseline=await Measure();var best=baseline;
+            if(!baseline.Stable.Any(g=>g.Id=="dns"&&g.State=="confirmed"))
+            {await LogToUiAsync("warn","Roblox: Windows DNS не подтвердил адреса картинок. Перебор TCP остановлен; исходные правила сохранены.");return;}
             // Unknown models alone are not evidence of a broken network.
             if(_settings.GameFilter.RobloxAssetsMode!="standard"&&(_settings.GameFilter.RobloxAssetsMode=="enhanced"||baseline.Needs))
             foreach(var block in new[]{"minimal","split","disorder"}.Where(b=>AdvisorStrategyPolicy.Blocks(_settings.BypassLevel).Contains(b)))
@@ -129,8 +131,29 @@ public partial class MainWindow
                 await LogToUiAsync("info",$"Roblox: испытываем {block}, три замера.");
                 await RestartAdvisorWinwsAsync(command,token);var measured=await Measure();
                 if(!RobloxSelectionPolicy.Preserves(baseline.Stable,measured.Stable))continue;
+                if(!RobloxSelectionPolicy.HasConfirmedContent(measured.Stable))continue;
                 if(measured.Score>best.Score||measured.Score==best.Score&&measured.Score>baseline.Score&&(measured.Spread??long.MaxValue)<(best.Spread??long.MaxValue))
-                {best=measured;winner=command;}
+                {best=measured;winner=command;winnerBlock=block;}
+            }
+            if(winner!=original&&winnerBlock is not null)
+            {
+                await RestartAdvisorWinwsAsync(winner,token);var fresh=await Measure();
+                if(network!=CurrentNetworkKey())throw new OperationCanceledException("Сеть изменилась",token);
+                if(!RobloxSelectionPolicy.HasConfirmedContent(fresh.Stable)||!RobloxSelectionPolicy.Preserves(best.Stable,fresh.Stable))throw new IOException("Roblox: свежая проверка контента не подтвердила результат");
+                var saved=_settings.SavedConnections.FirstOrDefault(p=>p.Id==_activeConnection?.Id);
+                if(saved?.Strategy is {} strategy)
+                {
+                    var previous=JsonSerializer.Deserialize<AppSettings>(JsonSerializer.Serialize(_settings))!;
+                    try
+                    {
+                        saved.Strategy=strategy with {Roblox=winnerBlock};
+                        if(saved.NetworkRoutes.TryGetValue(network,out var route))saved.NetworkRoutes[network]=route with {Strategy=saved.Strategy};
+                        if(_settings.LocalAdvisor.AppliedStrategy==strategy)_settings.LocalAdvisor.AppliedStrategy=saved.Strategy;
+                        await _settingsStore.SaveAsync(_settings,token);_activeConnection=SavedConnectionProfilePolicy.Clone(saved);
+                    }
+                    catch{_settings=previous;winner=original;throw;}
+                }
+                else throw new IOException("Roblox: нет сохранённой исходной стратегии для безопасной записи; исходный маршрут восстанавливается");
             }
             await LogToUiAsync(winner==original?"info":"ok",winner==original?"Roblox: улучшение не подтверждено; исходный маршрут сохранён. Модели проверяйте в игре.":"Roblox: выбран улучшившийся маршрут контента. Проверки не подтверждают всю игровую сессию.");
         }

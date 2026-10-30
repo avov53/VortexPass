@@ -12,6 +12,8 @@ internal static class NetworkRecoveryTests
     public static async Task Run()
     {
         await NegativeUdpFallback();
+        Check(!RobloxSelectionPolicy.HasConfirmedContent([new("assetDelivery","confirmed","HTTP 404")]),"API transport without images became a content improvement");
+        Check(RobloxSelectionPolicy.HasConfirmedContent([new("images","confirmed","PNG")]),"Real image bytes were ignored");
         var profile=new SavedConnectionProfile {Id=Guid.NewGuid().ToString(),Name="Roblox",Games=["roblox"],RobloxAssetsMode="enhanced"};
         var portable=ProfileTransferService.Export(profile);
         Check(ProfileTransferService.Parse(portable).RobloxAssetsMode=="enhanced","Exchange lost enhanced mode");
@@ -31,9 +33,10 @@ internal static class NetworkRecoveryTests
             Check(oldRules.Length==newRules.Length&&!changed.Contains("--new--"),"Rule separator corrupt");
             for(var i=0;i<oldRules.Length;i++)
             {
-                var robloxTcp=oldRules[i].Contains("--filter-tcp=")&&(oldRules[i].Contains("list-roblox")||oldRules[i].Contains("rbxcdn"));
+                var robloxTcp=oldRules[i].Contains("--filter-tcp=")&&(oldRules[i].Contains("list-roblox")||oldRules[i].Contains("rbxcdn")||oldRules[i].Contains("thumbnails.roblox.com"));
                 if(!robloxTcp)Check(oldRules[i]==newRules[i],"Roblox changed other services or gameplay UDP");
                 else Check(newRules[i].Contains("--dpi-desync-cutoff=n3"),"Roblox did not bound handshake processing");
+                if(robloxTcp)Check(!newRules[i].Contains("seqovl"),"Roblox candidate still injects overlapping TLS bytes");
             }
         }
         Check(WinwsProfileComposer.ApplyRobloxTcpBlock(original,"baseline","medium")==original,"Standard rollback changed command");

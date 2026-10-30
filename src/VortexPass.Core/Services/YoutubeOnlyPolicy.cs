@@ -5,7 +5,7 @@ namespace VortexPass.Core.Services;
 
 public static class YoutubeOnlyPolicy
 {
-    public const int ProbeVersion=3;
+    public const int ProbeVersion=4;
     public static void Validate(AdvisorStrategySpec baseline,AdvisorStrategySpec candidate)
     {
         AdvisorStrategyPolicy.Validate(candidate,baseline.Level);
@@ -54,5 +54,5 @@ public static class YoutubeOnlySearch
         token.ThrowIfCancellationRequested();
         return Rank(measured).ToArray();
     }
-    private static IOrderedEnumerable<YoutubeCandidate> Rank(IEnumerable<YoutubeCandidate> list)=>list.OrderByDescending(r=>r.PageScreened).ThenByDescending(r=>r.Samples.All(s=>YoutubeOnlyPolicy.Group(s,"video"))).ThenByDescending(r=>r.FullyConfirmed).ThenBy(r=>r.MedianMs??long.MaxValue);
+    private static IOrderedEnumerable<YoutubeCandidate> Rank(IEnumerable<YoutubeCandidate> list)=>list.OrderByDescending(r=>r.PageScreened).ThenByDescending(YoutubePersonalizedSearch.ImageScore).ThenByDescending(r=>r.Samples.All(s=>YoutubeOnlyPolicy.Group(s,"video"))).ThenByDescending(r=>r.FullyConfirmed).ThenBy(r=>r.MedianMs??long.MaxValue);
 }

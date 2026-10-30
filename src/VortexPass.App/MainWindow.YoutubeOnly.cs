@@ -163,6 +163,8 @@ public partial class MainWindow
                 token=>YoutubeRouteProbe.CheckAsync(token,TimeSpan.FromSeconds(7)),async(evidence,token)=>
             {
                 token.ThrowIfCancellationRequested();
+                if(candidate.Samples.All(s=>YoutubeOnlyPolicy.Group(s,"avatars"))&&!YoutubeOnlyPolicy.Group(evidence,"avatars"))
+                    throw new IOException("Аватарки каналов не прошли свежую проверку; исходный блок YouTube восстанавливается.");
                 if(!_protectionRequested||_advisorStopProtectionRequested||run.StopGeneration!=Volatile.Read(ref _userStopGeneration))throw new OperationCanceledException("Защита остановлена пользователем");
                 if(run.Network!=CurrentNetworkKey()||run.Frozen!=YoutubeFrozen(profile))throw new InvalidOperationException("Контекст изменился во время применения YouTube");
                 YoutubeOnlyPolicy.AssertIsolated(run.Command,_components.GetArguments("dpi"));

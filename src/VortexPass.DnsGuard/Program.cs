@@ -337,6 +337,12 @@ internal static class Program
     internal sealed class DnsServer : IAsyncDisposable
     {
         private readonly Provider[] _providers;
+        private readonly ConcurrentDictionary<string,byte> _robloxReports=new();
+        private void ReportRoblox(object detail)
+        {
+            var text=JsonSerializer.Serialize(detail,JsonOptions);
+            if(_robloxReports.Count<128&&_robloxReports.TryAdd(text,0))Console.Out.WriteLine(text);
+        }
         private readonly ConcurrentDictionary<string, CachedResponse> _cache = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string,DateTimeOffset> _knownIpv4=new(StringComparer.OrdinalIgnoreCase);
         private readonly SemaphoreSlim _requests=new(96);
@@ -525,10 +531,36 @@ internal static class Program
             var selected=_selected;
             var ordered = selected is null ? eligible : [selected, .. eligible.Where(provider => provider != selected)];
             var result=await StableDnsFallback.QueryAsync(ordered,(provider,token)=>QueryAsync(provider,query,token),cancellationToken);
-            var wire=DnsWirePolicy.Inspect(query,result.Payload);
+            var payload=result.Payload;
+            var robloxResolver=result.Provider.Name;
+            if(RobloxDnsRecovery.Needed(query,payload))
+            {
+                var reserve=ordered.FirstOrDefault(p=>p!=result.Provider&&p.PlainDns);
+                if(reserve is not null)payload=await RobloxDnsRecovery.ResolveAsync(query,payload,t=>QueryAsync(reserve,query,t),cancellationToken);
+                if(!ReferenceEquals(payload,result.Payload)&&reserve is not null)robloxResolver=reserve.Name;
+                if(RobloxDnsRecovery.Needed(query,payload))
+                {
+                    using var recovery=CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);recovery.CancelAfter(TimeSpan.FromSeconds(4));
+                    try
+                    {
+                        async Task<byte[]> Direct(byte[] q,CancellationToken t)=>(await DnsDiagnosticsService.QueryPlainAsync(IPAddress.Parse("9.9.9.9"),q,t)).Payload;
+                        var alternate=await Direct(query,recovery.Token);
+                        if(DnsWirePolicy.Inspect(query,alternate).HasAddress)payload=alternate;
+                        else payload=await RobloxDnsRecovery.FollowAliasesAsync(query,alternate,Direct,recovery.Token);
+                        if(!DnsWirePolicy.Inspect(query,payload).HasAddress)payload=await RobloxDnsRecovery.FollowAliasesAsync(query,result.Payload,Direct,recovery.Token);
+                        if(DnsWirePolicy.Inspect(query,payload).HasAddress)robloxResolver="Quad9 UDP/TCP 9.9.9.9 (Roblox only)";
+                    }
+                    catch(Exception ex)when(!cancellationToken.IsCancellationRequested&&ex is IOException or SocketException or OperationCanceledException)
+                    {ReportRoblox(new {type="dns.diagnostic",layer="roblox-direct-reserve",state="failed",reason=YoutubeRouteProbe.Error(ex)});}
+                }
+                if(!DnsWirePolicy.Inspect(query,payload).HasAddress)payload=result.Payload;
+                ReportRoblox(new {type="dns.diagnostic",layer="roblox-direct",host=DnsWirePolicy.QuestionName(query),state=DnsDiagnosticsService.Classify(DnsWirePolicy.Inspect(query,payload)),resolver=robloxResolver,recovered=!ReferenceEquals(payload,result.Payload),alias=DnsWirePolicy.LastAlias(query,result.Payload).Target});
+            }
+            if(RobloxDnsRecovery.IsScoped(query))payload=DnsWirePolicy.CompactAddressReply(query,payload);
+            var wire=DnsWirePolicy.Inspect(query,payload);
             if(_cache.Count>4096)
                 foreach(var entry in _cache.OrderBy(p=>p.Value.ExpiresAt).Take(1024))_cache.TryRemove(entry.Key,out _);
-            var normalized=WithId(result.Payload,0,0);
+            var normalized=WithId(payload,0,0);
             if(wire.CacheSeconds>0)_cache[key]=new(normalized,DateTimeOffset.UtcNow,DateTimeOffset.UtcNow.AddSeconds(wire.CacheSeconds));
             return WithId(normalized,query[0],query[1]);
         }

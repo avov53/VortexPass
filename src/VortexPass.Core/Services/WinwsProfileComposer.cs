@@ -162,7 +162,7 @@ public static class WinwsProfileComposer
                 ? MobileYoutubeTcpStrategy(youtubeMobileStrategy)
                 : YoutubeFastTcpStrategy();
             rules.Add($"--filter-tcp=443 --hostlist-domains={youtubeImageDomains} " +
-                      youtubeTcpStrategy + ExclusionOption(exclusionListPath) + " --new");
+                      ContentTcpStrategy() + ExclusionOption(exclusionListPath) + " --new");
             if (includeYouTubeQuic)
                 rules.Add($"--filter-udp=443 --hostlist-domains={youtubeImageDomains} " +
                           YoutubeFastQuicStrategy(mobileCompatibilityMode) + ExclusionOption(exclusionListPath) + " --new");
@@ -244,8 +244,11 @@ public static class WinwsProfileComposer
             // Give rbxcdn a bounded fast rule first and retain the complete
             // hostlist afterwards for API/setup endpoints.
             rules.Add("--filter-tcp=443 --hostlist-domains=rbxcdn.com " +
-                      (mobileCompatibilityMode ? MobileYoutubeTcpStrategy("primary") : YoutubeFastTcpStrategy()) +
+                      ContentTcpStrategy() +
                       ExclusionOption(exclusionListPath) + " --new");
+            // Thumbnail API is a separate hop from the returned rbxcdn image.
+            rules.Add("--filter-tcp=443 --hostlist-domains=thumbnails.roblox.com " +
+                      ContentTcpStrategy() + ExclusionOption(exclusionListPath) + " --new");
             rules.Add("--filter-udp=443 --hostlist-domains=rbxcdn.com --filter-l7=quic --dpi-desync=fake " +
                       $"--dpi-desync-repeats={(mobileCompatibilityMode ? 2 : 3)} --dpi-desync-fake-quic=files\\quic_initial_www_google_com.bin --dpi-desync-cutoff=d2" +
                       ExclusionOption(exclusionListPath) + " --new");
@@ -315,9 +318,9 @@ public static class WinwsProfileComposer
             rule.Contains("--hostlist-domains=googlevideo.com", StringComparison.Ordinal)) block = spec.YouTube;
         else if (rule.Contains("list-discord.txt", StringComparison.Ordinal) || rule.Contains("--hostlist-domains=cdn.discordapp.com", StringComparison.Ordinal)) block = spec.Discord;
         else if (rule.Contains("list-telegram.txt", StringComparison.Ordinal) || rule.Contains("--hostlist-domains=kws.web.telegram.org", StringComparison.Ordinal)) block = spec.Telegram;
-        else if ((rule.Contains("list-roblox.txt",StringComparison.Ordinal)||rule.Contains("--hostlist-domains=rbxcdn.com",StringComparison.Ordinal)) && rule.Contains("--filter-tcp=",StringComparison.Ordinal)) block=spec.Roblox;
+        else if ((rule.Contains("list-roblox.txt",StringComparison.Ordinal)||rule.Contains("--hostlist-domains=rbxcdn.com",StringComparison.Ordinal)||rule.Contains("--hostlist-domains=thumbnails.roblox.com",StringComparison.Ordinal)) && rule.Contains("--filter-tcp=",StringComparison.Ordinal)) block=spec.Roblox;
         if (block is null) return rule;
-        if (block == "baseline" && (rule.Contains("list-roblox.txt",StringComparison.Ordinal)||rule.Contains("rbxcdn",StringComparison.Ordinal))) return rule;
+        if (block == "baseline" && (rule.Contains("list-roblox.txt",StringComparison.Ordinal)||rule.Contains("rbxcdn",StringComparison.Ordinal)||rule.Contains("thumbnails.roblox.com",StringComparison.Ordinal))) return rule;
         if (block == "direct")
             return Regex.Replace(rule, @"(?:--dpi-desync[^\s]*|--ip-id=[^\s]*)\s*", "").Trim();
         var tcp = rule.Contains("--filter-tcp=", StringComparison.Ordinal);
@@ -327,6 +330,9 @@ public static class WinwsProfileComposer
                 ? "files\\tls_clienthello_max_ru.bin" : "files\\tls_clienthello_www_google_com.bin";
             var strategy = block switch
             {
+                "minimal" when rule.Contains("roblox",StringComparison.Ordinal)||rule.Contains("rbxcdn",StringComparison.Ordinal) => ContentTcpStrategy(),
+                "split" when rule.Contains("roblox",StringComparison.Ordinal)||rule.Contains("rbxcdn",StringComparison.Ordinal) => "--dpi-desync=multisplit --dpi-desync-split-pos=midsld --dpi-desync-cutoff=n3",
+                "disorder" when rule.Contains("roblox",StringComparison.Ordinal)||rule.Contains("rbxcdn",StringComparison.Ordinal) => "--dpi-desync=fake,multidisorder --dpi-desync-split-pos=1,midsld --dpi-desync-fooling=badseq --dpi-desync-fake-tls=files\\tls_clienthello_www_google_com.bin --dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com --dpi-desync-repeats=2 --dpi-desync-cutoff=n3",
                 "youtube-segment" => "--dpi-desync=multisplit --dpi-desync-split-pos=1,midsld",
                 "youtube-tls" => "--dpi-desync=fake,multidisorder --dpi-desync-split-pos=1,midsld " +
                     "--dpi-desync-fooling=badseq --dpi-desync-fake-tls=files\\tls_clienthello_www_google_com.bin " +
@@ -386,7 +392,7 @@ public static class WinwsProfileComposer
         if(block=="baseline")return command;
         var spec=new AdvisorStrategySpec {Level=level,Roblox=block};
         return string.Join(" --new",command.Split(" --new").Select(rule=>
-            rule.Contains("--filter-tcp=",StringComparison.Ordinal)&&(rule.Contains("list-roblox.txt",StringComparison.Ordinal)||rule.Contains("--hostlist-domains=rbxcdn.com",StringComparison.Ordinal))
+            rule.Contains("--filter-tcp=",StringComparison.Ordinal)&&(rule.Contains("list-roblox.txt",StringComparison.Ordinal)||rule.Contains("--hostlist-domains=rbxcdn.com",StringComparison.Ordinal)||rule.Contains("--hostlist-domains=thumbnails.roblox.com",StringComparison.Ordinal))
             ? (rule.StartsWith(" ",StringComparison.Ordinal)?" ":"")+ComposeAdvisorRule(rule.Trim()+" --new",spec).Replace(" --new","",StringComparison.Ordinal):rule));
     }
 
@@ -502,6 +508,10 @@ public static class WinwsProfileComposer
         // visible as very slow Shorts and thumbnails.
         $"--filter-l7=quic --dpi-desync=fake --dpi-desync-repeats={(mobileCompatibilityMode ? 2 : 6)} " +
         "--dpi-desync-fake-quic=files\\quic_initial_www_google_com.bin --dpi-desync-cutoff=d2";
+
+    // CDN defaults must not inject overlapping fake bytes into real TLS records.
+    // Explicit measured per-service candidates can still replace this block.
+    private static string ContentTcpStrategy() => "--dpi-desync=multisplit --dpi-desync-split-pos=1,midsld --dpi-desync-cutoff=n3";
 
     private static string YoutubeFastTcpStrategy() =>
         "--ip-id=zero --dpi-desync=fake,multidisorder --dpi-desync-fake-tls-mod=sni=www.google.com " +

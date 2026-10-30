@@ -136,6 +136,17 @@ await using(var stable=new Guard.DnsServer([new("primary",new("https://fixture.i
  if(!DnsWirePolicy.Inspect(query,fallback).HasAddress||reserveFixture.Calls<=reserveBefore||changed!=0)throw new Exception("Ordered transport fallback failed or changed primary selection");
  Console.WriteLine("PASS production DNS: parallel NXDOMAIN/NODATA preserve primary, transport uses reserve, default logs omit names");
 }
+var robloxPrimary=new FakeDoh();var robloxSecure=new FakeDoh();
+await using(var scoped=new Guard.DnsServer([new("primary",new("https://fixture.invalid/dns-query"),[],new HttpClient(robloxPrimary)),new("secure",new("https://fixture.invalid/dns-query"),[IPAddress.Loopback],new HttpClient(robloxSecure),true)]))
+{
+ await scoped.BindAsync(lifetime.Token,0);await scoped.SelectProviderAsync(lifetime.Token);var loop=scoped.RunAsync(lifetime.Token);
+ var query=AdvancedRouteTests.Question("tr.rbxcdn.com");using var browser=new UdpClient();await browser.SendAsync(query,new IPEndPoint(IPAddress.Loopback,scoped.Port),lifetime.Token);
+ var response=(await browser.ReceiveAsync(lifetime.Token)).Buffer;
+ if(!DnsWirePolicy.Inspect(query,response).HasAddress||robloxSecure.Calls!=0||scoped.CurrentResolver!="primary")throw new Exception("Production Roblox recovery failed or switched the main resolver");
+ var other=AdvancedRouteTests.Question("youtube.com");await browser.SendAsync(other,new IPEndPoint(IPAddress.Loopback,scoped.Port),lifetime.Token);await browser.ReceiveAsync(lifetime.Token);
+ if(robloxSecure.Calls!=0)throw new Exception("Roblox DNS proxy received another service's query");
+ Console.WriteLine("PASS real DNS server serves compact Roblox addresses without proxy or HTTPS, preserving primary resolver");
+}
 lifetime.Cancel();try{await running;}catch(OperationCanceledException){}
 Console.WriteLine("PASS real DNS UDP/TCP server on temporary loopback port: coalescing, independent IDs, AAAA NODATA with A, TCP reuse and resolver failure; no adapter changes");
 

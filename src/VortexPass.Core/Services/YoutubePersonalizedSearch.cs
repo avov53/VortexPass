@@ -12,14 +12,20 @@ public static class YoutubePersonalizedSearch
     public static bool Improves(YoutubeCandidate baseline,YoutubeCandidate candidate)
     {
         if(candidate.Strategy==baseline.Strategy||!candidate.PageConfirmed)return false;
+        if(!PreservesImages(baseline,candidate))return false;
         if(!baseline.PageConfirmed)return true;
         if(baseline.MediaConfirmed&&!candidate.MediaConfirmed)return false;
         if(candidate.MediaConfirmed&&!baseline.MediaConfirmed||candidate.FullyConfirmed&&!baseline.FullyConfirmed)return true;
+        if(ImageScore(candidate)>ImageScore(baseline))return true;
         if(baseline.Samples.Any(s=>s.Groups?.Any(g=>g.Id=="page"&&g.DurationMs.HasValue)!=true)||candidate.Samples.Any(s=>s.Groups?.Any(g=>g.Id=="page"&&g.DurationMs.HasValue)!=true))return false;
         return baseline.PageMedianMs is {} old&&candidate.PageMedianMs is {} current&&old-current>=100&&current<=old*.85;
     }
+    public static int ImageScore(YoutubeCandidate candidate)=>new[]{"images","avatars"}.Count(id=>candidate.Samples.Count>0&&candidate.Samples.All(s=>YoutubeOnlyPolicy.Group(s,id)));
+    public static bool ContentScreened(YoutubeCandidate candidate)=>candidate.PageScreened&&!candidate.Samples.Any(s=>s.Groups?.Any(g=>g.Id is "images" or "avatars" && g.State is "unconfirmed" or "routeUnavailable")==true);
+    public static bool PreservesImages(YoutubeCandidate baseline,YoutubeCandidate candidate)=>new[]{"images","avatars"}.All(id=>
+        !baseline.Samples.All(s=>YoutubeOnlyPolicy.Group(s,id))||candidate.Samples.Count>0&&candidate.Samples.All(s=>YoutubeOnlyPolicy.Group(s,id)));
     public static IOrderedEnumerable<YoutubeCandidate> Rank(IEnumerable<YoutubeCandidate> candidates)=>candidates.OrderByDescending(c=>c.FullyConfirmed)
-        .ThenByDescending(c=>c.PageScreened).ThenByDescending(c=>c.MediaConfirmed).ThenBy(c=>c.PageMedianMs??long.MaxValue).ThenBy(c=>c.MedianMs??long.MaxValue);
+        .ThenByDescending(c=>c.PageScreened).ThenByDescending(ImageScore).ThenByDescending(c=>c.MediaConfirmed).ThenBy(c=>c.PageMedianMs??long.MaxValue).ThenBy(c=>c.MedianMs??long.MaxValue);
     public static async Task<IReadOnlyList<YoutubeCandidate>> RunAsync(AdvisorStrategySpec baseline,
         Func<AdvisorStrategySpec,CancellationToken,Task<ServiceHealthResult>> trial,
         Func<AdvisorRecommendation,CancellationToken,Task<IReadOnlyList<AdvisorStrategySpec>>> propose,
@@ -66,7 +72,7 @@ public static class YoutubePersonalizedSearch
                 if(limit-watch.Elapsed<TimeSpan.FromSeconds(40))break;
                 if(await Measure(candidate) is not null)personalCount++;
             }
-            if(!measured.Any(c=>c.PageScreened))await Measure(fallback);
+            if(!measured.Any(ContentScreened))await Measure(fallback);
             var finalists=measured.Where(c=>c.Strategy==baseline&&c.PageScreened).Concat(Rank(measured.Where(c=>c.PageScreened))).DistinctBy(c=>key(c.Strategy)).Take(2).ToArray();
             foreach(var finalist in finalists)
             {

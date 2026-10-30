@@ -19,7 +19,7 @@ VortexPass - аккуратный сетевой ускоритель для Win
 
 ## Скачать
 
-Текущий выпуск — **v0.0.8**. Последняя версия публикуется в разделе [Releases](https://github.com/avov53/VortexPass/releases).
+Текущий выпуск — **v0.0.9**. Последняя версия публикуется в разделе [Releases](https://github.com/avov53/VortexPass/releases).
 
 Скачивайте файл:
 

@@ -33,10 +33,14 @@ public static class YoutubeRouteProbe
         var api=Resource(client,"api",new("https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=vortexpass"),deadline);
         var image=Resource(client,"images",new("https://i.ytimg.com/vi/jNQXAC9IVRw/default.jpg"),deadline);
         var video=PublicMediaProbeService.CheckAsync("video",deadline,directFresh:true);
-        await Task.WhenAll(connections.Cast<Task>().Concat(new Task[]{page,api,image,ObserveVideo()}));
+        var avatar=PublicMediaProbeService.CheckAsync("avatar",deadline,directFresh:true);
+        await Task.WhenAll(connections.Cast<Task>().Concat(new Task[]{page,api,image,ObserveVideo(),ObserveAvatar()}));
         async Task ObserveVideo(){try{await video;}catch(OperationCanceledException)when(!token.IsCancellationRequested){}}
+        async Task ObserveAvatar(){try{await avatar;}catch(OperationCanceledException)when(!token.IsCancellationRequested){}}
         foreach(var connection in connections)groups.AddRange(connection.Result.Groups);
         groups.Add(await page);groups.Add(await api);groups.Add(await image);
+        var channelImage=avatar.Status==TaskStatus.RanToCompletion?avatar.Result:new PublicMediaResult(false,"Аватарка канала не проверена за время раунда");
+        groups.Add(new("avatars",channelImage.Confirmed?"confirmed":channelImage.ResourceLocated?"unconfirmed":"controlResourceUnconfirmed",channelImage.Detail));
         var media=video.Status==TaskStatus.RanToCompletion?video.Result:new PublicMediaResult(false,"Не удалось получить/проверить контрольный видеоресурс за время раунда");
         groups.Add(new("video",media.Confirmed?"confirmed":"controlResourceUnconfirmed",media.Detail));
         groups.Add(new("browserSession","sessionRequired","Firefox: открытие страницы, видео и перемотка проверяются пользователем"));
@@ -47,9 +51,9 @@ public static class YoutubeRouteProbe
     public static ServiceHealthResult Evaluate(IReadOnlyList<ServiceRouteGroup> groups,long latency)
     {
         bool Ok(string id)=>groups.Any(g=>g.Id==id&&g.State=="confirmed");
-        var full=Ok("page")&&Ok("api")&&Ok("images")&&Ok("video");
+        var full=Ok("page")&&Ok("api")&&Ok("images")&&Ok("avatars")&&Ok("video");
         var state=full?ServiceHealthState.Healthy:Ok("page")?ServiceHealthState.Partial:!Ok("dns")?ServiceHealthState.DnsUnavailable:groups.Any(g=>g.Id.StartsWith("tls-")&&g.State=="confirmed")?ServiceHealthState.HttpUnavailable:groups.Any(g=>g.Id.StartsWith("tcp-")&&g.State=="confirmed")?ServiceHealthState.TlsFailed:ServiceHealthState.TcpTimeout;
-        var detail=$"Страница: {(Ok("page")?"подтверждена":"не подтверждена")}; API: {(Ok("api")?"ответ подтверждён":"не подтверждено")}; картинки: {(Ok("images")?"подтверждены":"не подтверждены")}; видео: {(Ok("video")?"реальные байты подтверждены":"контрольный ресурс не подтверждён")}. Браузерная сессия проверяется отдельно.";
+        var detail=$"Страница: {(Ok("page")?"подтверждена":"не подтверждена")}; API: {(Ok("api")?"ответ подтверждён":"не подтверждено")}; миниатюры: {(Ok("images")?"подтверждены":"не подтверждены")}; аватарки каналов: {(Ok("avatars")?"подтверждены":"не подтверждены")}; видео: {(Ok("video")?"реальные байты подтверждены":"контрольный ресурс не подтверждён")}. Браузерная сессия проверяется отдельно.";
         var stages=new ServiceProbeStages(string.Join("; ",groups.Where(g=>g.Id=="dns").Select(g=>g.Detail)),string.Join("; ",groups.Where(g=>g.Id.StartsWith("tcp-")).Select(g=>g.Detail)),string.Join("; ",groups.Where(g=>g.Id.StartsWith("tls-")).Select(g=>g.Detail)),groups.FirstOrDefault(g=>g.Id=="page")?.Detail??"не проверено");
         return new("youtube",state,detail,latency,stages,ContentConfirmed:full,Groups:groups,SystemDnsReady:Ok("dns"));
     }

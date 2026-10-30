@@ -187,6 +187,15 @@ public sealed class WarpPacService : IDisposable
         HttpProxyUri=null;
     }
 
+    public async Task VerifyPacAsync(CancellationToken token)
+    {
+        var uri=PacUri??throw new InvalidOperationException("PAC ещё не запущен");
+        using var handler=new SocketsHttpHandler {UseProxy=false,UseCookies=false};
+        using var client=new HttpClient(handler) {Timeout=TimeSpan.FromSeconds(3)};
+        var content=await client.GetStringAsync(uri,token);
+        if(content!=_content)throw new IOException("Браузерный PAC не прошёл проверку загрузки");
+    }
+
     private async Task ServeAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested && _listener is not null)
@@ -201,13 +210,30 @@ public sealed class WarpPacService : IDisposable
     private async Task RespondAsync(TcpClient client, CancellationToken cancellationToken)
     {
         using (client)
+        try
         {
+            // Consume the request before closing: closing a socket with unread
+            // request bytes can reset it, discarding the PAC on Windows clients.
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(TimeSpan.FromSeconds(3));
+            var stream = client.GetStream();
+            var request = new List<byte>();
+            var one = new byte[1];
+            while (request.Count < 16384)
+            {
+                if (await stream.ReadAsync(one, deadline.Token) == 0) return;
+                request.Add(one[0]);
+                if (request.TakeLast(4).SequenceEqual(new byte[] {13,10,13,10})) break;
+            }
+            if (!request.TakeLast(4).SequenceEqual(new byte[] {13,10,13,10})) return;
+            var first = Encoding.ASCII.GetString(request.ToArray()).Split("\r\n")[0].Split(' ');
+            if (first.Length != 3 || first[0] is not ("GET" or "HEAD")) return;
             var body = Encoding.UTF8.GetBytes(_content);
             var header = Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n");
-            var stream = client.GetStream();
-            await stream.WriteAsync(header, cancellationToken);
-            await stream.WriteAsync(body, cancellationToken);
+            await stream.WriteAsync(header, deadline.Token);
+            if (first[0] != "HEAD") await stream.WriteAsync(body, deadline.Token);
         }
+        catch (Exception ex) when (ex is IOException or SocketException or OperationCanceledException or ObjectDisposedException) { }
     }
 
     public static string GeneratePac(IEnumerable<string> domains, int socksPort)

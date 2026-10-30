@@ -7,6 +7,45 @@ public sealed record DnsWireResult(string Name, ushort Type, int ResponseCode, b
 public static class DnsWirePolicy
 {
     public static string QuestionName(byte[] query) => Question(query).Name;
+    public static ushort QuestionType(byte[] query) => Question(query).Type;
+    public static (string? Target,int Ttl) LastAlias(byte[] query,byte[] response)
+    {
+        var wire=Inspect(query,response);if(wire.Truncated||wire.ResponseCode!=0)return(null,0);
+        var current=wire.Name;var ttl=3600u;var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase){current};
+        var records=Records(response,Question(response).Offset).Take(U16(response,6)).ToArray();
+        for(var i=0;i<16;i++)
+        {
+            var r=records.FirstOrDefault(r=>r.Type==5&&r.Name.Equals(current,StringComparison.OrdinalIgnoreCase));if(r is null)break;
+            var p=r.Data;var next=Name(response,ref p);if(!seen.Add(next))throw new InvalidDataException("CNAME loop");current=next;ttl=Math.Min(ttl,r.Ttl);
+        }
+        return current==wire.Name?(null,0):(current,(int)ttl);
+    }
+    public static byte[] RebindAddressReply(byte[] original,byte[] targetQuery,byte[] targetResponse,int ttl)
+    {
+        var compact=CompactAddressReply(targetQuery,targetResponse);if(!Inspect(targetQuery,compact).HasAddress)throw new InvalidDataException("Missing terminal address");
+        var prefix=original[..Question(original).Offset];prefix[2]=0x81;prefix[3]=0x80;Array.Clear(prefix,6,6);prefix[6]=compact[6];prefix[7]=compact[7];
+        var result=prefix.Concat(compact[Question(compact).Offset..]).ToArray();
+        foreach(var r in Records(result,prefix.Length))BinaryPrimitives.WriteUInt32BigEndian(result.AsSpan(r.TtlOffset,4),Math.Min(r.Ttl,(uint)Math.Max(0,ttl)));
+        Inspect(original,result);return result;
+    }
+    public static byte[] CompactAddressReply(byte[] query,byte[] response)
+    {
+        var wire=Inspect(query,response);
+        if(wire.Truncated||wire.ResponseCode!=0||wire.Type is not (1 or 28))return response;
+        var q=Question(query);var rq=Question(response);var records=Records(response,rq.Offset).Take(U16(response,6)).ToArray();
+        var names=new HashSet<string>(StringComparer.OrdinalIgnoreCase){q.Name};
+        for(var i=0;i<records.Length;i++)foreach(var r in records.Where(r=>r.Type==5&&names.Contains(r.Name))){var p=r.Data;names.Add(Name(response,ref p));}
+        var addresses=records.Where(r=>r.Type==q.Type&&names.Contains(r.Name)).ToArray();
+        using var output=new MemoryStream();var header=query[..q.Offset];header[2]=0x81;header[3]=0x80;Array.Clear(header,6,6);BinaryPrimitives.WriteUInt16BigEndian(header.AsSpan(6,2),(ushort)addresses.Length);output.Write(header);
+        foreach(var address in addresses)
+        {
+            var record=new byte[12+address.Length];record[0]=0xc0;record[1]=0x0c;
+            BinaryPrimitives.WriteUInt16BigEndian(record.AsSpan(2,2),q.Type);record[5]=1;
+            BinaryPrimitives.WriteUInt32BigEndian(record.AsSpan(6,4),(uint)wire.CacheSeconds);
+            BinaryPrimitives.WriteUInt16BigEndian(record.AsSpan(10,2),(ushort)address.Length);response.AsSpan(address.Data,address.Length).CopyTo(record.AsSpan(12));output.Write(record);
+        }
+        return output.ToArray();
+    }
     public static string[] AddressRecords(byte[] query, byte[] response)
     {
         Inspect(query,response);

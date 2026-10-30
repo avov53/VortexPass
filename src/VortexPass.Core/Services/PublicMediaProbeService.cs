@@ -6,7 +6,7 @@ using System.Text.RegularExpressions;
 
 namespace VortexPass.Core.Services;
 
-public sealed record PublicMediaResult(bool Confirmed, string Detail, long? LatencyMs = null);
+public sealed record PublicMediaResult(bool Confirmed, string Detail, long? LatencyMs = null, bool ResourceLocated = false);
 public static class PublicMediaProbeService
 {
     private static readonly HttpClient Client = new(new SocketsHttpHandler { ConnectTimeout = TimeSpan.FromSeconds(3), PooledConnectionLifetime = TimeSpan.FromMinutes(2) }) { Timeout = Timeout.InfiniteTimeSpan };
@@ -20,10 +20,12 @@ public static class PublicMediaProbeService
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
         timeout.CancelAfter(TimeSpan.FromSeconds(8));
         var watch = Stopwatch.StartNew();
+        var located=false;
         try
         {
             var uri = await DiscoverAsync(kind, timeout.Token,client,!directFresh);
             if (uri is null) return new(false, "Адрес реального контрольного ресурса не получен; проверка не завершилась");
+            located=true;
             using var request = new HttpRequestMessage(HttpMethod.Get, uri);
             request.Headers.Range = new RangeHeaderValue(0, 1023);
             using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
@@ -33,15 +35,15 @@ public static class PublicMediaProbeService
                 ? RouteProbePolicy.IsVideo((int)response.StatusCode, response.Content.Headers.ContentType?.MediaType, buffer.AsSpan(0, read))
                 : RouteProbePolicy.IsImage((int)response.StatusCode, response.Content.Headers.ContentType?.MediaType, buffer.AsSpan(0, read));
             // Never expose signed URL parameters or response bodies in diagnostics.
-            return new(valid, $"{kind}: {uri.Host}, HTTP {(int)response.StatusCode}, {read} B; " + (valid ? "контент подтверждён" : "ответ не является требуемым медиаконтентом"), watch.ElapsedMilliseconds);
+            return new(valid, $"{kind}: {uri.Host}, HTTP {(int)response.StatusCode}, {read} B; " + (valid ? "контент подтверждён" : "ответ не является требуемым медиаконтентом"), watch.ElapsedMilliseconds, true);
         }
         catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or JsonException or IOException)
-        { token.ThrowIfCancellationRequested(); return new(false, "Проверка реального медиаресурса не завершилась"); }
+        { token.ThrowIfCancellationRequested(); return new(false, "Проверка реального медиаресурса не завершилась", ResourceLocated:located); }
     }
 
     private static async Task<Uri?> DiscoverAsync(string kind, CancellationToken token,HttpClient client,bool useCache)
     {
-        await DiscoveryGate.WaitAsync(token);
+        if(useCache) await DiscoveryGate.WaitAsync(token);
         try
         {
             if (useCache&&Cache.TryGetValue(kind, out var cached) && cached.Expiry > DateTimeOffset.UtcNow) return cached.Uri;
@@ -67,7 +69,7 @@ public static class PublicMediaProbeService
             if (uri is not null&&useCache) Cache[kind] = (uri, DateTimeOffset.UtcNow.AddMinutes(5));
             return uri;
         }
-        finally { DiscoveryGate.Release(); }
+        finally { if(useCache) DiscoveryGate.Release(); }
     }
     public static bool IsAllowedControlUri(string kind, Uri uri) => uri.Scheme == "https" && string.IsNullOrEmpty(uri.UserInfo) && uri.IsDefaultPort &&
         (kind == "video" ? uri.Host.EndsWith(".googlevideo.com", StringComparison.OrdinalIgnoreCase) && uri.AbsolutePath.Contains("videoplayback") :

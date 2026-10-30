@@ -1211,7 +1211,11 @@ public partial class MainWindow : Window
         {
             _warpPac.DiagnosticsEnabled=_settings.NetworkDiagnosticDetails;
             var pacUri = await _warpPac.StartAsync(plan.ProxyDomains, _settings.Warp.ProxyPort, _settings.Warp.ProxyPort + 1, cancellationToken);
+            await _warpPac.VerifyPacAsync(cancellationToken);
             _proxyManager.ApplyPac(pacUri);
+            if (!_proxyManager.IsOwnedPacApplied()) throw new InvalidOperationException("Windows не применил PAC VortexPass");
+            if (!FirefoxUsesSystemProxy(out var firefoxProxyHint))
+                await LogToUiAsync("warn", $"Telegram Web: {firefoxProxyHint}. Firefox → Настройки → Основные → Настройки сети → Использовать системные настройки прокси. Рабочий WARP сам по себе не подтверждает маршрут браузера.");
             await LogToUiAsync("ok", $"Умный WARP: {plan.ProxyDomains.Count} доменных зон направлены через локальный SOCKS5; остальной Web-трафик — DIRECT.");
         }
         else
@@ -4168,7 +4172,7 @@ public partial class MainWindow : Window
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_applicationLogPath)!);
-            await File.WriteAllTextAsync(_applicationLogPath, $"{DateTimeOffset.Now:O} [INFO] VortexPass started. Сборка public-v22-20261028.{Environment.NewLine}", _lifetime.Token);
+            await File.WriteAllTextAsync(_applicationLogPath, $"{DateTimeOffset.Now:O} [INFO] VortexPass started. Сборка roblox-direct-v5-20261030.{Environment.NewLine}", _lifetime.Token);
         }
         catch { }
     }
